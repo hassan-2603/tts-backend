@@ -680,6 +680,42 @@ async def unlink_account(aid: str, _=Depends(admin_only)):
     return {"ok": True}
 
 
+@app.post("/api/accounts/{aid}/token")
+async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
+    acc = await DB.get_account_async(aid)
+    if not acc:
+        raise HTTPException(404, "No such account")
+    data = await request.json()
+    token_str = (data.get("token") or "").strip()
+    if not token_str:
+        raise HTTPException(400, "Token is required")
+
+    doc = {
+        "access_token": token_str,
+        "expires_at": time.time() + 86400,
+        "linked_at": now_ist().isoformat(timespec="seconds"),
+        "status": "Linked",
+    }
+    try:
+        cd = await ZEBU.client_details_async(token_str, acc.get("zebu_uid"), acc.get("zebu_actid") or acc.get("zebu_uid"))
+        doc["cliname"] = cd.get("cliname") if isinstance(cd, dict) else None
+    except Exception as e:
+        log.warning(f"Could not verify client details with manual token: {e}")
+
+    await DB.put_token_async(aid, doc)
+
+    # Attach WebSocket stream immediately
+    await CONN_MGR.register_account_stream(
+        account_id=acc["id"],
+        uid=acc.get("zebu_uid", ""),
+        actid=acc.get("zebu_actid") or acc.get("zebu_uid", ""),
+        token=token_str,
+        on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
+    )
+    asyncio.create_task(poll_all_async("manual_token"))
+    return {"ok": True, "cliname": doc.get("cliname")}
+
+
 @app.get("/auth/zebu/start")
 async def zebu_start(n: str):
     d = await DB._get_link_nonce(n)

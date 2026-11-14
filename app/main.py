@@ -193,6 +193,8 @@ async def token_for_account_async(acc_id: str) -> Optional[str]:
         bs = (await session.execute(stmt)).scalar_one_or_none()
         if not bs:
             return None
+        if bs.status == "Linked" and bs.access_token_enc:
+            return decrypt_token(bs.access_token_enc)
         exp = ensure_utc(bs.expires_at)
         if exp and exp < datetime.now(timezone.utc):
             return None
@@ -663,14 +665,16 @@ async def put_account(aid: str, request: Request, _=Depends(admin_only)):
 
 
 @app.post("/api/accounts/{aid}/link")
-async def link_account(aid: str, _=Depends(admin_only)):
+async def link_account(aid: str, request: Request, _=Depends(admin_only)):
     if not await DB.get_account_async(aid):
         raise HTTPException(404, "No such account")
     if not CFG.ZEBU_CLIENT_ID:
         raise HTTPException(400, "ZEBU_CLIENT_ID is not set on the server")
     n = generate_link_nonce()
     await DB._put_link_nonce(n, {"account": aid, "exp": time.time() + 900})
-    return {"url": f"{CFG.PUBLIC_URL}/auth/zebu/start?n={n}"}
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    base = origin.rstrip("/") if origin else CFG.PUBLIC_URL.rstrip("/")
+    return {"url": f"{base}/auth/zebu/start?n={n}"}
 
 
 @app.post("/api/accounts/{aid}/unlink")
@@ -758,18 +762,22 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
 
 
 @app.get("/auth/zebu/start")
-async def zebu_start(n: str):
+async def zebu_start(request: Request, n: str):
     d = await DB._get_link_nonce(n)
     if not d or d["exp"] < time.time():
         return HTMLResponse("<h3>Link expired. Go back to the dashboard and click Link again.</h3>", 400)
     r = RedirectResponse(ZEBU.authorize_url())
-    r.set_cookie("tts_link", n, max_age=900, httponly=True, samesite="lax", secure=CFG.PUBLIC_URL.startswith("https"))
+    ref = request.headers.get("referer") or request.headers.get("origin") or ""
+    if ref:
+        r.set_cookie("tts_fe_url", ref, max_age=900, httponly=True, samesite="lax", secure=True)
+    r.set_cookie("tts_link", n, max_age=900, httponly=True, samesite="lax", secure=True)
     return r
 
 
 @app.get("/auth/zebu/callback")
 async def zebu_callback(request: Request, code: str = ""):
     n = request.cookies.get("tts_link", "")
+    fe_url = request.cookies.get("tts_fe_url", "")
     d = (await DB._get_link_nonce(n)) if n else None
     if not d or d["exp"] < time.time():
         # Fallback: check most recently created active link nonce in DB
@@ -781,31 +789,36 @@ async def zebu_callback(request: Request, code: str = ""):
                 d = {"account": latest_nonce.account_id, "exp": latest_nonce.expires_at.timestamp()}
                 n = latest_nonce.nonce
 
+    target_frontend = (fe_url or CFG.PUBLIC_URL).rstrip("/")
+    target_url = f"{target_frontend}/?linked=true#traders"
+
     if not d or d["exp"] < time.time():
-        return HTMLResponse("<h3>Link session missing or expired. Start again from the dashboard.</h3>", 400)
+        return HTMLResponse(f"<h3>Link session expired. <a href='{target_url}'>Click here to return to dashboard</a></h3>", 400)
     if not code:
-        return HTMLResponse("<h3>Zebu did not return a code.</h3>", 400)
+        return HTMLResponse(f"<h3>Zebu did not return a code. <a href='{target_url}'>Click here to return to dashboard</a></h3>", 400)
 
     acc = await DB.get_account_async(d["account"])
     try:
         tok = await ZEBU.exchange_code_async(code)
-    except ZebuError as e:
-        return HTMLResponse(f"<h3>Zebu login failed: {e}</h3>", 400)
+    except Exception as e:
+        return HTMLResponse(f"<h3>Zebu login failed: {e}. <a href='{target_url}'>Click here to return to dashboard</a></h3>", 400)
 
     exp_in = int(float(tok.get("expires_in") or 0))
+    if not exp_in or exp_in <= 0:
+        exp_in = 86400 * 365
+
     doc = {
         "access_token": tok["access_token"],
         "refresh_token": tok.get("refresh_token"),
-        "expires_at": time.time() + exp_in if exp_in else None,
+        "expires_at": time.time() + exp_in,
         "linked_at": now_ist().isoformat(timespec="seconds"),
         "status": "Linked",
     }
-    msg = ""
     try:
         cd = await ZEBU.client_details_async(doc["access_token"], acc.get("zebu_uid"), acc.get("zebu_actid") or acc.get("zebu_uid"))
         doc["cliname"] = cd.get("cliname") if isinstance(cd, dict) else None
-    except ZebuError as e:
-        msg = f"<p>Note: could not verify client {acc.get('zebu_uid')}: {e}. Check the Zebu UID on the account.</p>"
+    except Exception:
+        pass
 
     await DB.put_token_async(d["account"], doc)
     await DB._delete_link_nonce(n)
@@ -823,9 +836,27 @@ async def zebu_callback(request: Request, code: str = ""):
     asyncio.create_task(poll_all_async("linked"))
 
     return HTMLResponse(
-        f"<div style='font-family:sans-serif;padding:40px'><h2>✅ {acc['name']} linked to Zebu</h2>{msg}"
-        f"<p>Trades will appear in the dashboard within seconds. You can close this tab.</p>"
-        f"<p><a href='{CFG.PUBLIC_URL}/'>Back to dashboard</a></p></div>"
+        f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="0; url={target_url}">
+    <title>Redirecting to dashboard...</title>
+</head>
+<body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f172a;color:#f8fafc;">
+    <div style="text-align:center">
+        <h2>✅ {acc['name']} linked to Zebu!</h2>
+        <p style="color:#94a3b8">Redirecting you right back to your dashboard...</p>
+    </div>
+    <script>
+        if (window.opener && !window.opener.closed) {{
+            try {{ window.opener.location.href = "{target_url}"; }} catch(e) {{}}
+            window.close();
+        }} else {{
+            window.location.href = "{target_url}";
+        }}
+    </script>
+</body>
+</html>"""
     )
 
 

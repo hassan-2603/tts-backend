@@ -162,10 +162,10 @@ class ZebuClient:
                 if isinstance(data, dict) and data.get("stat") == "Not_Ok":
                     emsg = data.get("emsg", "")
                     low = emsg.lower()
+                    if "no data" in low or "no record" in low or "empty" in low or "not found" in low:
+                        return []
                     if "session" in low or ("invalid" in low and "key" in low) or "token expired" in low:
                         raise SessionExpired(emsg)
-                    if "no data" in low:
-                        return []
                     raise ZebuError(f"{endpoint}: {emsg}")
 
                 return data
@@ -202,10 +202,10 @@ class ZebuClient:
         if isinstance(data, dict) and data.get("stat") == "Not_Ok":
             emsg = data.get("emsg", "")
             low = emsg.lower()
+            if "no data" in low or "no record" in low or "empty" in low or "not found" in low:
+                return []
             if "session" in low or ("invalid" in low and "key" in low):
                 raise SessionExpired(emsg)
-            if "no data" in emsg.lower():
-                return []
             raise ZebuError(f"{endpoint}: {emsg}")
         return data
 

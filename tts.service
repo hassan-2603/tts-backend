@@ -1,0 +1,20 @@
+# Linux systemd service configuration for TTS
+# Installation: sudo cp tts.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now tts
+[Unit]
+Description=Trader Tracking System (TTS) Production Service
+After=network-online.target postgresql.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tts-server
+EnvironmentFile=/opt/tts-server/.env
+ExecStart=/opt/tts-server/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 4
+Restart=always
+RestartSec=5
+User=www-data
+Group=www-data
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

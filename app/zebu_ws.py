@@ -1,0 +1,185 @@
+"""Real-Time Zebu / Noren WebSocket Streaming Client.
+
+Implements official Noren WebSocket protocol:
+- Handshake: {"t": "c", "uid": uid, "actid": actid, "susertoken": token, "source": "API"}
+- Ack: {"t": "ck", "s": "OK"}
+- Order subscription: {"t": "o", "actid": actid"}
+- Order messages: {"t": "om", ...}
+- Touchline: {"t": "t", "k": "..."}
+- Heartbeats: {"t": "h"}
+- Automatic reconnection with exponential backoff & jitter
+- Graceful degradation if WebSocket is not permitted
+"""
+import asyncio
+import json
+import logging
+import random
+from datetime import datetime, timezone
+from typing import Callable, Coroutine, Dict, Optional, Any
+import websockets
+import websockets.asyncio.client as _ws_modern
+
+log = logging.getLogger("tts.ws")
+
+
+class ZebuWebSocketClient:
+    def __init__(
+        self,
+        ws_url: str,
+        account_id: str,
+        uid: str,
+        actid: str,
+        token: str,
+        on_order_update: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
+        on_touchline_update: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
+        on_status_change: Optional[Callable[[str, str], Coroutine[Any, Any, None]]] = None,
+    ):
+        self.ws_url = ws_url
+        self.account_id = account_id
+        self.uid = uid
+        self.actid = actid or uid
+        self.token = token
+        self.on_order_update = on_order_update
+        self.on_touchline_update = on_touchline_update
+        self.on_status_change = on_status_change
+
+        self._running = False
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._task: Optional[asyncio.Task] = None
+        self._status = "DISCONNECTED"
+        self._last_event_time: Optional[datetime] = None
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    @property
+    def last_event_time(self) -> Optional[datetime]:
+        return self._last_event_time
+
+    async def start(self):
+        """Start the persistent WebSocket connection in a background task."""
+        if self._running:
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self):
+        """Gracefully stop the WebSocket connection."""
+        self._running = False
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        await self._set_status("DISCONNECTED")
+
+    async def _set_status(self, new_status: str, message: str = ""):
+        self._status = new_status
+        if self.on_status_change:
+            try:
+                await self.on_status_change(new_status, message)
+            except Exception as e:
+                log.error(f"Error in on_status_change callback for {self.account_id}: {e}")
+
+    async def _run_loop(self):
+        retry_delay = 1.0
+        max_delay = 60.0
+
+        while self._running:
+            try:
+                log.info(f"Connecting WebSocket for account {self.account_id} to {self.ws_url}")
+                # Use modern websockets.asyncio.client API (websockets >= 13.0)
+                async with _ws_modern.connect(
+                    self.ws_url,
+                    ping_interval=None,  # We manage Noren custom heartbeats manually
+                    close_timeout=10,
+                ) as ws:
+                    self._ws = ws
+
+                    # 1. Handshake
+                    handshake = {
+                        "t": "c",
+                        "uid": self.uid,
+                        "actid": self.actid,
+                        "susertoken": self.token,
+                        "source": "API",
+                    }
+                    await ws.send(json.dumps(handshake))
+
+                    # 2. Receive Handshake Ack
+                    ack_raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                    ack = json.loads(ack_raw) if isinstance(ack_raw, str) else json.loads(ack_raw.decode("utf-8"))
+
+                    if ack.get("t") != "ck" or ack.get("s") != "OK":
+                        log.warning(f"Handshake failed for {self.account_id}: {ack}")
+                        await self._set_status("DEGRADED", f"Handshake failed: {ack.get('emsg', 'Unknown')}")
+                        await asyncio.sleep(retry_delay)
+                        continue
+
+                    # 3. Connection Established
+                    await self._set_status("REAL-TIME")
+                    retry_delay = 1.0  # Reset backoff on success
+
+                    # 4. Subscribe to Order Updates
+                    order_sub = {"t": "o", "actid": self.actid}
+                    await ws.send(json.dumps(order_sub))
+
+                    # 5. Heartbeat & Message Processing
+                    heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+                    try:
+                        async for raw_msg in ws:
+                            if not self._running:
+                                break
+                            self._last_event_time = datetime.now(timezone.utc)
+                            msg = json.loads(raw_msg) if isinstance(raw_msg, str) else json.loads(raw_msg.decode("utf-8"))
+                            await self._handle_message(msg)
+                    finally:
+                        heartbeat_task.cancel()
+                        try:
+                            await heartbeat_task
+                        except asyncio.CancelledError:
+                            pass
+
+            except (websockets.exceptions.ConnectionClosed, ConnectionError, asyncio.TimeoutError) as e:
+                log.warning(f"WebSocket disconnected for {self.account_id}: {e}")
+                await self._set_status("DEGRADED", f"Disconnected: {e}")
+            except Exception as e:
+                log.error(f"Unexpected WebSocket error for {self.account_id}: {e}", exc_info=True)
+                await self._set_status("DEGRADED", str(e))
+
+            if self._running:
+                jitter = random.uniform(0.5, 1.5)
+                sleep_time = min(retry_delay * jitter, max_delay)
+                log.info(f"Reconnecting {self.account_id} in {sleep_time:.2f}s...")
+                await asyncio.sleep(sleep_time)
+                retry_delay = min(retry_delay * 2, max_delay)
+
+    async def _heartbeat_loop(self, ws):
+        """Sends Noren {"t": "h"} heartbeat every 30 seconds."""
+        while self._running:
+            try:
+                await asyncio.sleep(30)
+                await ws.send(json.dumps({"t": "h"}))
+            except Exception:
+                break
+
+    async def _handle_message(self, msg: Dict[str, Any]):
+        """Dispatches incoming Noren messages."""
+        t = msg.get("t")
+        if t == "om":
+            # Order update event
+            if self.on_order_update:
+                await self.on_order_update(msg)
+        elif t in ("tk", "tf"):
+            # Touchline / Price feed event
+            if self.on_touchline_update:
+                await self.on_touchline_update(msg)
+        elif t == "ck":
+            pass  # Heartbeat or acknowledgment

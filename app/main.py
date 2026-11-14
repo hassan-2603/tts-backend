@@ -790,7 +790,8 @@ async def zebu_start(request: Request, n: str = "", account: str = ""):
     d = LINK_NONCE_MAP.get(n) or await DB._get_link_nonce(n)
     if not d or d["exp"] < time.time():
         return HTMLResponse("<h3>Link expired. Go back to the dashboard and click Link again.</h3>", 400)
-    r = RedirectResponse(ZEBU.authorize_url(state=n))
+    cb_url = "https://tts-backend-ezm3.onrender.com/auth/zebu/callback"
+    r = RedirectResponse(ZEBU.authorize_url(state=n, redirect_uri=cb_url))
     ref = d.get("frontend_url") or request.headers.get("referer") or request.headers.get("origin") or ""
     if ref:
         r.set_cookie("tts_fe_url", ref, max_age=900, httponly=True, samesite="lax", secure=True)

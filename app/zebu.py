@@ -70,8 +70,11 @@ class ZebuClient:
             self._sync_http.close()
 
     # ---------- OAuth ----------
-    def authorize_url(self, state: str = "") -> str:
+    def authorize_url(self, state: str = "", redirect_uri: str = "") -> str:
         url = f"{self.base}/OAuthlogin/authorize/oauth?client_id={self.client_id}"
+        if redirect_uri:
+            import urllib.parse
+            url += f"&redirect_uri={urllib.parse.quote(redirect_uri, safe='')}"
         if state:
             url += f"&state={state}"
         return url
@@ -82,61 +85,71 @@ class ZebuClient:
     async def exchange_code_async(self, code: str) -> dict:
         """Returns {access_token, refresh_token, expires_in, ...}"""
         errors = []
-        # Try format 1: AppKey + SecretKey + Code
-        cs1 = hashlib.sha256(f"{self.client_id}{self.secret_key}{code}".encode("utf-8")).hexdigest()
-        try:
-            r = await self._post_async("GenAcsTok", {"code": code, "checksum": cs1}, token=None)
-            tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
-            if tok and r.get("stat") == "Ok":
-                r["access_token"] = tok
-                return r
-            if isinstance(r, dict) and r.get("emsg"):
-                errors.append(r["emsg"])
-        except Exception as e:
-            errors.append(str(e))
+        keys = [self.client_id]
+        if "_" in self.client_id:
+            keys.append(self.client_id.split("_")[0])
 
-        # Try format 2: AppKey + Code + SecretKey
-        cs2 = hashlib.sha256(f"{self.client_id}{code}{self.secret_key}".encode("utf-8")).hexdigest()
-        try:
-            r = await self._post_async("GenAcsTok", {"code": code, "checksum": cs2}, token=None)
-            tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
-            if tok and r.get("stat") == "Ok":
-                r["access_token"] = tok
-                return r
-            if isinstance(r, dict) and r.get("emsg"):
-                errors.append(r["emsg"])
-        except Exception as e:
-            errors.append(str(e))
+        for k in keys:
+            # 1. Format: AppKey + SecretKey + Code
+            cs1 = hashlib.sha256(f"{k}{self.secret_key}{code}".encode("utf-8")).hexdigest()
+            try:
+                r = await self._post_async("GenAcsTok", {"code": code, "checksum": cs1}, token=None)
+                tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
+                if tok and r.get("stat") == "Ok":
+                    r["access_token"] = tok
+                    return r
+                if isinstance(r, dict) and r.get("emsg"):
+                    errors.append(r["emsg"])
+            except Exception as e:
+                errors.append(str(e))
 
-        raise ZebuError("; ".join(errors) or "Token exchange failed")
+            # 2. Format: AppKey + Code + SecretKey
+            cs2 = hashlib.sha256(f"{k}{code}{self.secret_key}".encode("utf-8")).hexdigest()
+            try:
+                r = await self._post_async("GenAcsTok", {"code": code, "checksum": cs2}, token=None)
+                tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
+                if tok and r.get("stat") == "Ok":
+                    r["access_token"] = tok
+                    return r
+                if isinstance(r, dict) and r.get("emsg"):
+                    errors.append(r["emsg"])
+            except Exception as e:
+                errors.append(str(e))
+
+        raise ZebuError("; ".join(dict.fromkeys(errors)) or "Token exchange failed")
 
     def exchange_code(self, code: str) -> dict:
         errors = []
-        cs1 = hashlib.sha256(f"{self.client_id}{self.secret_key}{code}".encode("utf-8")).hexdigest()
-        try:
-            r = self._post_sync("GenAcsTok", {"code": code, "checksum": cs1}, token=None)
-            tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
-            if tok and r.get("stat") == "Ok":
-                r["access_token"] = tok
-                return r
-            if isinstance(r, dict) and r.get("emsg"):
-                errors.append(r["emsg"])
-        except Exception as e:
-            errors.append(str(e))
+        keys = [self.client_id]
+        if "_" in self.client_id:
+            keys.append(self.client_id.split("_")[0])
 
-        cs2 = hashlib.sha256(f"{self.client_id}{code}{self.secret_key}".encode("utf-8")).hexdigest()
-        try:
-            r = self._post_sync("GenAcsTok", {"code": code, "checksum": cs2}, token=None)
-            tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
-            if tok and r.get("stat") == "Ok":
-                r["access_token"] = tok
-                return r
-            if isinstance(r, dict) and r.get("emsg"):
-                errors.append(r["emsg"])
-        except Exception as e:
-            errors.append(str(e))
+        for k in keys:
+            cs1 = hashlib.sha256(f"{k}{self.secret_key}{code}".encode("utf-8")).hexdigest()
+            try:
+                r = self._post_sync("GenAcsTok", {"code": code, "checksum": cs1}, token=None)
+                tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
+                if tok and r.get("stat") == "Ok":
+                    r["access_token"] = tok
+                    return r
+                if isinstance(r, dict) and r.get("emsg"):
+                    errors.append(r["emsg"])
+            except Exception as e:
+                errors.append(str(e))
 
-        raise ZebuError("; ".join(errors) or "Token exchange failed")
+            cs2 = hashlib.sha256(f"{k}{code}{self.secret_key}".encode("utf-8")).hexdigest()
+            try:
+                r = self._post_sync("GenAcsTok", {"code": code, "checksum": cs2}, token=None)
+                tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
+                if tok and r.get("stat") == "Ok":
+                    r["access_token"] = tok
+                    return r
+                if isinstance(r, dict) and r.get("emsg"):
+                    errors.append(r["emsg"])
+            except Exception as e:
+                errors.append(str(e))
+
+        raise ZebuError("; ".join(dict.fromkeys(errors)) or "Token exchange failed")
 
     # ---------- Low Level Async Request with Exponential Backoff ----------
     async def _post_async(self, endpoint: str, payload: dict, token: Optional[str] = None, retries: int = 2) -> Any:

@@ -107,8 +107,9 @@ class ZebuWebSocketClient:
                     handshake = {
                         "t": "c",
                         "uid": self.uid,
-                        "actid": self.actid,
+                        "actid": self.actid or self.uid,
                         "susertoken": self.token,
+                        "accesstoken": self.token,
                         "source": "API",
                     }
                     await ws.send(json.dumps(handshake))
@@ -117,7 +118,7 @@ class ZebuWebSocketClient:
                     ack_raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
                     ack = json.loads(ack_raw) if isinstance(ack_raw, str) else json.loads(ack_raw.decode("utf-8"))
 
-                    if ack.get("t") != "ck" or ack.get("s") != "OK":
+                    if ack.get("t") not in ("ck", "ak") or str(ack.get("s", "")).upper() != "OK":
                         log.warning(f"Handshake failed for {self.account_id}: {ack}")
                         await self._set_status("DEGRADED", f"Handshake failed: {ack.get('emsg', 'Unknown')}")
                         await asyncio.sleep(retry_delay)

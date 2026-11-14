@@ -79,14 +79,20 @@ class ZebuClient:
     async def exchange_code_async(self, code: str) -> dict:
         """Returns {access_token, refresh_token, expires_in, ...}"""
         r = await self._post_async("GenAcsTok", {"code": code, "checksum": self.checksum(code)}, token=None)
-        if not isinstance(r, dict) or r.get("stat") != "Ok" or not r.get("access_token"):
+        tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
+        if not isinstance(r, dict) or r.get("stat") != "Ok" or not tok:
             raise ZebuError((r or {}).get("emsg", "Token exchange failed"))
+        if not r.get("access_token") and tok:
+            r["access_token"] = tok
         return r
 
     def exchange_code(self, code: str) -> dict:
         r = self._post_sync("GenAcsTok", {"code": code, "checksum": self.checksum(code)}, token=None)
-        if not isinstance(r, dict) or r.get("stat") != "Ok" or not r.get("access_token"):
+        tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
+        if not isinstance(r, dict) or r.get("stat") != "Ok" or not tok:
             raise ZebuError((r or {}).get("emsg", "Token exchange failed"))
+        if not r.get("access_token") and tok:
+            r["access_token"] = tok
         return r
 
     # ---------- Low Level Async Request with Exponential Backoff ----------
@@ -94,10 +100,12 @@ class ZebuClient:
         if endpoint not in READ_ONLY_ENDPOINTS:
             raise PermissionError(f"{endpoint} is not allowed — tracking software is strictly read-only")
 
-        headers = {"Content-Type": "text/plain"}
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         body = "jData=" + json.dumps(payload, separators=(",", ":"))
+        if token:
+            body += f"&jKey={token}"
         client = self._get_async_http()
 
         last_ex = None
@@ -137,10 +145,12 @@ class ZebuClient:
         if endpoint not in READ_ONLY_ENDPOINTS:
             raise PermissionError(f"{endpoint} is not allowed — tracking software is strictly read-only")
 
-        headers = {"Content-Type": "text/plain"}
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         body = "jData=" + json.dumps(payload, separators=(",", ":"))
+        if token:
+            body += f"&jKey={token}"
         client = self._get_sync_http()
 
         resp = client.post(f"{self.base}/NorenWClientAPI/{endpoint}", content=body, headers=headers)

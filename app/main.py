@@ -702,8 +702,9 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
     exp_in = 86400
     try:
         exchanged = await ZEBU.exchange_code_async(token_str)
-        if isinstance(exchanged, dict) and exchanged.get("access_token"):
-            final_token = exchanged["access_token"]
+        tok = (exchanged.get("access_token") or exchanged.get("susertoken")) if isinstance(exchanged, dict) else None
+        if tok:
+            final_token = tok
             exp_in = int(float(exchanged.get("expires_in") or 86400))
             log.info(f"Successfully exchanged code for access token for account {aid}")
     except Exception as e:

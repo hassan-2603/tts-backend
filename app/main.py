@@ -690,14 +690,33 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
     if not token_str:
         raise HTTPException(400, "Token is required")
 
+    # If the user pasted a raw auth code (or URL containing ?code=...), extract and exchange it!
+    if "code=" in token_str or "code" in token_str:
+        import urllib.parse
+        parsed = urllib.parse.urlparse(token_str)
+        qs = urllib.parse.parse_qs(parsed.query or (token_str if "?" not in token_str else token_str.split("?", 1)[1]))
+        if "code" in qs:
+            token_str = qs["code"][0]
+
+    final_token = token_str
+    exp_in = 86400
+    try:
+        exchanged = await ZEBU.exchange_code_async(token_str)
+        if isinstance(exchanged, dict) and exchanged.get("access_token"):
+            final_token = exchanged["access_token"]
+            exp_in = int(float(exchanged.get("expires_in") or 86400))
+            log.info(f"Successfully exchanged code for access token for account {aid}")
+    except Exception as e:
+        log.info(f"Using input as direct access token: {e}")
+
     doc = {
-        "access_token": token_str,
-        "expires_at": time.time() + 86400,
+        "access_token": final_token,
+        "expires_at": time.time() + exp_in,
         "linked_at": now_ist().isoformat(timespec="seconds"),
         "status": "Linked",
     }
     try:
-        cd = await ZEBU.client_details_async(token_str, acc.get("zebu_uid"), acc.get("zebu_actid") or acc.get("zebu_uid"))
+        cd = await ZEBU.client_details_async(final_token, acc.get("zebu_uid"), acc.get("zebu_actid") or acc.get("zebu_uid"))
         doc["cliname"] = cd.get("cliname") if isinstance(cd, dict) else None
     except Exception as e:
         log.warning(f"Could not verify client details with manual token: {e}")
@@ -709,7 +728,7 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
         account_id=acc["id"],
         uid=acc.get("zebu_uid", ""),
         actid=acc.get("zebu_actid") or acc.get("zebu_uid", ""),
-        token=token_str,
+        token=final_token,
         on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
     )
     asyncio.create_task(poll_all_async("manual_token"))
@@ -730,6 +749,16 @@ async def zebu_start(n: str):
 async def zebu_callback(request: Request, code: str = ""):
     n = request.cookies.get("tts_link", "")
     d = (await DB._get_link_nonce(n)) if n else None
+    if not d or d["exp"] < time.time():
+        # Fallback: check most recently created active link nonce in DB
+        from app.models import LinkNonce
+        async with AsyncSessionLocal() as session:
+            stmt = select(LinkNonce).where(LinkNonce.expires_at > datetime.now(timezone.utc)).order_by(LinkNonce.created_at.desc())
+            latest_nonce = (await session.execute(stmt)).scalars().first()
+            if latest_nonce:
+                d = {"account": latest_nonce.account_id, "exp": latest_nonce.expires_at.timestamp()}
+                n = latest_nonce.nonce
+
     if not d or d["exp"] < time.time():
         return HTMLResponse("<h3>Link session missing or expired. Start again from the dashboard.</h3>", 400)
     if not code:

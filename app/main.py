@@ -690,8 +690,8 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
     if not token_str:
         raise HTTPException(400, "Token is required")
 
-    # If the user pasted a raw auth code (or URL containing ?code=...), extract and exchange it!
-    if "code=" in token_str or "code" in token_str:
+    is_code = "code=" in token_str or "?" in token_str or "&" in token_str or "http" in token_str
+    if is_code:
         import urllib.parse
         parsed = urllib.parse.urlparse(token_str)
         qs = urllib.parse.parse_qs(parsed.query or (token_str if "?" not in token_str else token_str.split("?", 1)[1]))
@@ -700,28 +700,49 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
 
     final_token = token_str
     exp_in = 86400
+    exchange_error = None
+
+    if is_code or len(token_str) < 50:
+        try:
+            exchanged = await ZEBU.exchange_code_async(token_str)
+            tok = (exchanged.get("access_token") or exchanged.get("susertoken")) if isinstance(exchanged, dict) else None
+            if tok:
+                final_token = tok
+                exp_in = int(float(exchanged.get("expires_in") or 86400))
+                log.info(f"Successfully exchanged code for access token for account {aid}")
+            else:
+                exchange_error = (exchanged or {}).get("emsg", "No access token received from Zebu")
+        except Exception as e:
+            exchange_error = str(e)
+            log.warning(f"Failed to exchange code: {e}")
+
+    # Validate the token with Zebu before marking as Linked!
+    cliname = None
     try:
-        exchanged = await ZEBU.exchange_code_async(token_str)
-        tok = (exchanged.get("access_token") or exchanged.get("susertoken")) if isinstance(exchanged, dict) else None
-        if tok:
-            final_token = tok
-            exp_in = int(float(exchanged.get("expires_in") or 86400))
-            log.info(f"Successfully exchanged code for access token for account {aid}")
+        cd = await ZEBU.client_details_async(final_token, acc.get("zebu_uid"), acc.get("zebu_actid") or acc.get("zebu_uid"))
+        if isinstance(cd, dict):
+            if cd.get("stat") == "Not_Ok":
+                raise ZebuError(cd.get("emsg", "Session validation failed"))
+            cliname = cd.get("cliname")
     except Exception as e:
-        log.info(f"Using input as direct access token: {e}")
+        log.warning(f"Token validation failed for {aid}: {e}")
+        if is_code:
+            raise HTTPException(
+                400,
+                f"Zebu authentication failed: {exchange_error or e}. Note: Zebu authorization codes expire quickly (in 1-2 minutes) and can only be used once. Please generate a fresh login code."
+            )
+        raise HTTPException(
+            400,
+            f"Invalid Zebu token: {e}. Zebu rejected this token. Please generate a fresh login code."
+        )
 
     doc = {
         "access_token": final_token,
         "expires_at": time.time() + exp_in,
         "linked_at": now_ist().isoformat(timespec="seconds"),
         "status": "Linked",
+        "cliname": cliname,
     }
-    try:
-        cd = await ZEBU.client_details_async(final_token, acc.get("zebu_uid"), acc.get("zebu_actid") or acc.get("zebu_uid"))
-        doc["cliname"] = cd.get("cliname") if isinstance(cd, dict) else None
-    except Exception as e:
-        log.warning(f"Could not verify client details with manual token: {e}")
-
     await DB.put_token_async(aid, doc)
 
     # Attach WebSocket stream immediately

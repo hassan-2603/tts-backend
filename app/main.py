@@ -776,7 +776,17 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
 
 
 @app.get("/auth/zebu/start")
-async def zebu_start(request: Request, n: str = ""):
+async def zebu_start(request: Request, n: str = "", account: str = ""):
+    if account and not n:
+        acc = await DB.get_account_async(account)
+        if not acc:
+            return HTMLResponse("<h3>No such account.</h3>", 404)
+        n = generate_link_nonce()
+        fe = request.headers.get("referer") or request.headers.get("origin") or CFG.PUBLIC_URL
+        fe = fe.rstrip("/")
+        LINK_NONCE_MAP[n] = {"account": account, "exp": time.time() + 900, "frontend_url": fe}
+        await DB._put_link_nonce(n, {"account": account, "exp": time.time() + 900})
+
     d = LINK_NONCE_MAP.get(n) or await DB._get_link_nonce(n)
     if not d or d["exp"] < time.time():
         return HTMLResponse("<h3>Link expired. Go back to the dashboard and click Link again.</h3>", 400)

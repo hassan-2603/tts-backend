@@ -797,10 +797,11 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
         # Fallback: check most recently created active link nonce in DB
         from app.models import LinkNonce
         async with AsyncSessionLocal() as session:
-            stmt = select(LinkNonce).where(LinkNonce.expires_at > datetime.now(timezone.utc)).order_by(LinkNonce.created_at.desc())
+            stmt = select(LinkNonce).where(LinkNonce.exp > datetime.now(timezone.utc)).order_by(LinkNonce.created_at.desc())
             latest_nonce = (await session.execute(stmt)).scalars().first()
             if latest_nonce:
-                d = LINK_NONCE_MAP.get(latest_nonce.nonce) or {"account": latest_nonce.account_id, "exp": latest_nonce.expires_at.timestamp()}
+                exp_ts = latest_nonce.exp.timestamp() if latest_nonce.exp else time.time() + 900
+                d = LINK_NONCE_MAP.get(latest_nonce.nonce) or {"account": latest_nonce.account_id, "exp": exp_ts}
                 n = latest_nonce.nonce
 
     target_frontend = (d.get("frontend_url") if d else "") or fe_url or CFG.PUBLIC_URL

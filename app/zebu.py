@@ -70,8 +70,11 @@ class ZebuClient:
             self._sync_http.close()
 
     # ---------- OAuth ----------
-    def authorize_url(self) -> str:
-        return f"{self.base}/OAuthlogin/authorize/oauth?client_id={self.client_id}"
+    def authorize_url(self, state: str = "") -> str:
+        url = f"{self.base}/OAuthlogin/authorize/oauth?client_id={self.client_id}"
+        if state:
+            url += f"&state={state}"
+        return url
 
     def checksum(self, code: str) -> str:
         return hashlib.sha256((self.client_id + self.secret_key + code).encode()).hexdigest()

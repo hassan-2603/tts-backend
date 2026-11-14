@@ -664,17 +664,31 @@ async def put_account(aid: str, request: Request, _=Depends(admin_only)):
     return doc
 
 
+LINK_NONCE_MAP: Dict[str, Dict[str, Any]] = {}
+
+
 @app.post("/api/accounts/{aid}/link")
 async def link_account(aid: str, request: Request, _=Depends(admin_only)):
     if not await DB.get_account_async(aid):
         raise HTTPException(404, "No such account")
     if not CFG.ZEBU_CLIENT_ID:
         raise HTTPException(400, "ZEBU_CLIENT_ID is not set on the server")
+    
+    fe_url = None
+    try:
+        data = await request.json()
+        fe_url = data.get("frontend_url")
+    except Exception:
+        pass
+    
+    if not fe_url:
+        fe_url = request.headers.get("origin") or request.headers.get("referer") or CFG.PUBLIC_URL
+    fe_url = fe_url.rstrip("/")
+
     n = generate_link_nonce()
+    LINK_NONCE_MAP[n] = {"account": aid, "exp": time.time() + 900, "frontend_url": fe_url}
     await DB._put_link_nonce(n, {"account": aid, "exp": time.time() + 900})
-    origin = request.headers.get("origin") or request.headers.get("referer")
-    base = origin.rstrip("/") if origin else CFG.PUBLIC_URL.rstrip("/")
-    return {"url": f"{base}/auth/zebu/start?n={n}"}
+    return {"ok": True, "nonce": n, "url": f"/auth/zebu/start?n={n}"}
 
 
 @app.post("/api/accounts/{aid}/unlink")
@@ -762,12 +776,12 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
 
 
 @app.get("/auth/zebu/start")
-async def zebu_start(request: Request, n: str):
-    d = await DB._get_link_nonce(n)
+async def zebu_start(request: Request, n: str = ""):
+    d = LINK_NONCE_MAP.get(n) or await DB._get_link_nonce(n)
     if not d or d["exp"] < time.time():
         return HTMLResponse("<h3>Link expired. Go back to the dashboard and click Link again.</h3>", 400)
-    r = RedirectResponse(ZEBU.authorize_url())
-    ref = request.headers.get("referer") or request.headers.get("origin") or ""
+    r = RedirectResponse(ZEBU.authorize_url(state=n))
+    ref = d.get("frontend_url") or request.headers.get("referer") or request.headers.get("origin") or ""
     if ref:
         r.set_cookie("tts_fe_url", ref, max_age=900, httponly=True, samesite="lax", secure=True)
     r.set_cookie("tts_link", n, max_age=900, httponly=True, samesite="lax", secure=True)
@@ -775,10 +789,10 @@ async def zebu_start(request: Request, n: str):
 
 
 @app.get("/auth/zebu/callback")
-async def zebu_callback(request: Request, code: str = ""):
-    n = request.cookies.get("tts_link", "")
+async def zebu_callback(request: Request, code: str = "", state: str = ""):
+    n = state or request.cookies.get("tts_link", "")
     fe_url = request.cookies.get("tts_fe_url", "")
-    d = (await DB._get_link_nonce(n)) if n else None
+    d = LINK_NONCE_MAP.get(n) or ((await DB._get_link_nonce(n)) if n else None)
     if not d or d["exp"] < time.time():
         # Fallback: check most recently created active link nonce in DB
         from app.models import LinkNonce
@@ -786,11 +800,11 @@ async def zebu_callback(request: Request, code: str = ""):
             stmt = select(LinkNonce).where(LinkNonce.expires_at > datetime.now(timezone.utc)).order_by(LinkNonce.created_at.desc())
             latest_nonce = (await session.execute(stmt)).scalars().first()
             if latest_nonce:
-                d = {"account": latest_nonce.account_id, "exp": latest_nonce.expires_at.timestamp()}
+                d = LINK_NONCE_MAP.get(latest_nonce.nonce) or {"account": latest_nonce.account_id, "exp": latest_nonce.expires_at.timestamp()}
                 n = latest_nonce.nonce
 
-    target_frontend = (fe_url or CFG.PUBLIC_URL).rstrip("/")
-    target_url = f"{target_frontend}/?linked=true#traders"
+    target_frontend = (d.get("frontend_url") if d else "") or fe_url or CFG.PUBLIC_URL
+    target_url = f"{target_frontend.rstrip('/')}/?linked=true#traders"
 
     if not d or d["exp"] < time.time():
         return HTMLResponse(f"<h3>Link session expired. <a href='{target_url}'>Click here to return to dashboard</a></h3>", 400)
@@ -801,7 +815,13 @@ async def zebu_callback(request: Request, code: str = ""):
     try:
         tok = await ZEBU.exchange_code_async(code)
     except Exception as e:
-        return HTMLResponse(f"<h3>Zebu login failed: {e}. <a href='{target_url}'>Click here to return to dashboard</a></h3>", 400)
+        return HTMLResponse(
+            f"""<div style='font-family:sans-serif;padding:40px;text-align:center;'>
+            <h2 style='color:#ef4444;'>❌ Zebu login failed</h2>
+            <p>{e}</p>
+            <p><a href='{target_url}' style='color:#38bdf8;'>← Return to Dashboard</a></p>
+            </div>""", 400
+        )
 
     exp_in = int(float(tok.get("expires_in") or 0))
     if not exp_in or exp_in <= 0:
@@ -822,6 +842,7 @@ async def zebu_callback(request: Request, code: str = ""):
 
     await DB.put_token_async(d["account"], doc)
     await DB._delete_link_nonce(n)
+    LINK_NONCE_MAP.pop(n, None)
 
     # Attach WebSocket stream immediately
     await CONN_MGR.register_account_stream(
@@ -839,19 +860,24 @@ async def zebu_callback(request: Request, code: str = ""):
         f"""<!DOCTYPE html>
 <html>
 <head>
-    <meta http-equiv="refresh" content="0; url={target_url}">
-    <title>Redirecting to dashboard...</title>
+    <title>Zebu Account Linked</title>
 </head>
 <body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f172a;color:#f8fafc;">
-    <div style="text-align:center">
-        <h2>✅ {acc['name']} linked to Zebu!</h2>
-        <p style="color:#94a3b8">Redirecting you right back to your dashboard...</p>
+    <div style="text-align:center;padding:24px;background:#1e293b;border-radius:12px;border:1px solid #334155;max-width:440px;">
+        <h2 style="color:#22c55e;margin-top:0;">✅ {acc['name']} Linked!</h2>
+        <p style="color:#94a3b8;font-size:14px;">Your Zebu account is connected and live streaming is active.</p>
+        <p style="color:#64748b;font-size:13px;">Returning to your dashboard in 2 seconds...</p>
+        <p style="margin-top:16px;"><a href="{target_url}" style="color:#38bdf8;text-decoration:none;font-weight:600;">← Back to Dashboard</a></p>
     </div>
     <script>
-        if (window.opener && !window.opener.closed) {{
-            try {{ window.opener.location.href = "{target_url}"; }} catch(e) {{}}
-            window.close();
-        }} else {{
+        try {{
+            if (window.opener && !window.opener.closed) {{
+                try {{ window.opener.location.reload(); }} catch(e) {{}}
+                setTimeout(function() {{ window.close(); }}, 1800);
+            }} else {{
+                setTimeout(function() {{ window.location.href = "{target_url}"; }}, 1800);
+            }}
+        }} catch(e) {{
             window.location.href = "{target_url}";
         }}
     </script>

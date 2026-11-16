@@ -888,11 +888,16 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
     </div>
     <script>
         try {{
+            const bc = new BroadcastChannel('tts_auth');
+            bc.postMessage({{ type: 'zebu_linked', account: '{acc['id']}' }});
+        }} catch(e) {{}}
+
+        try {{
             if (window.opener && !window.opener.closed) {{
                 try {{ window.opener.location.reload(); }} catch(e) {{}}
-                setTimeout(function() {{ window.close(); }}, 1800);
+                setTimeout(function() {{ window.close(); }}, 1500);
             }} else {{
-                setTimeout(function() {{ window.location.href = "{target_url}"; }}, 1800);
+                setTimeout(function() {{ window.location.href = "{target_url}"; }}, 1500);
             }}
         }} catch(e) {{
             window.location.href = "{target_url}";

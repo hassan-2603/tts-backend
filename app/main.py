@@ -776,15 +776,18 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
 
 
 @app.get("/auth/zebu/start")
-async def zebu_start(request: Request, n: str = "", account: str = ""):
+async def zebu_start(request: Request, n: str = "", account: str = "", fe: str = ""):
+    fe_param = fe or request.query_params.get("fe") or ""
     if account and not n:
         acc = await DB.get_account_async(account)
         if not acc:
             return HTMLResponse("<h3>No such account.</h3>", 404)
         n = generate_link_nonce()
-        fe = request.headers.get("referer") or request.headers.get("origin") or CFG.PUBLIC_URL
-        fe = fe.rstrip("/")
-        LINK_NONCE_MAP[n] = {"account": account, "exp": time.time() + 900, "frontend_url": fe}
+        frontend_target = fe_param or request.headers.get("referer") or request.headers.get("origin") or CFG.FRONTEND_URL
+        frontend_target = str(frontend_target).split("?")[0].rstrip("/")
+        if not frontend_target or "onrender.com" in frontend_target or "localhost:8000" in frontend_target or "/auth" in frontend_target:
+            frontend_target = CFG.FRONTEND_URL.rstrip("/")
+        LINK_NONCE_MAP[n] = {"account": account, "exp": time.time() + 900, "frontend_url": frontend_target}
         await DB._put_link_nonce(n, {"account": account, "exp": time.time() + 900})
 
     d = LINK_NONCE_MAP.get(n) or await DB._get_link_nonce(n)
@@ -792,9 +795,9 @@ async def zebu_start(request: Request, n: str = "", account: str = ""):
         return HTMLResponse("<h3>Link expired. Go back to the dashboard and click Link again.</h3>", 400)
     cb_url = "https://tts-backend-ezm3.onrender.com/auth/zebu/callback"
     r = RedirectResponse(ZEBU.authorize_url(state=n, redirect_uri=cb_url))
-    ref = d.get("frontend_url") or request.headers.get("referer") or request.headers.get("origin") or ""
+    ref = d.get("frontend_url") or fe_param or request.headers.get("referer") or request.headers.get("origin") or CFG.FRONTEND_URL
     if ref:
-        r.set_cookie("tts_fe_url", ref, max_age=900, httponly=True, samesite="lax", secure=True)
+        r.set_cookie("tts_fe_url", str(ref).split("?")[0].rstrip("/"), max_age=900, httponly=True, samesite="lax", secure=True)
     r.set_cookie("tts_link", n, max_age=900, httponly=True, samesite="lax", secure=True)
     return r
 
@@ -815,7 +818,9 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
                 d = LINK_NONCE_MAP.get(latest_nonce.nonce) or {"account": latest_nonce.account_id, "exp": exp_ts}
                 n = latest_nonce.nonce
 
-    target_frontend = (d.get("frontend_url") if d else "") or fe_url or CFG.PUBLIC_URL
+    target_frontend = (d.get("frontend_url") if d else "") or fe_url or CFG.FRONTEND_URL
+    if not target_frontend or "onrender.com" in target_frontend or "localhost:8000" in target_frontend or "127.0.0.1:8000" in target_frontend or "/auth" in target_frontend:
+        target_frontend = CFG.FRONTEND_URL
     target_url = f"{target_frontend.rstrip('/')}/?linked=true#traders"
 
     if not d or d["exp"] < time.time():
@@ -1062,9 +1067,9 @@ FRONTEND_DIR = get_frontend_dir()
 @app.get("/")
 def index():
     html_file = FRONTEND_DIR / "index.html"
-    if not html_file.exists():
-        raise HTTPException(404, "Frontend file index.html not found.")
-    return FileResponse(html_file)
+    if html_file.exists():
+        return FileResponse(html_file)
+    return RedirectResponse(CFG.FRONTEND_URL, status_code=302)
 
 
 # Mount static assets if present

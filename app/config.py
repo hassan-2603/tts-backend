@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     ENV: str = Field(default="development")
     DEBUG: bool = Field(default=False)
     PUBLIC_URL: str = Field(default="http://localhost:8000")
+    FRONTEND_URL: str = Field(default="https://tts-frontend-liart.vercel.app")
     API_V1_STR: str = Field(default="/api")
     SECRET_KEY: str = Field(default_factory=lambda: secrets.token_hex(32))
     TOKEN_ENCRYPTION_KEY: str = Field(

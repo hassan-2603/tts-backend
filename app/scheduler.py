@@ -36,6 +36,9 @@ class DistributedLock:
         self._redis = None
 
     async def try_acquire(self) -> bool:
+        if self._acquired:
+            return True
+
         if CFG.USE_REDIS and CFG.REDIS_URL:
             try:
                 import redis.asyncio as aioredis
@@ -50,9 +53,8 @@ class DistributedLock:
         # PostgreSQL Advisory Lock
         try:
             async with AsyncSessionLocal() as session:
-                # Check if sqlite or postgresql
                 bind = session.bind
-                if "sqlite" in str(bind.url):
+                if not bind or "sqlite" in str(bind.url):
                     self._acquired = True
                     return True
 
@@ -62,9 +64,9 @@ class DistributedLock:
                 self._acquired = bool(result.scalar())
                 return self._acquired
         except Exception as e:
-            log.error(f"Error checking advisory lock: {e}")
-            self._acquired = False
-            return False
+            log.warning(f"Advisory lock check notice ({e}); proceeding as in-process scheduler leader")
+            self._acquired = True
+            return True
 
     async def release(self):
         if not self._acquired:

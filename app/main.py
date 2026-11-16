@@ -10,6 +10,7 @@ Features:
 """
 import asyncio
 import hashlib
+import httpx
 import json
 import logging
 import os

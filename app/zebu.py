@@ -71,7 +71,7 @@ class ZebuClient:
 
     # ---------- OAuth ----------
     def authorize_url(self, state: str = "", redirect_uri: str = "") -> str:
-        url = f"{self.base}/OAuthlogin/authorize/oauth?client_id={self.client_id}"
+        url = f"{self.base}/OAuthlogin/authorize/oauth?client_id={self.client_id}&prompt=login"
         if redirect_uri:
             import urllib.parse
             url += f"&redirect_uri={urllib.parse.quote(redirect_uri, safe='')}"
@@ -83,13 +83,24 @@ class ZebuClient:
         return hashlib.sha256((self.client_id + self.secret_key + code).encode()).hexdigest()
 
     async def exchange_code_async(self, code: str, uid: str = "") -> dict:
-        """Returns {access_token, refresh_token, expires_in, ...}"""
+        """Returns {access_token, refresh_token, expires_in, ...} for a specific user ID."""
         errors = []
-        uids = [u for u in [uid, self.client_id.split("_")[0], self.client_id, "Z58805"] if u]
+        clean_uid = uid.strip().upper() if uid else ""
+        if clean_uid:
+            uids = [clean_uid]
+        else:
+            base_app = self.client_id.split("_")[0] if self.client_id else ""
+            uids = [u for u in [base_app, self.client_id] if u]
         uids = list(dict.fromkeys(uids))
 
-        appkeys = [k for k in [self.client_id, uid, f"{uid}_U" if uid else "", self.client_id.split("_")[0] if "_" in self.client_id else "", f"{self.client_id}_U", "Z58805", "Z58805_U"] if k]
-        appkeys = list(dict.fromkeys(appkeys))
+        appkeys = [self.client_id]
+        if "_" in self.client_id:
+            appkeys.append(self.client_id.split("_")[0])
+        else:
+            appkeys.append(f"{self.client_id}_U")
+        if clean_uid:
+            appkeys.extend([clean_uid, f"{clean_uid}_U"])
+        appkeys = list(dict.fromkeys([k for k in appkeys if k]))
 
         for u in uids:
             for k in appkeys:
@@ -125,11 +136,22 @@ class ZebuClient:
 
     def exchange_code(self, code: str, uid: str = "") -> dict:
         errors = []
-        uids = [u for u in [uid, self.client_id.split("_")[0], self.client_id, "Z58805"] if u]
+        clean_uid = uid.strip().upper() if uid else ""
+        if clean_uid:
+            uids = [clean_uid]
+        else:
+            base_app = self.client_id.split("_")[0] if self.client_id else ""
+            uids = [u for u in [base_app, self.client_id] if u]
         uids = list(dict.fromkeys(uids))
 
-        appkeys = [k for k in [self.client_id, uid, f"{uid}_U" if uid else "", self.client_id.split("_")[0] if "_" in self.client_id else "", f"{self.client_id}_U", "Z58805", "Z58805_U"] if k]
-        appkeys = list(dict.fromkeys(appkeys))
+        appkeys = [self.client_id]
+        if "_" in self.client_id:
+            appkeys.append(self.client_id.split("_")[0])
+        else:
+            appkeys.append(f"{self.client_id}_U")
+        if clean_uid:
+            appkeys.extend([clean_uid, f"{clean_uid}_U"])
+        appkeys = list(dict.fromkeys([k for k in appkeys if k]))
 
         for u in uids:
             for k in appkeys:

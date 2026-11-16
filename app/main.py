@@ -283,18 +283,24 @@ async def poll_all_async(reason: str = "schedule") -> dict:
     accounts = await DB.get_all_accounts_async()
     results = {}
 
-    tasks = []
-    for acc in accounts:
-        if acc.get("broker", "Zebu") != "Zebu" or not acc.get("zebu_uid"):
-            continue
-
-        async def _sync_single(a=acc):
+    async def _sync_one(acc_dict):
+        async def _sync_single(a=acc_dict):
             return await poll_account_async(a, now)
+        res = await CONN_MGR.sync_account_bounded(acc_dict, _sync_single)
+        return acc_dict["id"], res
 
-        tasks.append((acc["id"], CONN_MGR.sync_account_bounded(acc, _sync_single)))
-
-    for aid, task in tasks:
-        results[aid] = await task
+    tasks = [
+        _sync_one(acc)
+        for acc in accounts
+        if acc.get("broker", "Zebu") == "Zebu" and acc.get("zebu_uid")
+    ]
+    if tasks:
+        synced_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for item in synced_results:
+            if isinstance(item, tuple):
+                results[item[0]] = item[1]
+            elif isinstance(item, Exception):
+                log.error(f"Error during parallel poll: {item}")
 
     await DB._put_status("poll", {"last": now.isoformat(timespec="seconds"), "reason": reason, "results": results})
     await send_flag_alerts_async(now)
@@ -699,7 +705,9 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
     data = await request.json()
     token_str = (data.get("token") or "").strip()
     if not token_str:
-        raise HTTPException(400, "Token is required")
+        raise HTTPException(400, "Token or code is required")
+
+    uid = (acc.get("zebu_uid") or acc.get("zebu_actid") or "").strip().upper()
 
     is_code = "code=" in token_str or "?" in token_str or "&" in token_str or "http" in token_str
     if is_code:
@@ -710,17 +718,16 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
             token_str = qs["code"][0]
 
     final_token = token_str
-    exp_in = 86400
+    exp_in = 86400 * 3650  # Keep linked permanently (10 years) until disconnected
     exchange_error = None
 
     if is_code or len(token_str) < 50:
         try:
-            exchanged = await ZEBU.exchange_code_async(token_str)
+            exchanged = await ZEBU.exchange_code_async(token_str, uid=uid)
             tok = (exchanged.get("access_token") or exchanged.get("susertoken")) if isinstance(exchanged, dict) else None
             if tok:
                 final_token = tok
-                exp_in = int(float(exchanged.get("expires_in") or 86400))
-                log.info(f"Successfully exchanged code for access token for account {aid}")
+                log.info(f"Successfully exchanged code for access token for account {aid} ({uid})")
             else:
                 exchange_error = (exchanged or {}).get("emsg", "No access token received from Zebu")
         except Exception as e:
@@ -730,21 +737,24 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
     # Validate the token with Zebu before marking as Linked!
     cliname = None
     try:
-        cd = await ZEBU.client_details_async(final_token, acc.get("zebu_uid"), acc.get("zebu_actid") or acc.get("zebu_uid"))
+        cd = await ZEBU.client_details_async(final_token, uid, acc.get("zebu_actid") or uid)
         if isinstance(cd, dict):
             if cd.get("stat") == "Not_Ok":
                 raise ZebuError(cd.get("emsg", "Session validation failed"))
             cliname = cd.get("cliname")
+            returned_actid = (cd.get("actid") or cd.get("uid") or "").strip().upper()
+            if returned_actid and uid and returned_actid != uid:
+                raise ZebuError(f"Session belongs to client '{returned_actid}', but this account is configured for '{uid}'. Please log in as '{uid}'.")
     except Exception as e:
         log.warning(f"Token validation failed for {aid}: {e}")
         if is_code:
             raise HTTPException(
                 400,
-                f"Zebu authentication failed: {exchange_error or e}. Note: Zebu authorization codes expire quickly (in 1-2 minutes) and can only be used once. Please generate a fresh login code."
+                f"Zebu authentication failed: {exchange_error or e}. Check that you logged into Zebu as '{uid}' and that the authorization code was not already used."
             )
         raise HTTPException(
             400,
-            f"Invalid Zebu token: {e}. Zebu rejected this token. Please generate a fresh login code."
+            f"Invalid Zebu token for {uid}: {e}. Zebu rejected this token."
         )
 
     doc = {
@@ -759,8 +769,8 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
     # Attach WebSocket stream immediately
     await CONN_MGR.register_account_stream(
         account_id=acc["id"],
-        uid=acc.get("zebu_uid", ""),
-        actid=acc.get("zebu_actid") or acc.get("zebu_uid", ""),
+        uid=uid,
+        actid=acc.get("zebu_actid") or uid,
         token=final_token,
         on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
     )
@@ -837,7 +847,8 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
             d["account"] = acc["id"]
         else:
             return HTMLResponse(f"<h3>No Zebu account found to link. <a href='{target_url}'>Return to dashboard</a></h3>", 404)
-    uid = (acc.get("zebu_uid") if acc else "") or (acc.get("zebu_actid") if acc else "") or "Z58805"
+    uid = (acc.get("zebu_uid") if acc else "") or (acc.get("zebu_actid") if acc else "")
+    uid = uid.strip().upper()
     try:
         tok = await ZEBU.exchange_code_async(code, uid=uid)
     except Exception as e:
@@ -857,12 +868,70 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
         </div>""" if ("INVALID_IP" in str(e) and server_ip_str) else ""
 
         return HTMLResponse(
-            f"""<div style='font-family:sans-serif;padding:40px;text-align:center;'>
-            <h2 style='color:#ef4444;'>❌ Zebu login failed</h2>
-            <p style='color:#f8fafc;'>{e}</p>
-            {ip_hint}
-            <p><a href='{target_url}' style='color:#38bdf8;'>← Return to Dashboard</a></p>
-            </div>""", 400
+            f"""<!DOCTYPE html>
+<html>
+<head><title>Zebu Login Failed</title></head>
+<body style='font-family:sans-serif;padding:40px;text-align:center;background:#0f172a;color:#f8fafc;'>
+    <div style='max-width:480px;margin:40px auto;background:#1e293b;border-radius:12px;border:1px solid #ef4444;padding:24px;'>
+        <h2 style='color:#ef4444;margin-top:0;'>❌ Zebu Login Failed</h2>
+        <p style='color:#f8fafc;font-size:14px;'>{e}</p>
+        <p style='color:#94a3b8;font-size:13px;'>Attempted to link account <b>{acc.get('name', '')}</b> with client ID <code>{uid}</code>.</p>
+        {ip_hint}
+        <div style='margin-top:16px;background:#0f172a;border-radius:8px;padding:14px;text-align:left;font-size:12px;color:#94a3b8;'>
+            <b>Tip for Multiple Accounts:</b> If you were already signed into another Zebu account in this browser, Zebu re-uses that session.<br><br>
+            Please open an <b>Incognito / Private Window</b>, log into Zebu as <b>{uid}</b>, and authorize.
+        </div>
+        <p style='margin-top:20px;'><a href='{target_url}' style='color:#38bdf8;text-decoration:none;font-weight:600;'>← Return to Dashboard</a></p>
+    </div>
+</body>
+</html>""", 400
+        )
+
+    access_token = tok["access_token"]
+    cliname = None
+    mismatch_error = None
+    try:
+        cd = await ZEBU.client_details_async(access_token, uid, acc.get("zebu_actid") or uid)
+        if isinstance(cd, dict):
+            if cd.get("stat") == "Not_Ok":
+                mismatch_error = cd.get("emsg", "Validation rejected by Zebu")
+            else:
+                cliname = cd.get("cliname")
+                returned_actid = (cd.get("actid") or cd.get("uid") or "").strip().upper()
+                if returned_actid and uid and returned_actid != uid:
+                    mismatch_error = f"Zebu token belongs to client '{returned_actid}', but this account is configured for '{uid}'"
+    except Exception as ex:
+        mismatch_error = str(ex)
+
+    if mismatch_error:
+        log.warning(f"Zebu callback mismatch or validation error for {acc['id']} ({uid}): {mismatch_error}")
+        return HTMLResponse(
+            f"""<!DOCTYPE html>
+<html>
+<head><title>Zebu Account Mismatch</title></head>
+<body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f172a;color:#f8fafc;">
+    <div style="text-align:center;padding:30px;background:#1e293b;border-radius:12px;border:1px solid #ef4444;max-width:480px;">
+        <h2 style="color:#ef4444;margin-top:0;">⚠️ Account Mismatch Detected</h2>
+        <p style="color:#cbd5e1;font-size:14px;">
+            The Zebu session in your browser does not match the configured client ID for <b>{acc.get('name', 'this account')}</b>.
+        </p>
+        <p style="color:#f87171;font-size:13px;font-family:monospace;background:#0f172a;padding:8px;border-radius:6px;">
+            {mismatch_error}
+        </p>
+        <div style="background:#0f172a;border-radius:8px;padding:14px;margin:16px 0;text-align:left;font-size:13px;color:#94a3b8;">
+            <b>Why did this happen?</b><br>
+            Your browser was still logged into another Zebu account from a previous login.
+            <div style="margin-top:8px;color:#cbd5e1;"><b>To connect {acc.get('name')} ({uid}):</b></div>
+            <ol style="margin:6px 0 0 18px;padding:0;line-height:1.6;">
+                <li>Open a new <b>Incognito / Private Window</b> in your browser.</li>
+                <li>Go to the dashboard and click <b>Link Zebu</b> for <b>{acc.get('name')}</b>.</li>
+                <li>Log in using <b>{uid}</b>'s User ID and Password, then click Authorize.</li>
+            </ol>
+        </div>
+        <p><a href="{target_url}" style="color:#38bdf8;text-decoration:none;font-weight:600;">← Return to Dashboard</a></p>
+    </div>
+</body>
+</html>""", 400
         )
 
     exp_in = 86400 * 3650  # Keep linked permanently (10 years) until disconnected by user
@@ -873,13 +942,8 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
         "expires_at": time.time() + exp_in,
         "linked_at": now_ist().isoformat(timespec="seconds"),
         "status": "Linked",
+        "cliname": cliname,
     }
-    try:
-        cd = await ZEBU.client_details_async(doc["access_token"], acc.get("zebu_uid"), acc.get("zebu_actid") or acc.get("zebu_uid"))
-        doc["cliname"] = cd.get("cliname") if isinstance(cd, dict) else None
-    except Exception:
-        pass
-
     await DB.put_token_async(d["account"], doc)
     await DB._delete_link_nonce(n)
     LINK_NONCE_MAP.pop(n, None)

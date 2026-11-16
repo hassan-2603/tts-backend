@@ -807,8 +807,8 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
     n = state or request.cookies.get("tts_link", "")
     fe_url = request.cookies.get("tts_fe_url", "")
     d = LINK_NONCE_MAP.get(n) or ((await DB._get_link_nonce(n)) if n else None)
-    if not d or d["exp"] < time.time():
-        # Fallback: check most recently created active link nonce in DB
+    if not d or d.get("exp", 0) < time.time():
+        # Fallback 1: check most recently created active link nonce in DB
         from app.models import LinkNonce
         async with AsyncSessionLocal() as session:
             stmt = select(LinkNonce).where(LinkNonce.exp > datetime.now(timezone.utc)).order_by(LinkNonce.created_at.desc())
@@ -818,17 +818,32 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
                 d = LINK_NONCE_MAP.get(latest_nonce.nonce) or {"account": latest_nonce.account_id, "exp": exp_ts}
                 n = latest_nonce.nonce
 
+    # Fallback 2: if d is still missing, auto-detect the configured Zebu account
+    if not d or not d.get("account"):
+        all_acc = await DB.get_all_accounts_async()
+        zebu_accs = [a for a in all_acc if a.get("broker") == "Zebu"]
+        if zebu_accs:
+            d = {"account": zebu_accs[0]["id"], "exp": time.time() + 900, "frontend_url": CFG.FRONTEND_URL}
+
     target_frontend = (d.get("frontend_url") if d else "") or fe_url or CFG.FRONTEND_URL
     if not target_frontend or "onrender.com" in target_frontend or "localhost:8000" in target_frontend or "127.0.0.1:8000" in target_frontend or "/auth" in target_frontend:
         target_frontend = CFG.FRONTEND_URL
     target_url = f"{target_frontend.rstrip('/')}/?linked=true#traders"
 
-    if not d or d["exp"] < time.time():
+    if not d or not d.get("account"):
         return HTMLResponse(f"<h3>Link session expired. <a href='{target_url}'>Click here to return to dashboard</a></h3>", 400)
     if not code:
         return HTMLResponse(f"<h3>Zebu did not return a code. <a href='{target_url}'>Click here to return to dashboard</a></h3>", 400)
 
     acc = await DB.get_account_async(d["account"])
+    if not acc:
+        all_acc = await DB.get_all_accounts_async()
+        zebu_accs = [a for a in all_acc if a.get("broker") == "Zebu"]
+        if zebu_accs:
+            acc = zebu_accs[0]
+            d["account"] = acc["id"]
+        else:
+            return HTMLResponse(f"<h3>No Zebu account found to link. <a href='{target_url}'>Return to dashboard</a></h3>", 404)
     try:
         tok = await ZEBU.exchange_code_async(code)
     except Exception as e:
@@ -1070,7 +1085,9 @@ FRONTEND_DIR = get_frontend_dir()
 
 
 @app.get("/")
-def index():
+async def index(request: Request, code: str = "", state: str = ""):
+    if code:
+        return await zebu_callback(request, code=code, state=state)
     html_file = FRONTEND_DIR / "index.html"
     if html_file.exists():
         return FileResponse(html_file)

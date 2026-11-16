@@ -848,10 +848,26 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
     try:
         tok = await ZEBU.exchange_code_async(code, uid=uid)
     except Exception as e:
+        server_ip_str = ""
+        try:
+            async with httpx.AsyncClient(timeout=3) as cl:
+                res = await cl.get("https://api.ipify.org?format=json")
+                server_ip_str = res.json().get("ip", "")
+        except Exception:
+            pass
+
+        ip_hint = f"""<div style='background:#1e293b;border:1px solid #f59e0b;border-radius:8px;padding:12px;margin:16px auto;max-width:400px;text-align:left;'>
+            <div style='color:#f59e0b;font-weight:600;font-size:13px;'>⚠️ Zebu IP Whitelist Detected</div>
+            <div style='color:#cbd5e1;font-size:12px;margin-top:4px;'>Zebu requires your server's outbound IP to match the IP in your Zebu API settings.</div>
+            <div style='margin-top:8px;color:#94a3b8;font-size:12px;'>Render Server Outbound IP: <code style='background:#0f172a;color:#38bdf8;padding:2px 6px;border-radius:4px;'>{server_ip_str}</code></div>
+            <div style='color:#94a3b8;font-size:11px;margin-top:4px;'>In Zebu Trade &rarr; Settings &rarr; API, update your API Key's IP address to this IP.</div>
+        </div>""" if ("INVALID_IP" in str(e) and server_ip_str) else ""
+
         return HTMLResponse(
             f"""<div style='font-family:sans-serif;padding:40px;text-align:center;'>
             <h2 style='color:#ef4444;'>❌ Zebu login failed</h2>
-            <p>{e}</p>
+            <p style='color:#f8fafc;'>{e}</p>
+            {ip_hint}
             <p><a href='{target_url}' style='color:#38bdf8;'>← Return to Dashboard</a></p>
             </div>""", 400
         )
@@ -1070,6 +1086,16 @@ async def status(_=Depends(current_user)):
         "max_concurrent_accounts": CFG.MAX_CONCURRENT_ACCOUNTS,
         "active_streams": len([a for a, s in CONN_MGR.accounts.items() if s.status == "REAL-TIME"]),
     }
+
+
+@app.get("/api/server-ip")
+async def server_ip():
+    try:
+        async with httpx.AsyncClient(timeout=4) as cl:
+            r = await cl.get("https://api.ipify.org?format=json")
+            return r.json()
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def get_frontend_dir() -> Path:

@@ -980,25 +980,30 @@ async def get_trades(request: Request, user=Depends(current_user)):
 
 @app.post("/api/trades/import")
 async def import_trades(request: Request, _=Depends(admin_only)):
-    rows = await request.json()
-    items = []
-    for r in rows:
-        r["origin"] = r.get("origin", "import")
-        r["id"] = r.get("id") or "I-" + secrets.token_hex(5)
-        # Ensure account & trader exist to satisfy foreign key constraints
-        aid = str(r.get("account") or "AC-01").strip()
-        tid = str(r.get("trader") or "TR-001").strip()
-        r["account"] = aid
-        r["trader"] = tid
-        if not await DB.get_account_async(aid):
-            if not await DB._get_trader(tid):
+    try:
+        rows = await request.json()
+        items = []
+        for r in rows:
+            r["origin"] = "import"
+            r["id"] = r.get("id") or "I-" + secrets.token_hex(5)
+            aid = str(r.get("account") or "AC-01").strip()
+            tid = str(r.get("trader") or "TR-001").strip()
+            r["account"] = aid
+            r["trader"] = tid
+            if not await DB.get_account_async(aid):
+                if not await DB._get_trader(tid):
+                    await DB._put_trader(tid, {"id": tid, "name": f"Trader {tid}", "status": "Testing"})
+                await DB.put_account_async(aid, {"id": aid, "name": f"Account {aid}", "broker": "Manual", "trader": tid})
+            elif not await DB._get_trader(tid):
                 await DB._put_trader(tid, {"id": tid, "name": f"Trader {tid}", "status": "Testing"})
-            await DB.put_account_async(aid, {"id": aid, "name": f"Account {aid}", "broker": "Manual", "trader": tid})
-        elif not await DB._get_trader(tid):
-            await DB._put_trader(tid, {"id": tid, "name": f"Trader {tid}", "status": "Testing"})
-        items.append((r["id"], r))
-    await DB._put_many_trades(items)
-    return {"ok": True, "n": len(items)}
+            if "qty" not in r or r["qty"] is None:
+                r["qty"] = float(r.get("lots") or 1) * int(r.get("lotSize") or 1)
+            items.append((r["id"], r))
+        await DB._put_many_trades(items)
+        return {"ok": True, "n": len(items)}
+    except Exception as e:
+        log.exception(f"Import trades error: {e}")
+        raise HTTPException(500, f"Import failed: {str(e)}")
 
 
 @app.delete("/api/trades/{tid}")

@@ -629,35 +629,43 @@ class Store:
             await session.commit()
 
     def _update_trade_model(self, t: Trade, doc: Dict[str, Any]):
-        t.origin = doc.get("origin", t.origin or "zebu")
-        t.account_id = doc.get("account", t.account_id)
-        t.trader_id = doc.get("trader", t.trader_id)
-        t.trade_date = doc.get("date", t.trade_date)
-        t.trade_time = doc.get("time", t.trade_time)
-        t.symbol = doc.get("symbol", t.symbol)
+        t.origin = doc.get("origin") or t.origin or "import"
+        t.account_id = doc.get("account") or t.account_id or "AC-01"
+        t.trader_id = doc.get("trader") or t.trader_id
+        t.trade_date = doc.get("date") or t.trade_date
+        t.trade_time = doc.get("time") or t.trade_time or "10:00"
+        t.symbol = doc.get("symbol") or t.symbol or "BANKNIFTY"
         t.strike = doc.get("strike", t.strike)
         t.opt = doc.get("opt", t.opt)
         t.expiry = doc.get("expiry", t.expiry)
         t.expiry_type = doc.get("expiryType", t.expiry_type)
-        t.tsym = doc.get("tsym") or doc.get("symbol") or "UNKNOWN"
+        t.tsym = doc.get("tsym") or doc.get("symbol") or t.tsym or "UNKNOWN"
         t.exch = doc.get("exch", t.exch or "NFO")
-        t.side = doc.get("side", t.side)
-        t.lots = doc.get("lots", t.lots)
-        t.lot_size = doc.get("lotSize", t.lot_size or 1)
-        t.qty = doc.get("qty", t.qty)
-        t.entry_price = doc.get("entry", t.entry_price)
-        t.exit_price = doc.get("exit", t.exit_price)
+        t.side = (doc.get("side") or t.side or "BUY").upper()
+        lots = doc.get("lots") if doc.get("lots") is not None else (t.lots or 1)
+        t.lots = float(lots) if lots is not None else 1.0
+        lot_size = doc.get("lotSize") or doc.get("lot_size") or t.lot_size or 1
+        t.lot_size = int(lot_size)
+        qty = doc.get("qty")
+        if qty is None:
+            qty = float(t.lots) * int(t.lot_size)
+        t.qty = float(qty)
+        t.entry_price = float(doc.get("entry") if doc.get("entry") is not None else (t.entry_price if t.entry_price is not None else 0.0))
+        t.exit_price = float(doc.get("exit") if doc.get("exit") is not None else (t.exit_price if t.exit_price is not None else 0.0))
         t.is_open = bool(doc.get("open", False))
-        t.exit_date = doc.get("exitDate", t.exit_date)
-        t.exit_time = doc.get("exitTime", t.exit_time)
+        t.exit_date = doc.get("exitDate", t.exit_date or t.trade_date)
+        t.exit_time = doc.get("exitTime", t.exit_time or t.trade_time)
         t.spot = doc.get("spot", t.spot)
         t.product = doc.get("product", t.product or "MIS")
         t.source = doc.get("source", t.source or "Manual")
-        t.charges = doc.get("charges", t.charges or 0.0)
+        t.charges = float(doc.get("charges") if doc.get("charges") is not None else (t.charges if t.charges is not None else 0.0))
         t.charges_estimated = doc.get("chargesEstimated", True)
         t.hedged = bool(doc.get("hedged", False))
 
     def _trade_to_dict(self, t: Trade) -> Dict[str, Any]:
+        lots = float(t.lots) if t.lots is not None else 1.0
+        lot_size = int(t.lot_size) if t.lot_size is not None else 1
+        qty = float(t.qty) if t.qty is not None else (lots * lot_size)
         return {
             "id": t.id,
             "origin": t.origin,
@@ -673,18 +681,18 @@ class Store:
             "tsym": t.tsym,
             "exch": t.exch,
             "side": t.side,
-            "lots": float(t.lots),
-            "lotSize": t.lot_size,
-            "qty": float(t.qty),
-            "entry": float(t.entry_price),
-            "exit": float(t.exit_price),
+            "lots": lots,
+            "lotSize": lot_size,
+            "qty": qty,
+            "entry": float(t.entry_price) if t.entry_price is not None else 0.0,
+            "exit": float(t.exit_price) if t.exit_price is not None else 0.0,
             "open": t.is_open,
             "exitDate": t.exit_date,
             "exitTime": t.exit_time,
             "spot": float(t.spot) if t.spot is not None else None,
             "product": t.product,
             "source": t.source,
-            "charges": float(t.charges or 0.0),
+            "charges": float(t.charges) if t.charges is not None else 0.0,
             "chargesEstimated": t.charges_estimated,
             "hedged": t.hedged,
         }

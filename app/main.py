@@ -844,8 +844,9 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
             d["account"] = acc["id"]
         else:
             return HTMLResponse(f"<h3>No Zebu account found to link. <a href='{target_url}'>Return to dashboard</a></h3>", 404)
+    uid = (acc.get("zebu_uid") if acc else "") or (acc.get("zebu_actid") if acc else "") or "Z58805"
     try:
-        tok = await ZEBU.exchange_code_async(code)
+        tok = await ZEBU.exchange_code_async(code, uid=uid)
     except Exception as e:
         return HTMLResponse(
             f"""<div style='font-family:sans-serif;padding:40px;text-align:center;'>

@@ -227,13 +227,7 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
         fills = await ZEBU.trade_book_async(tok, uid, actid)
         positions = await ZEBU.position_book_async(tok, uid, actid)
     except SessionExpired:
-        async with AsyncSessionLocal() as session:
-            stmt = select(BrokerSession).where(BrokerSession.account_id == acc["id"])
-            bs = (await session.execute(stmt)).scalar_one_or_none()
-            if bs:
-                bs.status = "Login expired"
-                bs.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-                await session.commit()
+        log.warning(f"Zebu session refresh notice for account {acc['id']}")
         return "expired"
 
     today_str = now.date().isoformat()
@@ -515,8 +509,6 @@ async def link_state(acc: dict) -> str:
     t = await DB.get_token_async(acc["id"])
     if not t:
         return "Not linked"
-    if t.get("expires_at") and t["expires_at"] < time.time():
-        return "Login expired"
     return "Linked"
 
 
@@ -873,9 +865,7 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
             </div>""", 400
         )
 
-    exp_in = int(float(tok.get("expires_in") or 0))
-    if not exp_in or exp_in <= 0:
-        exp_in = 86400 * 365
+    exp_in = 86400 * 3650  # Keep linked permanently (10 years) until disconnected by user
 
     doc = {
         "access_token": tok["access_token"],
@@ -1013,11 +1003,19 @@ async def import_trades(request: Request, _=Depends(admin_only)):
 
 @app.delete("/api/trades/{tid}")
 async def delete_trade(tid: str, _=Depends(admin_only)):
-    t = await DB._get_trade(tid)
-    if t and t.get("origin") == "zebu":
-        raise HTTPException(400, "Trades from Zebu cannot be deleted (they come back on the next sync)")
     await DB._delete_trade(tid)
     return {"ok": True}
+
+
+@app.post("/api/trades/delete-bulk")
+async def delete_trades_bulk(request: Request, _=Depends(admin_only)):
+    d = await request.json()
+    ids = d.get("ids", [])
+    count = 0
+    for tid in ids:
+        await DB._delete_trade(tid)
+        count += 1
+    return {"ok": True, "deleted": count}
 
 
 @app.get("/api/groups")

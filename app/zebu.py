@@ -86,27 +86,33 @@ class ZebuClient:
         """Returns {access_token, refresh_token, expires_in, ...} for a specific user ID."""
         errors = []
         clean_uid = uid.strip().upper() if uid else ""
-        if clean_uid:
-            uids = [clean_uid]
-        else:
-            base_app = self.client_id.split("_")[0] if self.client_id else ""
-            uids = [u for u in [base_app, self.client_id] if u]
-        uids = list(dict.fromkeys(uids))
 
+        # The API AppKey must strictly be the developer's registered AppKey with the whitelisted IP.
+        # Client accounts (like 47000S19) authorize through this AppKey and do NOT have an IP whitelist.
         appkeys = [self.client_id]
         if "_" in self.client_id:
             appkeys.append(self.client_id.split("_")[0])
         else:
             appkeys.append(f"{self.client_id}_U")
-        if clean_uid:
-            appkeys.extend([clean_uid, f"{clean_uid}_U"])
         appkeys = list(dict.fromkeys([k for k in appkeys if k]))
 
-        for u in uids:
+        # Payload UID candidates to test (trader UID, omitting UID, or developer account)
+        uid_candidates = []
+        if clean_uid:
+            uid_candidates.append(clean_uid)
+        uid_candidates.append("")  # omit uid field
+        base_app = self.client_id.split("_")[0] if self.client_id else ""
+        if base_app and base_app != clean_uid:
+            uid_candidates.append(base_app)
+        uid_candidates = list(dict.fromkeys(uid_candidates))
+
+        for u in uid_candidates:
             for k in appkeys:
                 # 1. Format: AppKey + SecretKey + Code
                 cs1 = hashlib.sha256(f"{k}{self.secret_key}{code}".encode("utf-8")).hexdigest()
-                payload1 = {"uid": u, "code": code, "appkey": cs1, "checksum": cs1}
+                payload1 = {"code": code, "appkey": cs1, "checksum": cs1}
+                if u:
+                    payload1["uid"] = u
                 try:
                     r = await self._post_async("GenAcsTok", payload1, token=None)
                     tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
@@ -114,13 +120,15 @@ class ZebuClient:
                         r["access_token"] = tok
                         return r
                     if isinstance(r, dict) and r.get("emsg"):
-                        errors.append(f"{u}/{k}: {r['emsg']}")
+                        errors.append(f"{u or 'none'}/{k}: {r['emsg']}")
                 except Exception as e:
-                    errors.append(f"{u}/{k}: {str(e)}")
+                    errors.append(f"{u or 'none'}/{k}: {str(e)}")
 
                 # 2. Format: AppKey + Code + SecretKey
                 cs2 = hashlib.sha256(f"{k}{code}{self.secret_key}".encode("utf-8")).hexdigest()
-                payload2 = {"uid": u, "code": code, "appkey": cs2, "checksum": cs2}
+                payload2 = {"code": code, "appkey": cs2, "checksum": cs2}
+                if u:
+                    payload2["uid"] = u
                 try:
                     r = await self._post_async("GenAcsTok", payload2, token=None)
                     tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
@@ -128,35 +136,38 @@ class ZebuClient:
                         r["access_token"] = tok
                         return r
                     if isinstance(r, dict) and r.get("emsg"):
-                        errors.append(f"{u}/{k}: {r['emsg']}")
+                        errors.append(f"{u or 'none'}/{k}: {r['emsg']}")
                 except Exception as e:
-                    errors.append(f"{u}/{k}: {str(e)}")
+                    errors.append(f"{u or 'none'}/{k}: {str(e)}")
 
         raise ZebuError("; ".join(dict.fromkeys(errors)) or "Token exchange failed")
 
     def exchange_code(self, code: str, uid: str = "") -> dict:
         errors = []
         clean_uid = uid.strip().upper() if uid else ""
-        if clean_uid:
-            uids = [clean_uid]
-        else:
-            base_app = self.client_id.split("_")[0] if self.client_id else ""
-            uids = [u for u in [base_app, self.client_id] if u]
-        uids = list(dict.fromkeys(uids))
 
         appkeys = [self.client_id]
         if "_" in self.client_id:
             appkeys.append(self.client_id.split("_")[0])
         else:
             appkeys.append(f"{self.client_id}_U")
-        if clean_uid:
-            appkeys.extend([clean_uid, f"{clean_uid}_U"])
         appkeys = list(dict.fromkeys([k for k in appkeys if k]))
 
-        for u in uids:
+        uid_candidates = []
+        if clean_uid:
+            uid_candidates.append(clean_uid)
+        uid_candidates.append("")
+        base_app = self.client_id.split("_")[0] if self.client_id else ""
+        if base_app and base_app != clean_uid:
+            uid_candidates.append(base_app)
+        uid_candidates = list(dict.fromkeys(uid_candidates))
+
+        for u in uid_candidates:
             for k in appkeys:
                 cs1 = hashlib.sha256(f"{k}{self.secret_key}{code}".encode("utf-8")).hexdigest()
-                payload1 = {"uid": u, "code": code, "appkey": cs1, "checksum": cs1}
+                payload1 = {"code": code, "appkey": cs1, "checksum": cs1}
+                if u:
+                    payload1["uid"] = u
                 try:
                     r = self._post_sync("GenAcsTok", payload1, token=None)
                     tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
@@ -164,12 +175,14 @@ class ZebuClient:
                         r["access_token"] = tok
                         return r
                     if isinstance(r, dict) and r.get("emsg"):
-                        errors.append(f"{u}/{k}: {r['emsg']}")
+                        errors.append(f"{u or 'none'}/{k}: {r['emsg']}")
                 except Exception as e:
-                    errors.append(f"{u}/{k}: {str(e)}")
+                    errors.append(f"{u or 'none'}/{k}: {str(e)}")
 
                 cs2 = hashlib.sha256(f"{k}{code}{self.secret_key}".encode("utf-8")).hexdigest()
-                payload2 = {"uid": u, "code": code, "appkey": cs2, "checksum": cs2}
+                payload2 = {"code": code, "appkey": cs2, "checksum": cs2}
+                if u:
+                    payload2["uid"] = u
                 try:
                     r = self._post_sync("GenAcsTok", payload2, token=None)
                     tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
@@ -177,9 +190,9 @@ class ZebuClient:
                         r["access_token"] = tok
                         return r
                     if isinstance(r, dict) and r.get("emsg"):
-                        errors.append(f"{u}/{k}: {r['emsg']}")
+                        errors.append(f"{u or 'none'}/{k}: {r['emsg']}")
                 except Exception as e:
-                    errors.append(f"{u}/{k}: {str(e)}")
+                    errors.append(f"{u or 'none'}/{k}: {str(e)}")
 
         raise ZebuError("; ".join(dict.fromkeys(errors)) or "Token exchange failed")
 

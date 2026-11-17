@@ -860,11 +860,10 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
         except Exception:
             pass
 
-        ip_hint = f"""<div style='background:#1e293b;border:1px solid #f59e0b;border-radius:8px;padding:12px;margin:16px auto;max-width:400px;text-align:left;'>
-            <div style='color:#f59e0b;font-weight:600;font-size:13px;'>⚠️ Zebu IP Whitelist Detected</div>
-            <div style='color:#cbd5e1;font-size:12px;margin-top:4px;'>Zebu requires your server's outbound IP to match the IP in your Zebu API settings.</div>
-            <div style='margin-top:8px;color:#94a3b8;font-size:12px;'>Render Server Outbound IP: <code style='background:#0f172a;color:#38bdf8;padding:2px 6px;border-radius:4px;'>{server_ip_str}</code></div>
-            <div style='color:#94a3b8;font-size:11px;margin-top:4px;'>In Zebu Trade &rarr; Settings &rarr; API, update your API Key's IP address to this IP.</div>
+        ip_hint = f"""<div style='background:#1e293b;border:1px solid #f59e0b;border-radius:8px;padding:12px;margin:16px auto;max-width:420px;text-align:left;'>
+            <div style='color:#f59e0b;font-weight:600;font-size:13px;'>⚠️ Zebu IP Whitelist Notice</div>
+            <div style='color:#cbd5e1;font-size:12px;margin-top:4px;'>Only the primary Developer App Key (<code>Z58805_U</code>) needs this IP mapped. Client accounts (like <code>{uid}</code>) do NOT need an API key and must NOT map the IP.</div>
+            <div style='margin-top:8px;color:#94a3b8;font-size:12px;'>Server Outbound IP: <code style='background:#0f172a;color:#38bdf8;padding:2px 6px;border-radius:4px;'>{server_ip_str}</code></div>
         </div>""" if ("INVALID_IP" in str(e) and server_ip_str) else ""
 
         return HTMLResponse(

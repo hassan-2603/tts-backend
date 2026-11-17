@@ -222,10 +222,11 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
         return "expired"
 
     uid, actid = acc.get("zebu_uid"), acc.get("zebu_actid") or acc.get("zebu_uid")
+    proxy_url = acc.get("proxy_url")
 
     try:
-        fills = await ZEBU.trade_book_async(tok, uid, actid)
-        positions = await ZEBU.position_book_async(tok, uid, actid)
+        fills = await ZEBU.trade_book_async(tok, uid, actid, proxy=proxy_url)
+        positions = await ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url)
     except SessionExpired:
         log.warning(f"Zebu session refresh notice for account {acc['id']}")
         return "expired"
@@ -655,13 +656,15 @@ async def get_accounts(user=Depends(current_user)):
 @app.put("/api/accounts/{aid}")
 async def put_account(aid: str, request: Request, _=Depends(admin_only)):
     d = await request.json()
-    doc = {k: d.get(k) for k in ("name", "broker", "trader", "zebu_uid", "zebu_actid", "zebu_client_id", "zebu_secret_key")}
+    doc = {k: d.get(k) for k in ("name", "broker", "trader", "zebu_uid", "zebu_actid", "zebu_client_id", "zebu_secret_key", "proxy_url")}
     doc["id"] = aid
     doc["zebu_uid"] = (doc.get("zebu_uid") or "").strip().upper()
     doc["zebu_actid"] = (doc.get("zebu_actid") or doc["zebu_uid"]).strip().upper()
     doc["zebu_client_id"] = (doc.get("zebu_client_id") or doc["zebu_uid"]).strip()
     if doc.get("zebu_secret_key"):
         doc["zebu_secret_key"] = doc["zebu_secret_key"].strip()
+    if doc.get("proxy_url"):
+        doc["proxy_url"] = doc["proxy_url"].strip()
     await DB.put_account_async(aid, doc)
     return doc
 
@@ -689,10 +692,12 @@ async def link_account(aid: str, request: Request, _=Depends(admin_only)):
     n = generate_link_nonce()
     client_id = acc.get("zebu_client_id") or acc.get("zebu_uid") or CFG.ZEBU_CLIENT_ID
     secret_key = acc.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY
+    proxy_url = acc.get("proxy_url")
     nonce_doc = {
         "account": aid,
         "client_id": client_id,
         "secret_key": secret_key,
+        "proxy_url": proxy_url,
         "uid": acc.get("zebu_uid") or "",
         "exp": time.time() + 900,
         "frontend_url": fe_url,
@@ -737,7 +742,8 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
         try:
             client_id = acc.get("zebu_client_id") or uid or CFG.ZEBU_CLIENT_ID
             secret_key = acc.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY
-            exchanged = await ZEBU.exchange_code_async(token_str, uid=uid, client_id=client_id, secret_key=secret_key)
+            proxy_url = acc.get("proxy_url")
+            exchanged = await ZEBU.exchange_code_async(token_str, uid=uid, client_id=client_id, secret_key=secret_key, proxy=proxy_url)
             tok = (exchanged.get("access_token") or exchanged.get("susertoken")) if isinstance(exchanged, dict) else None
             if tok:
                 final_token = tok
@@ -751,7 +757,7 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
     # Validate the token with Zebu before marking as Linked!
     cliname = None
     try:
-        cd = await ZEBU.client_details_async(final_token, uid, acc.get("zebu_actid") or uid)
+        cd = await ZEBU.client_details_async(final_token, uid, acc.get("zebu_actid") or uid, proxy=acc.get("proxy_url"))
         if isinstance(cd, dict):
             if cd.get("stat") == "Not_Ok":
                 raise ZebuError(cd.get("emsg", "Session validation failed"))
@@ -810,10 +816,12 @@ async def zebu_start(request: Request, n: str = "", account: str = "", fe: str =
         if clean_cid and not clean_cid.endswith("_U") and "_" not in clean_cid:
             clean_cid = f"{clean_cid}_U"
         secret_key = acc.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY
+        proxy_url = acc.get("proxy_url")
         nonce_doc = {
             "account": account,
             "client_id": clean_cid,
             "secret_key": secret_key,
+            "proxy_url": proxy_url,
             "uid": acc.get("zebu_uid") or "",
             "exp": time.time() + 900,
             "frontend_url": frontend_target,
@@ -884,12 +892,13 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
     uid = uid.strip().upper()
     client_id = d.get("client_id") or acc.get("zebu_client_id") or uid or CFG.ZEBU_CLIENT_ID
     secret_key = d.get("secret_key") or acc.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY
+    proxy_url = d.get("proxy_url") or (acc.get("proxy_url") if acc else None)
     try:
-        tok = await ZEBU.exchange_code_async(code, uid=uid, client_id=client_id, secret_key=secret_key)
+        tok = await ZEBU.exchange_code_async(code, uid=uid, client_id=client_id, secret_key=secret_key, proxy=proxy_url)
     except Exception as e:
         server_ip_str = ""
         try:
-            async with httpx.AsyncClient(timeout=3) as cl:
+            async with httpx.AsyncClient(timeout=3, proxy=proxy_url) as cl:
                 res = await cl.get("https://api.ipify.org?format=json")
                 server_ip_str = res.json().get("ip", "")
         except Exception:
@@ -925,7 +934,7 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
     cliname = None
     mismatch_error = None
     try:
-        cd = await ZEBU.client_details_async(access_token, uid, acc.get("zebu_actid") or uid)
+        cd = await ZEBU.client_details_async(access_token, uid, acc.get("zebu_actid") or uid, proxy=proxy_url)
         if isinstance(cd, dict):
             if cd.get("stat") == "Not_Ok":
                 mismatch_error = cd.get("emsg", "Validation rejected by Zebu")

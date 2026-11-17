@@ -49,6 +49,7 @@ class Account(Base):
     zebu_actid = Column(String(100), nullable=True)
     zebu_client_id = Column(String(100), nullable=True)
     zebu_secret_key = Column(String(200), nullable=True)
+    proxy_url = Column(String(300), nullable=True)
     group_id = Column(String(100), ForeignKey("groups.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)

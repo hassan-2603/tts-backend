@@ -71,7 +71,7 @@ async def init_models(engine: AsyncEngine = None):
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Graceful column migration for accounts table (PostgreSQL & SQLite)
-        for col, col_type in [("zebu_client_id", "VARCHAR(100)"), ("zebu_secret_key", "VARCHAR(200)")]:
+        for col, col_type in [("zebu_client_id", "VARCHAR(100)"), ("zebu_secret_key", "VARCHAR(200)"), ("proxy_url", "VARCHAR(300)")]:
             try:
                 await conn.execute(text(f"ALTER TABLE accounts ADD COLUMN IF NOT EXISTS {col} {col_type}"))
             except Exception:

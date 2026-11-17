@@ -51,13 +51,28 @@ class ZebuClient:
         self.timeout = timeout
         self._async_http: Optional[httpx.AsyncClient] = None
         self._sync_http: Optional[httpx.Client] = None
+        self._proxy_async_clients: Dict[str, httpx.AsyncClient] = {}
+        self._proxy_sync_clients: Dict[str, httpx.Client] = {}
 
-    def _get_sync_http(self) -> httpx.Client:
+    def _get_sync_http(self, proxy: Optional[str] = None) -> httpx.Client:
+        if proxy:
+            cl = self._proxy_sync_clients.get(proxy)
+            if cl is None or cl.is_closed:
+                cl = httpx.Client(timeout=self.timeout, proxy=proxy)
+                self._proxy_sync_clients[proxy] = cl
+            return cl
         if self._sync_http is None or self._sync_http.is_closed:
             self._sync_http = httpx.Client(timeout=self.timeout)
         return self._sync_http
 
-    def _get_async_http(self) -> httpx.AsyncClient:
+    def _get_async_http(self, proxy: Optional[str] = None) -> httpx.AsyncClient:
+        if proxy:
+            cl = self._proxy_async_clients.get(proxy)
+            if cl is None or cl.is_closed:
+                limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
+                cl = httpx.AsyncClient(timeout=self.timeout, limits=limits, proxy=proxy)
+                self._proxy_async_clients[proxy] = cl
+            return cl
         if self._async_http is None or self._async_http.is_closed:
             limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
             self._async_http = httpx.AsyncClient(timeout=self.timeout, limits=limits)
@@ -66,8 +81,16 @@ class ZebuClient:
     async def aclose(self):
         if self._async_http and not self._async_http.is_closed:
             await self._async_http.aclose()
+        for cl in list(self._proxy_async_clients.values()):
+            if not cl.is_closed:
+                await cl.aclose()
+        self._proxy_async_clients.clear()
         if self._sync_http and not self._sync_http.is_closed:
             self._sync_http.close()
+        for cl in list(self._proxy_sync_clients.values()):
+            if not cl.is_closed:
+                cl.close()
+        self._proxy_sync_clients.clear()
 
     # ---------- OAuth ----------
     def authorize_url(self, client_id: str = "", state: str = "", redirect_uri: str = "") -> str:
@@ -93,6 +116,7 @@ class ZebuClient:
         uid: str = "",
         client_id: str = "",
         secret_key: str = "",
+        proxy: Optional[str] = None,
     ) -> dict:
         """Returns {access_token, refresh_token, expires_in, ...} following official Zebu myntapi standard."""
         errors = []
@@ -134,7 +158,7 @@ class ZebuClient:
 
                 for p in payloads:
                     try:
-                        r = await self._post_async("GenAcsTok", p, token=None)
+                        r = await self._post_async("GenAcsTok", p, token=None, proxy=proxy)
                         tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
                         if tok and (r.get("stat", "").upper() == "OK" or "stat" not in r):
                             r["access_token"] = tok
@@ -200,7 +224,7 @@ class ZebuClient:
         raise ZebuError("; ".join(dict.fromkeys(errors)) or "Token exchange failed")
 
     # ---------- Low Level Async Request with Exponential Backoff ----------
-    async def _post_async(self, endpoint: str, payload: dict, token: Optional[str] = None, retries: int = 2) -> Any:
+    async def _post_async(self, endpoint: str, payload: dict, token: Optional[str] = None, retries: int = 2, proxy: Optional[str] = None) -> Any:
         if endpoint not in READ_ONLY_ENDPOINTS:
             raise PermissionError(f"{endpoint} is not allowed — tracking software is strictly read-only")
 
@@ -210,7 +234,7 @@ class ZebuClient:
         body = "jData=" + json.dumps(payload, separators=(",", ":"))
         if token:
             body += f"&jKey={token}"
-        client = self._get_async_http()
+        client = self._get_async_http(proxy=proxy)
 
         last_ex = None
         for attempt in range(retries + 1):
@@ -245,7 +269,7 @@ class ZebuClient:
             raise ZebuError(f"{endpoint} failed: {last_ex}")
 
     # ---------- Low Level Sync Request (Preserved for compatibility) ----------
-    def _post_sync(self, endpoint: str, payload: dict, token: Optional[str] = None) -> Any:
+    def _post_sync(self, endpoint: str, payload: dict, token: Optional[str] = None, proxy: Optional[str] = None) -> Any:
         if endpoint not in READ_ONLY_ENDPOINTS:
             raise PermissionError(f"{endpoint} is not allowed — tracking software is strictly read-only")
 
@@ -255,7 +279,7 @@ class ZebuClient:
         body = "jData=" + json.dumps(payload, separators=(",", ":"))
         if token:
             body += f"&jKey={token}"
-        client = self._get_sync_http()
+        client = self._get_sync_http(proxy=proxy)
 
         resp = client.post(f"{self.base}/NorenWClientAPI/{endpoint}", content=body, headers=headers)
         try:
@@ -273,39 +297,40 @@ class ZebuClient:
             raise ZebuError(f"{endpoint}: {emsg}")
         return data
 
-    def _post(self, endpoint: str, payload: dict, token: Optional[str] = None) -> Any:
-        return self._post_sync(endpoint, payload, token)
+    def _post(self, endpoint: str, payload: dict, token: Optional[str] = None, proxy: Optional[str] = None) -> Any:
+        return self._post_sync(endpoint, payload, token, proxy=proxy)
 
     # ---------- Async Read Calls ----------
-    async def client_details_async(self, token: str, uid: str, actid: str) -> dict:
-        return await self._post_async("ClientDetails", {"uid": uid, "actid": actid}, token)
+    async def client_details_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None) -> dict:
+        return await self._post_async("ClientDetails", {"uid": uid, "actid": actid}, token, proxy=proxy)
 
-    async def trade_book_async(self, token: str, uid: str, actid: str) -> List[dict]:
-        r = await self._post_async("TradeBook", {"uid": uid, "actid": actid}, token)
+    async def trade_book_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None) -> List[dict]:
+        r = await self._post_async("TradeBook", {"uid": uid, "actid": actid}, token, proxy=proxy)
         return r if isinstance(r, list) else []
 
-    async def order_book_async(self, token: str, uid: str) -> List[dict]:
-        r = await self._post_async("OrderBook", {"uid": uid}, token)
+    async def order_book_async(self, token: str, uid: str, proxy: Optional[str] = None) -> List[dict]:
+        r = await self._post_async("OrderBook", {"uid": uid}, token, proxy=proxy)
         return r if isinstance(r, list) else []
 
-    async def position_book_async(self, token: str, uid: str, actid: str) -> List[dict]:
-        r = await self._post_async("PositionBook", {"uid": uid, "actid": actid}, token)
+    async def position_book_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None) -> List[dict]:
+        r = await self._post_async("PositionBook", {"uid": uid, "actid": actid}, token, proxy=proxy)
         return r if isinstance(r, list) else []
 
-    async def tp_series_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], st: int, et: int, intrv: str = "1") -> List[dict]:
+    async def tp_series_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], st: int, et: int, intrv: str = "1", proxy: Optional[str] = None) -> List[dict]:
         r = await self._post_async(
             "TPSeries",
             {"uid": uid, "exch": exch, "token": str(sym_token), "st": str(st), "et": str(et), "intrv": intrv},
             token,
+            proxy=proxy,
         )
         return r if isinstance(r, list) else []
 
-    async def index_list_async(self, token: str, uid: str, exch: str = "NSE") -> List[dict]:
-        r = await self._post_async("GetIndexList", {"uid": uid, "exch": exch}, token)
+    async def index_list_async(self, token: str, uid: str, exch: str = "NSE", proxy: Optional[str] = None) -> List[dict]:
+        r = await self._post_async("GetIndexList", {"uid": uid, "exch": exch}, token, proxy=proxy)
         return (r or {}).get("values", []) if isinstance(r, dict) else []
 
-    async def quote_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int]) -> dict:
-        return await self._post_async("GetQuotes", {"uid": uid, "exch": exch, "token": str(sym_token)}, token)
+    async def quote_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], proxy: Optional[str] = None) -> dict:
+        return await self._post_async("GetQuotes", {"uid": uid, "exch": exch, "token": str(sym_token)}, token, proxy=proxy)
 
     # ---------- Sync Read Calls (Backward Compatibility) ----------
     def client_details(self, token: str, uid: str, actid: str):

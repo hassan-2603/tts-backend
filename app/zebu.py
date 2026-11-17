@@ -83,7 +83,7 @@ class ZebuClient:
         if proxy_clean:
             cl = self._proxy_async_clients.get(proxy_clean)
             if cl is None or cl.is_closed:
-                proxy_timeout = httpx.Timeout(connect=5.0, read=15.0, write=15.0, pool=10.0)
+                proxy_timeout = httpx.Timeout(connect=15.0, read=20.0, write=20.0, pool=15.0)
                 limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
                 cl = httpx.AsyncClient(timeout=proxy_timeout, limits=limits, proxy=proxy_clean)
                 self._proxy_async_clients[proxy_clean] = cl
@@ -139,20 +139,20 @@ class ZebuClient:
         cid = (client_id or self.client_id).strip()
         sec = (secret_key or self.secret_key).strip()
 
-        # Candidate client IDs to test
-        cids = [cid]
-        if cid.endswith("_U"):
-            cids.append(cid[:-2])
-        else:
-            cids.append(f"{cid}_U")
+        # Format clean client_id (Zebu API app keys always end with _U)
+        primary_cid = cid
+        if not primary_cid.endswith("_U") and "_" not in primary_cid:
+            primary_cid = f"{primary_cid}_U"
+
+        # Candidate client IDs to test (primary_cid first, then fallback without _U if needed)
+        cids = [primary_cid]
+        if primary_cid.endswith("_U"):
+            cids.append(primary_cid[:-2])
         if clean_uid and clean_uid not in cids:
-            cids.append(clean_uid)
-            cids.append(f"{clean_uid}_U")
-        if self.client_id and self.client_id not in cids:
-            cids.append(self.client_id)
+            cids.append(f"{clean_uid}_U" if not clean_uid.endswith("_U") else clean_uid)
         cids = list(dict.fromkeys([k for k in cids if k]))
 
-        # Candidate secret keys to test (account-level or global server secret)
+        # Candidate secret keys to test (account-level first, then server fallback)
         secs = [sec]
         if self.secret_key and self.secret_key != sec:
             secs.append(self.secret_key)
@@ -162,32 +162,24 @@ class ZebuClient:
             for k in cids:
                 # Official Zebu checksum: SHA256(client_id + secret_key + code)
                 cs = hashlib.sha256(f"{k}{s}{code}".encode("utf-8")).hexdigest()
+                payload = {"code": code, "checksum": cs}
 
-                # Payloads to test: official myntapi uses only code and checksum
-                payloads = [
-                    {"code": code, "checksum": cs},
-                    {"code": code, "appkey": cs, "checksum": cs},
-                ]
-                if clean_uid:
-                    payloads.append({"code": code, "checksum": cs, "uid": clean_uid})
-
-                for p in payloads:
-                    try:
-                        r = await self._post_async("GenAcsTok", p, token=None, proxy=proxy)
-                        tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
-                        if tok and (r.get("stat", "").upper() == "OK" or "stat" not in r):
-                            r["access_token"] = tok
-                            return r
-                        if isinstance(r, dict) and r.get("emsg"):
-                            emsg = r["emsg"]
-                            errors.append(f"{k}: {emsg}")
-                            if "INVALID_IP" in emsg:
-                                raise ZebuError(f"{k}: {emsg}")
-                    except Exception as e:
-                        err_str = str(e)
-                        errors.append(f"{k}: {err_str}")
-                        if "INVALID_IP" in err_str or "Proxy Connection Error" in err_str:
-                            raise ZebuError(err_str) from e
+                try:
+                    r = await self._post_async("GenAcsTok", payload, token=None, retries=0, proxy=proxy)
+                    tok = (r.get("access_token") or r.get("susertoken")) if isinstance(r, dict) else None
+                    if tok and (r.get("stat", "").upper() == "OK" or "stat" not in r):
+                        r["access_token"] = tok
+                        return r
+                    if isinstance(r, dict) and r.get("emsg"):
+                        emsg = r["emsg"]
+                        errors.append(f"{k}: {emsg}")
+                        if "INVALID_IP" in emsg:
+                            raise ZebuError(f"{k}: {emsg}")
+                except Exception as e:
+                    err_str = str(e)
+                    errors.append(f"{k}: {err_str}")
+                    if "INVALID_IP" in err_str or "Proxy Connection Error" in err_str:
+                        raise ZebuError(err_str) from e
 
         raise ZebuError("; ".join(dict.fromkeys(errors)) or "Token exchange failed")
 

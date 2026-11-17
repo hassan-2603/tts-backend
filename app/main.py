@@ -582,10 +582,14 @@ async def test_proxy(proxy: str = ""):
     except Exception as e:
         http_res = {"ok": False, "error": str(e), "type": type(e).__name__}
 
+    sec_preview = (CFG.ZEBU_SECRET_KEY[:4] + "..." + CFG.ZEBU_SECRET_KEY[-4:]) if len(CFG.ZEBU_SECRET_KEY) >= 8 else "NOT_SET"
+    cid_cfg = CFG.ZEBU_CLIENT_ID or "NOT_SET"
+
     return {
         "server_outbound_ip": "74.220.48.71",
         "tcp": tcp_results,
         "http_client": http_res,
+        "server_cfg": {"client_id": cid_cfg, "secret_key": sec_preview},
         "duration": round(time.time() - t0, 2)
     }
 
@@ -980,7 +984,9 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
             else:
                 cliname = cd.get("cliname")
                 returned_actid = (cd.get("actid") or cd.get("uid") or "").strip().upper()
-                if returned_actid and uid and returned_actid != uid:
+                c_uid = uid[:-2] if uid.endswith("_U") else uid
+                c_ret = returned_actid[:-2] if returned_actid.endswith("_U") else returned_actid
+                if c_ret and c_uid and c_ret != c_uid:
                     mismatch_error = f"Zebu token belongs to client '{returned_actid}', but this account is configured for '{uid}'"
     except Exception as ex:
         mismatch_error = str(ex)

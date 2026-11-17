@@ -83,8 +83,9 @@ class ZebuClient:
         if proxy_clean:
             cl = self._proxy_async_clients.get(proxy_clean)
             if cl is None or cl.is_closed:
+                proxy_timeout = httpx.Timeout(connect=5.0, read=15.0, write=15.0, pool=10.0)
                 limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
-                cl = httpx.AsyncClient(timeout=self.timeout, limits=limits, proxy=proxy_clean)
+                cl = httpx.AsyncClient(timeout=proxy_timeout, limits=limits, proxy=proxy_clean)
                 self._proxy_async_clients[proxy_clean] = cl
             return cl
         if self._async_http is None or self._async_http.is_closed:
@@ -271,8 +272,10 @@ class ZebuClient:
                     raise ZebuError(f"{endpoint}: {emsg}")
 
                 return data
-            except (httpx.ConnectError, httpx.TimeoutException, RateLimitError) as e:
+            except (httpx.ProxyError, httpx.ConnectError, httpx.TimeoutException, RateLimitError) as e:
                 last_ex = e
+                if proxy and (isinstance(e, httpx.ProxyError) or "proxy" in str(e).lower() or isinstance(e, (httpx.ConnectTimeout, httpx.ConnectError))):
+                    raise ZebuError(f"Proxy Connection Error: Unable to reach proxy '{proxy}'. Please verify your proxy host, port, and authentication credentials.") from e
                 if attempt < retries:
                     backoff = (2 ** attempt) * 0.5
                     await asyncio.sleep(backoff)

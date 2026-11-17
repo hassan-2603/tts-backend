@@ -806,10 +806,13 @@ async def zebu_start(request: Request, n: str = "", account: str = "", fe: str =
         if not frontend_target or "onrender.com" in frontend_target or "localhost:8000" in frontend_target or "/auth" in frontend_target:
             frontend_target = CFG.FRONTEND_URL.rstrip("/")
         client_id = acc.get("zebu_client_id") or acc.get("zebu_uid") or CFG.ZEBU_CLIENT_ID
+        clean_cid = client_id.strip() if client_id else ""
+        if clean_cid and not clean_cid.endswith("_U") and "_" not in clean_cid:
+            clean_cid = f"{clean_cid}_U"
         secret_key = acc.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY
         nonce_doc = {
             "account": account,
-            "client_id": client_id,
+            "client_id": clean_cid,
             "secret_key": secret_key,
             "uid": acc.get("zebu_uid") or "",
             "exp": time.time() + 900,
@@ -824,7 +827,10 @@ async def zebu_start(request: Request, n: str = "", account: str = "", fe: str =
 
     cb_url = "https://tts-backend-ezm3.onrender.com/auth/zebu/callback"
     client_id = d.get("client_id") or CFG.ZEBU_CLIENT_ID
-    r = RedirectResponse(ZEBU.authorize_url(client_id=client_id, state=n, redirect_uri=cb_url))
+    clean_cid = client_id.strip() if client_id else ""
+    if clean_cid and not clean_cid.endswith("_U") and "_" not in clean_cid:
+        clean_cid = f"{clean_cid}_U"
+    r = RedirectResponse(ZEBU.authorize_url(client_id=clean_cid, state=n, redirect_uri=cb_url))
     ref = d.get("frontend_url") or fe_param or request.headers.get("referer") or request.headers.get("origin") or CFG.FRONTEND_URL
     if ref:
         r.set_cookie("tts_fe_url", str(ref).split("?")[0].rstrip("/"), max_age=900, httponly=True, samesite="lax", secure=True)

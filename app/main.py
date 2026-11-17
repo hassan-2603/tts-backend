@@ -557,6 +557,18 @@ async def websocket_endpoint(websocket: WebSocket):
         WS_HUB.disconnect(websocket)
 
 
+@app.get("/api/test-proxy")
+async def test_proxy(proxy: str = ""):
+    p = proxy or "http://u084BWjx_2:HctOYpF0z5@79.127.168.43:50100"
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(proxy=p, timeout=5.0) as cl:
+            r = await cl.get("https://api.ipify.org?format=json")
+            return {"ok": True, "ip": r.json().get("ip"), "duration": round(time.time() - t0, 2)}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "type": type(e).__name__, "duration": round(time.time() - t0, 2)}
+
+
 # ---------------- API Endpoints (Preserving 100% contracts) ----------------
 @app.post("/api/login")
 async def login(request: Request):

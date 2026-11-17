@@ -800,7 +800,9 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
                 raise ZebuError(cd.get("emsg", "Session validation failed"))
             cliname = cd.get("cliname")
             returned_actid = (cd.get("actid") or cd.get("uid") or "").strip().upper()
-            if returned_actid and uid and returned_actid != uid:
+            c_uid = uid[:-2] if uid.endswith("_U") else uid
+            c_ret = returned_actid[:-2] if returned_actid.endswith("_U") else returned_actid
+            if c_ret and c_uid and c_ret != c_uid:
                 raise ZebuError(f"Session belongs to client '{returned_actid}', but this account is configured for '{uid}'. Please log in as '{uid}'.")
     except Exception as e:
         log.warning(f"Token validation failed for {aid}: {e}")

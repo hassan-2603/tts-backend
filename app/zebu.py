@@ -321,52 +321,73 @@ class ZebuClient:
     def _post(self, endpoint: str, payload: dict, token: Optional[str] = None, proxy: Optional[str] = None) -> Any:
         return self._post_sync(endpoint, payload, token, proxy=proxy)
 
+    def _clean_uid(self, u: Optional[str]) -> str:
+        s = (u or "").strip().upper()
+        return s[:-2] if s.endswith("_U") else s
+
     # ---------- Async Read Calls ----------
     async def client_details_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None) -> dict:
-        return await self._post_async("ClientDetails", {"uid": uid, "actid": actid}, token, proxy=proxy)
+        u = self._clean_uid(uid)
+        a = self._clean_uid(actid) or u
+        return await self._post_async("ClientDetails", {"uid": u, "actid": a}, token, proxy=proxy)
 
     async def trade_book_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None) -> List[dict]:
-        r = await self._post_async("TradeBook", {"uid": uid, "actid": actid}, token, proxy=proxy)
+        u = self._clean_uid(uid)
+        a = self._clean_uid(actid) or u
+        r = await self._post_async("TradeBook", {"uid": u, "actid": a}, token, proxy=proxy)
         return r if isinstance(r, list) else []
 
     async def order_book_async(self, token: str, uid: str, proxy: Optional[str] = None) -> List[dict]:
-        r = await self._post_async("OrderBook", {"uid": uid}, token, proxy=proxy)
+        u = self._clean_uid(uid)
+        r = await self._post_async("OrderBook", {"uid": u}, token, proxy=proxy)
         return r if isinstance(r, list) else []
 
     async def position_book_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None) -> List[dict]:
-        r = await self._post_async("PositionBook", {"uid": uid, "actid": actid}, token, proxy=proxy)
+        u = self._clean_uid(uid)
+        a = self._clean_uid(actid) or u
+        r = await self._post_async("PositionBook", {"uid": u, "actid": a}, token, proxy=proxy)
         return r if isinstance(r, list) else []
 
     async def tp_series_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], st: int, et: int, intrv: str = "1", proxy: Optional[str] = None) -> List[dict]:
+        u = self._clean_uid(uid)
         r = await self._post_async(
             "TPSeries",
-            {"uid": uid, "exch": exch, "token": str(sym_token), "st": str(st), "et": str(et), "intrv": intrv},
+            {"uid": u, "exch": exch, "token": str(sym_token), "st": str(st), "et": str(et), "intrv": intrv},
             token,
             proxy=proxy,
         )
         return r if isinstance(r, list) else []
 
     async def index_list_async(self, token: str, uid: str, exch: str = "NSE", proxy: Optional[str] = None) -> List[dict]:
-        r = await self._post_async("GetIndexList", {"uid": uid, "exch": exch}, token, proxy=proxy)
+        u = self._clean_uid(uid)
+        r = await self._post_async("GetIndexList", {"uid": u, "exch": exch}, token, proxy=proxy)
         return (r or {}).get("values", []) if isinstance(r, dict) else []
 
     async def quote_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], proxy: Optional[str] = None) -> dict:
-        return await self._post_async("GetQuotes", {"uid": uid, "exch": exch, "token": str(sym_token)}, token, proxy=proxy)
+        u = self._clean_uid(uid)
+        return await self._post_async("GetQuotes", {"uid": u, "exch": exch, "token": str(sym_token)}, token, proxy=proxy)
 
     # ---------- Sync Read Calls (Backward Compatibility) ----------
     def client_details(self, token: str, uid: str, actid: str):
-        return self._post_sync("ClientDetails", {"uid": uid, "actid": actid}, token)
+        u = self._clean_uid(uid)
+        a = self._clean_uid(actid) or u
+        return self._post_sync("ClientDetails", {"uid": u, "actid": a}, token)
 
     def trade_book(self, token: str, uid: str, actid: str):
-        r = self._post_sync("TradeBook", {"uid": uid, "actid": actid}, token)
+        u = self._clean_uid(uid)
+        a = self._clean_uid(actid) or u
+        r = self._post_sync("TradeBook", {"uid": u, "actid": a}, token)
         return r if isinstance(r, list) else []
 
     def order_book(self, token: str, uid: str):
-        r = self._post_sync("OrderBook", {"uid": uid}, token)
+        u = self._clean_uid(uid)
+        r = self._post_sync("OrderBook", {"uid": u}, token)
         return r if isinstance(r, list) else []
 
     def position_book(self, token: str, uid: str, actid: str):
-        r = self._post_sync("PositionBook", {"uid": uid, "actid": actid}, token)
+        u = self._clean_uid(uid)
+        a = self._clean_uid(actid) or u
+        r = self._post_sync("PositionBook", {"uid": u, "actid": a}, token)
         return r if isinstance(r, list) else []
 
     def tp_series(self, token: str, uid: str, exch: str, sym_token: Union[str, int], st: int, et: int, intrv: str = "1"):

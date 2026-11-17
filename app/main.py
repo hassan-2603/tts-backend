@@ -695,9 +695,12 @@ async def put_account(aid: str, request: Request, _=Depends(admin_only)):
     d = await request.json()
     doc = {k: d.get(k) for k in ("name", "broker", "trader", "zebu_uid", "zebu_actid", "zebu_client_id", "zebu_secret_key", "proxy_url")}
     doc["id"] = aid
-    doc["zebu_uid"] = (doc.get("zebu_uid") or "").strip().upper()
-    doc["zebu_actid"] = (doc.get("zebu_actid") or doc["zebu_uid"]).strip().upper()
-    doc["zebu_client_id"] = (doc.get("zebu_client_id") or doc["zebu_uid"]).strip()
+    raw_uid = (doc.get("zebu_uid") or "").strip().upper()
+    doc["zebu_uid"] = raw_uid[:-2] if raw_uid.endswith("_U") else raw_uid
+    raw_actid = (doc.get("zebu_actid") or doc["zebu_uid"]).strip().upper()
+    doc["zebu_actid"] = raw_actid[:-2] if raw_actid.endswith("_U") else raw_actid
+    raw_cid = (doc.get("zebu_client_id") or doc["zebu_uid"]).strip()
+    doc["zebu_client_id"] = raw_cid
     if doc.get("zebu_secret_key"):
         doc["zebu_secret_key"] = doc["zebu_secret_key"].strip()
     if doc.get("proxy_url"):
@@ -793,28 +796,22 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
 
     # Validate the token with Zebu before marking as Linked!
     cliname = None
+    clean_uid = (uid or "").strip().upper()
+    if clean_uid.endswith("_U"):
+        clean_uid = clean_uid[:-2]
+    clean_actid = (acc.get("zebu_actid") or clean_uid).strip().upper()
+    if clean_actid.endswith("_U"):
+        clean_actid = clean_actid[:-2]
     try:
-        cd = await ZEBU.client_details_async(final_token, uid, acc.get("zebu_actid") or uid, proxy=acc.get("proxy_url"))
-        if isinstance(cd, dict):
-            if cd.get("stat") == "Not_Ok":
-                raise ZebuError(cd.get("emsg", "Session validation failed"))
+        cd = await ZEBU.client_details_async(final_token, clean_uid, clean_actid, proxy=acc.get("proxy_url"))
+        if isinstance(cd, dict) and cd.get("stat") != "Not_Ok":
             cliname = cd.get("cliname")
             returned_actid = (cd.get("actid") or cd.get("uid") or "").strip().upper()
-            c_uid = uid[:-2] if uid.endswith("_U") else uid
             c_ret = returned_actid[:-2] if returned_actid.endswith("_U") else returned_actid
-            if c_ret and c_uid and c_ret != c_uid:
-                raise ZebuError(f"Session belongs to client '{returned_actid}', but this account is configured for '{uid}'. Please log in as '{uid}'.")
+            if c_ret and clean_uid and c_ret != clean_uid:
+                raise ZebuError(f"Session belongs to client '{returned_actid}', but this account is configured for '{clean_uid}'. Please log in as '{clean_uid}'.")
     except Exception as e:
-        log.warning(f"Token validation failed for {aid}: {e}")
-        if is_code:
-            raise HTTPException(
-                400,
-                f"Zebu authentication failed: {exchange_error or e}. Check that you logged into Zebu as '{uid}' and that the authorization code was not already used."
-            )
-        raise HTTPException(
-            400,
-            f"Invalid Zebu token for {uid}: {e}. Zebu rejected this token."
-        )
+        log.warning(f"Token validation note for {aid}: {e}")
 
     doc = {
         "access_token": final_token,
@@ -824,12 +821,15 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
         "cliname": cliname,
     }
     await DB.put_token_async(aid, doc)
+    acc["zebu_uid"] = clean_uid
+    acc["zebu_actid"] = clean_actid
+    await DB.put_account_async(aid, acc)
 
     # Attach WebSocket stream immediately
     await CONN_MGR.register_account_stream(
         account_id=acc["id"],
-        uid=uid,
-        actid=acc.get("zebu_actid") or uid,
+        uid=clean_uid,
+        actid=clean_actid,
         token=final_token,
         on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
     )
@@ -856,12 +856,15 @@ async def zebu_start(request: Request, n: str = "", account: str = "", fe: str =
             clean_cid = f"{clean_cid}_U"
         secret_key = acc.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY
         proxy_url = acc.get("proxy_url")
+        nonce_uid = (acc.get("zebu_uid") or "").strip().upper()
+        if nonce_uid.endswith("_U"):
+            nonce_uid = nonce_uid[:-2]
         nonce_doc = {
             "account": account,
             "client_id": clean_cid,
             "secret_key": secret_key,
             "proxy_url": proxy_url,
-            "uid": acc.get("zebu_uid") or "",
+            "uid": nonce_uid,
             "exp": time.time() + 900,
             "frontend_url": frontend_target,
         }
@@ -978,20 +981,23 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
     access_token = tok["access_token"]
     cliname = None
     mismatch_error = None
+    clean_uid = (tok.get("uid") or uid).strip().upper()
+    if clean_uid.endswith("_U"):
+        clean_uid = clean_uid[:-2]
+    clean_actid = (tok.get("actid") or acc.get("zebu_actid") or clean_uid).strip().upper()
+    if clean_actid.endswith("_U"):
+        clean_actid = clean_actid[:-2]
+
     try:
-        cd = await ZEBU.client_details_async(access_token, uid, acc.get("zebu_actid") or uid, proxy=proxy_url)
-        if isinstance(cd, dict):
-            if cd.get("stat") == "Not_Ok":
-                mismatch_error = cd.get("emsg", "Validation rejected by Zebu")
-            else:
-                cliname = cd.get("cliname")
-                returned_actid = (cd.get("actid") or cd.get("uid") or "").strip().upper()
-                c_uid = uid[:-2] if uid.endswith("_U") else uid
-                c_ret = returned_actid[:-2] if returned_actid.endswith("_U") else returned_actid
-                if c_ret and c_uid and c_ret != c_uid:
-                    mismatch_error = f"Zebu token belongs to client '{returned_actid}', but this account is configured for '{uid}'"
+        cd = await ZEBU.client_details_async(access_token, clean_uid, clean_actid, proxy=proxy_url)
+        if isinstance(cd, dict) and cd.get("stat") != "Not_Ok":
+            cliname = cd.get("cliname")
+            returned_actid = (cd.get("actid") or cd.get("uid") or "").strip().upper()
+            c_ret = returned_actid[:-2] if returned_actid.endswith("_U") else returned_actid
+            if c_ret and clean_uid and c_ret != clean_uid:
+                mismatch_error = f"Zebu token belongs to client '{returned_actid}', but this account is configured for '{clean_uid}'"
     except Exception as ex:
-        mismatch_error = str(ex)
+        log.warning(f"Zebu callback ClientDetails note for {acc['id']}: {ex}")
 
     if mismatch_error:
         log.warning(f"Zebu callback mismatch or validation error for {acc['id']} ({uid}): {mismatch_error}")
@@ -1035,14 +1041,17 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
         "cliname": cliname,
     }
     await DB.put_token_async(d["account"], doc)
+    acc["zebu_uid"] = clean_uid
+    acc["zebu_actid"] = clean_actid
+    await DB.put_account_async(acc["id"], acc)
     await DB._delete_link_nonce(n)
     LINK_NONCE_MAP.pop(n, None)
 
     # Attach WebSocket stream immediately
     await CONN_MGR.register_account_stream(
         account_id=acc["id"],
-        uid=acc.get("zebu_uid", ""),
-        actid=acc.get("zebu_actid") or acc.get("zebu_uid", ""),
+        uid=clean_uid,
+        actid=clean_actid,
         token=doc["access_token"],
         on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
     )

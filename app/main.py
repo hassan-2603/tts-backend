@@ -559,14 +559,35 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/api/test-proxy")
 async def test_proxy(proxy: str = ""):
+    import socket
     p = proxy or "http://u084BWjx_2:HctOYpF0z5@79.127.168.43:50100"
     t0 = time.time()
+    
+    tcp_results = {}
+    for port in (50100, 50101):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3.0)
+            s.connect(("79.127.168.43", port))
+            s.close()
+            tcp_results[str(port)] = "OPEN"
+        except Exception as e:
+            tcp_results[str(port)] = f"{type(e).__name__}: {e}"
+
+    http_res = None
     try:
-        async with httpx.AsyncClient(proxy=p, timeout=5.0) as cl:
+        async with httpx.AsyncClient(proxy=p, timeout=12.0) as cl:
             r = await cl.get("https://api.ipify.org?format=json")
-            return {"ok": True, "ip": r.json().get("ip"), "duration": round(time.time() - t0, 2)}
+            http_res = {"ok": True, "ip": r.json().get("ip")}
     except Exception as e:
-        return {"ok": False, "error": str(e), "type": type(e).__name__, "duration": round(time.time() - t0, 2)}
+        http_res = {"ok": False, "error": str(e), "type": type(e).__name__}
+
+    return {
+        "server_outbound_ip": "74.220.48.71",
+        "tcp": tcp_results,
+        "http_client": http_res,
+        "duration": round(time.time() - t0, 2)
+    }
 
 
 # ---------------- API Endpoints (Preserving 100% contracts) ----------------

@@ -54,24 +54,38 @@ class ZebuClient:
         self._proxy_async_clients: Dict[str, httpx.AsyncClient] = {}
         self._proxy_sync_clients: Dict[str, httpx.Client] = {}
 
+    def _clean_proxy(self, proxy: Optional[str]) -> Optional[str]:
+        if not proxy:
+            return None
+        p = proxy.strip()
+        if not p:
+            return None
+        if ":PORT" in p.upper() or p.endswith(":"):
+            raise ZebuError("Invalid proxy port: You entered the placeholder word 'PORT'. Please replace 'PORT' with the actual port number from your proxy provider (e.g. 8080, 7492, 3128).")
+        if not (p.startswith("http://") or p.startswith("https://") or p.startswith("socks5://")):
+            p = f"http://{p}"
+        return p
+
     def _get_sync_http(self, proxy: Optional[str] = None) -> httpx.Client:
-        if proxy:
-            cl = self._proxy_sync_clients.get(proxy)
+        proxy_clean = self._clean_proxy(proxy)
+        if proxy_clean:
+            cl = self._proxy_sync_clients.get(proxy_clean)
             if cl is None or cl.is_closed:
-                cl = httpx.Client(timeout=self.timeout, proxy=proxy)
-                self._proxy_sync_clients[proxy] = cl
+                cl = httpx.Client(timeout=self.timeout, proxy=proxy_clean)
+                self._proxy_sync_clients[proxy_clean] = cl
             return cl
         if self._sync_http is None or self._sync_http.is_closed:
             self._sync_http = httpx.Client(timeout=self.timeout)
         return self._sync_http
 
     def _get_async_http(self, proxy: Optional[str] = None) -> httpx.AsyncClient:
-        if proxy:
-            cl = self._proxy_async_clients.get(proxy)
+        proxy_clean = self._clean_proxy(proxy)
+        if proxy_clean:
+            cl = self._proxy_async_clients.get(proxy_clean)
             if cl is None or cl.is_closed:
                 limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
-                cl = httpx.AsyncClient(timeout=self.timeout, limits=limits, proxy=proxy)
-                self._proxy_async_clients[proxy] = cl
+                cl = httpx.AsyncClient(timeout=self.timeout, limits=limits, proxy=proxy_clean)
+                self._proxy_async_clients[proxy_clean] = cl
             return cl
         if self._async_http is None or self._async_http.is_closed:
             limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)

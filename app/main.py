@@ -655,10 +655,13 @@ async def get_accounts(user=Depends(current_user)):
 @app.put("/api/accounts/{aid}")
 async def put_account(aid: str, request: Request, _=Depends(admin_only)):
     d = await request.json()
-    doc = {k: d.get(k) for k in ("name", "broker", "trader", "zebu_uid", "zebu_actid")}
+    doc = {k: d.get(k) for k in ("name", "broker", "trader", "zebu_uid", "zebu_actid", "zebu_client_id", "zebu_secret_key")}
     doc["id"] = aid
     doc["zebu_uid"] = (doc.get("zebu_uid") or "").strip().upper()
     doc["zebu_actid"] = (doc.get("zebu_actid") or doc["zebu_uid"]).strip().upper()
+    doc["zebu_client_id"] = (doc.get("zebu_client_id") or doc["zebu_uid"]).strip()
+    if doc.get("zebu_secret_key"):
+        doc["zebu_secret_key"] = doc["zebu_secret_key"].strip()
     await DB.put_account_async(aid, doc)
     return doc
 
@@ -668,10 +671,9 @@ LINK_NONCE_MAP: Dict[str, Dict[str, Any]] = {}
 
 @app.post("/api/accounts/{aid}/link")
 async def link_account(aid: str, request: Request, _=Depends(admin_only)):
-    if not await DB.get_account_async(aid):
+    acc = await DB.get_account_async(aid)
+    if not acc:
         raise HTTPException(404, "No such account")
-    if not CFG.ZEBU_CLIENT_ID:
-        raise HTTPException(400, "ZEBU_CLIENT_ID is not set on the server")
     
     fe_url = None
     try:
@@ -681,12 +683,22 @@ async def link_account(aid: str, request: Request, _=Depends(admin_only)):
         pass
     
     if not fe_url:
-        fe_url = request.headers.get("origin") or request.headers.get("referer") or CFG.PUBLIC_URL
-    fe_url = fe_url.rstrip("/")
+        fe_url = request.headers.get("origin") or request.headers.get("referer") or CFG.FRONTEND_URL
+    fe_url = str(fe_url).split("?")[0].rstrip("/")
 
     n = generate_link_nonce()
-    LINK_NONCE_MAP[n] = {"account": aid, "exp": time.time() + 900, "frontend_url": fe_url}
-    await DB._put_link_nonce(n, {"account": aid, "exp": time.time() + 900})
+    client_id = acc.get("zebu_client_id") or acc.get("zebu_uid") or CFG.ZEBU_CLIENT_ID
+    secret_key = acc.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY
+    nonce_doc = {
+        "account": aid,
+        "client_id": client_id,
+        "secret_key": secret_key,
+        "uid": acc.get("zebu_uid") or "",
+        "exp": time.time() + 900,
+        "frontend_url": fe_url,
+    }
+    LINK_NONCE_MAP[n] = nonce_doc
+    await DB._put_link_nonce(n, nonce_doc)
     return {"ok": True, "nonce": n, "url": f"/auth/zebu/start?n={n}"}
 
 
@@ -723,7 +735,9 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
 
     if is_code or len(token_str) < 50:
         try:
-            exchanged = await ZEBU.exchange_code_async(token_str, uid=uid)
+            client_id = acc.get("zebu_client_id") or uid or CFG.ZEBU_CLIENT_ID
+            secret_key = acc.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY
+            exchanged = await ZEBU.exchange_code_async(token_str, uid=uid, client_id=client_id, secret_key=secret_key)
             tok = (exchanged.get("access_token") or exchanged.get("susertoken")) if isinstance(exchanged, dict) else None
             if tok:
                 final_token = tok
@@ -781,23 +795,36 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
 @app.get("/auth/zebu/start")
 async def zebu_start(request: Request, n: str = "", account: str = "", fe: str = ""):
     fe_param = fe or request.query_params.get("fe") or ""
-    if account and not n:
+    acc = None
+    if account:
         acc = await DB.get_account_async(account)
-        if not acc:
-            return HTMLResponse("<h3>No such account.</h3>", 404)
+
+    if acc and not n:
         n = generate_link_nonce()
         frontend_target = fe_param or request.headers.get("referer") or request.headers.get("origin") or CFG.FRONTEND_URL
         frontend_target = str(frontend_target).split("?")[0].rstrip("/")
         if not frontend_target or "onrender.com" in frontend_target or "localhost:8000" in frontend_target or "/auth" in frontend_target:
             frontend_target = CFG.FRONTEND_URL.rstrip("/")
-        LINK_NONCE_MAP[n] = {"account": account, "exp": time.time() + 900, "frontend_url": frontend_target}
-        await DB._put_link_nonce(n, {"account": account, "exp": time.time() + 900})
+        client_id = acc.get("zebu_client_id") or acc.get("zebu_uid") or CFG.ZEBU_CLIENT_ID
+        secret_key = acc.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY
+        nonce_doc = {
+            "account": account,
+            "client_id": client_id,
+            "secret_key": secret_key,
+            "uid": acc.get("zebu_uid") or "",
+            "exp": time.time() + 900,
+            "frontend_url": frontend_target,
+        }
+        LINK_NONCE_MAP[n] = nonce_doc
+        await DB._put_link_nonce(n, nonce_doc)
 
     d = LINK_NONCE_MAP.get(n) or await DB._get_link_nonce(n)
-    if not d or d["exp"] < time.time():
-        return HTMLResponse("<h3>Link expired. Go back to the dashboard and click Link again.</h3>", 400)
+    if not d or d.get("exp", 0) < time.time():
+        return HTMLResponse("<h3>Link expired. Go back to the dashboard and click Connect Zebu again.</h3>", 400)
+
     cb_url = "https://tts-backend-ezm3.onrender.com/auth/zebu/callback"
-    r = RedirectResponse(ZEBU.authorize_url(state=n, redirect_uri=cb_url))
+    client_id = d.get("client_id") or CFG.ZEBU_CLIENT_ID
+    r = RedirectResponse(ZEBU.authorize_url(client_id=client_id, state=n, redirect_uri=cb_url))
     ref = d.get("frontend_url") or fe_param or request.headers.get("referer") or request.headers.get("origin") or CFG.FRONTEND_URL
     if ref:
         r.set_cookie("tts_fe_url", str(ref).split("?")[0].rstrip("/"), max_age=900, httponly=True, samesite="lax", secure=True)
@@ -849,8 +876,10 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
             return HTMLResponse(f"<h3>No Zebu account found to link. <a href='{target_url}'>Return to dashboard</a></h3>", 404)
     uid = (acc.get("zebu_uid") if acc else "") or (acc.get("zebu_actid") if acc else "")
     uid = uid.strip().upper()
+    client_id = d.get("client_id") or acc.get("zebu_client_id") or uid or CFG.ZEBU_CLIENT_ID
+    secret_key = d.get("secret_key") or acc.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY
     try:
-        tok = await ZEBU.exchange_code_async(code, uid=uid)
+        tok = await ZEBU.exchange_code_async(code, uid=uid, client_id=client_id, secret_key=secret_key)
     except Exception as e:
         server_ip_str = ""
         try:

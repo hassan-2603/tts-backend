@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
     async_sessionmaker,
 )
+from sqlalchemy import text
 from sqlalchemy.orm import declarative_base
 from app.config import CFG
 
@@ -69,6 +70,15 @@ async def init_models(engine: AsyncEngine = None):
     eng = engine or async_engine
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Graceful column migration for accounts table (PostgreSQL & SQLite)
+        for col, col_type in [("zebu_client_id", "VARCHAR(100)"), ("zebu_secret_key", "VARCHAR(200)")]:
+            try:
+                await conn.execute(text(f"ALTER TABLE accounts ADD COLUMN IF NOT EXISTS {col} {col_type}"))
+            except Exception:
+                try:
+                    await conn.execute(text(f"ALTER TABLE accounts ADD COLUMN {col} {col_type}"))
+                except Exception:
+                    pass
     log.info("Database tables verified/initialized.")
 
 

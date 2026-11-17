@@ -172,6 +172,8 @@ class Store:
                 "trader": acc.trader_id,
                 "zebu_uid": acc.zebu_uid,
                 "zebu_actid": acc.zebu_actid,
+                "zebu_client_id": getattr(acc, "zebu_client_id", None) or acc.zebu_uid,
+                "zebu_secret_key": getattr(acc, "zebu_secret_key", None),
                 "group_id": acc.group_id,
             }
 
@@ -187,6 +189,8 @@ class Store:
                     "trader": a.trader_id,
                     "zebu_uid": a.zebu_uid,
                     "zebu_actid": a.zebu_actid,
+                    "zebu_client_id": getattr(a, "zebu_client_id", None) or a.zebu_uid,
+                    "zebu_secret_key": getattr(a, "zebu_secret_key", None),
                     "group_id": a.group_id,
                 }
                 for a in res
@@ -202,6 +206,10 @@ class Store:
                 acc.trader_id = doc.get("trader", acc.trader_id)
                 acc.zebu_uid = doc.get("zebu_uid", acc.zebu_uid)
                 acc.zebu_actid = doc.get("zebu_actid", acc.zebu_actid)
+                if "zebu_client_id" in doc:
+                    acc.zebu_client_id = doc.get("zebu_client_id")
+                if "zebu_secret_key" in doc and doc.get("zebu_secret_key"):
+                    acc.zebu_secret_key = doc.get("zebu_secret_key")
                 acc.group_id = doc.get("group_id", acc.group_id)
             else:
                 acc = Account(
@@ -211,6 +219,8 @@ class Store:
                     trader_id=doc.get("trader"),
                     zebu_uid=doc.get("zebu_uid"),
                     zebu_actid=doc.get("zebu_actid"),
+                    zebu_client_id=doc.get("zebu_client_id") or doc.get("zebu_uid"),
+                    zebu_secret_key=doc.get("zebu_secret_key"),
                     group_id=doc.get("group_id"),
                 )
                 session.add(acc)

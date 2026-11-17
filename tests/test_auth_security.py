@@ -101,3 +101,45 @@ def test_security_headers():
     assert resp.headers.get("X-Content-Type-Options") == "nosniff"
     assert resp.headers.get("X-Frame-Options") == "SAMEORIGIN"
     assert resp.headers.get("X-XSS-Protection") == "1; mode=block"
+
+
+def test_multi_account_oauth_isolation():
+    from app.zebu import ZebuClient
+    zc = ZebuClient("https://go.mynt.in", "MASTER_KEY_U", "master_secret")
+    
+    # 1. Authorize URL uses specific client ID when provided
+    url1 = zc.authorize_url(client_id="47000S19", state="nonce123")
+    assert "client_id=47000S19" in url1
+    assert "state=nonce123" in url1
+
+    # 2. Falls back to default client_id when not provided
+    url2 = zc.authorize_url(state="nonce456")
+    assert "client_id=MASTER_KEY_U" in url2
+
+    # 3. Test link endpoint uses account's own client_id and secret
+    client = TestClient(app)
+    resp = client.post("/api/login", json={"user": "admin_test", "password": "admin123"})
+    token = resp.json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Create account with custom Zebu credentials
+    acc_payload = {
+        "id": "AC-47000S19",
+        "name": "Trader 47000S19",
+        "broker": "Zebu",
+        "zebu_uid": "47000S19",
+        "zebu_client_id": "47000S19",
+        "zebu_secret_key": "sec_rb0kc9",
+    }
+    client.put("/api/accounts/AC-47000S19", headers=headers, json=acc_payload)
+
+    # Calling link endpoint creates nonce with specific credentials
+    link_resp = client.post("/api/accounts/AC-47000S19/link", headers=headers, json={"frontend_url": "https://test.app"})
+    assert link_resp.status_code == 200
+    nonce = link_resp.json()["nonce"]
+    assert nonce
+
+    from app.main import LINK_NONCE_MAP
+    assert nonce in LINK_NONCE_MAP
+    assert LINK_NONCE_MAP[nonce]["client_id"] == "47000S19"
+    assert LINK_NONCE_MAP[nonce]["secret_key"] == "sec_rb0kc9"

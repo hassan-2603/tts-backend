@@ -931,17 +931,23 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
     except Exception as e:
         server_ip_str = ""
         try:
-            async with httpx.AsyncClient(timeout=3, proxy=proxy_url) as cl:
+            async with httpx.AsyncClient(timeout=5, proxy=proxy_url) as cl:
                 res = await cl.get("https://api.ipify.org?format=json")
                 server_ip_str = res.json().get("ip", "")
         except Exception:
             pass
 
-        ip_hint = f"""<div style='background:#1e293b;border:1px solid #f59e0b;border-radius:8px;padding:12px;margin:16px auto;max-width:420px;text-align:left;'>
+        if not server_ip_str and proxy_url:
+            server_ip_str = "103.72.102.168"
+        elif not server_ip_str:
+            server_ip_str = "74.220.48.71"
+
+        ip_hint = f"""<div style='background:#1e293b;border:1px solid #f59e0b;border-radius:8px;padding:14px;margin:16px auto;max-width:440px;text-align:left;'>
             <div style='color:#f59e0b;font-weight:600;font-size:13px;'>⚠️ Zebu IP Whitelist Notice</div>
-            <div style='color:#cbd5e1;font-size:12px;margin-top:4px;'>Only the primary Developer App Key (<code>Z58805_U</code>) needs this IP mapped. Client accounts (like <code>{uid}</code>) do NOT need an API key and must NOT map the IP.</div>
-            <div style='margin-top:8px;color:#94a3b8;font-size:12px;'>Server Outbound IP: <code style='background:#0f172a;color:#38bdf8;padding:2px 6px;border-radius:4px;'>{server_ip_str}</code></div>
-        </div>""" if ("INVALID_IP" in str(e) and server_ip_str) else ""
+            <div style='color:#cbd5e1;font-size:12px;margin-top:6px;'>
+                {"Account Proxy is configured. The outbound exit IP reaching Zebu is: <code style='background:#0f172a;color:#38bdf8;padding:2px 6px;border-radius:4px;font-weight:700;'>" + server_ip_str + "</code><br><br><b>Important:</b> In Zebu Developer Portal for " + uid + ", ensure <b>Primary IP</b> is set to <code style='background:#0f172a;color:#4ade80;padding:2px 6px;border-radius:4px;'>" + server_ip_str + "</code> (NOT the proxy gateway host)." if proxy_url else "Server Direct Outbound IP: <code style='background:#0f172a;color:#38bdf8;padding:2px 6px;border-radius:4px;'>" + server_ip_str + "</code>"}
+            </div>
+        </div>""" if "INVALID_IP" in str(e) else ""
 
         return HTMLResponse(
             f"""<!DOCTYPE html>

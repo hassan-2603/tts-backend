@@ -179,9 +179,15 @@ class ZebuClient:
                             r["access_token"] = tok
                             return r
                         if isinstance(r, dict) and r.get("emsg"):
-                            errors.append(f"{k}: {r['emsg']}")
+                            emsg = r["emsg"]
+                            errors.append(f"{k}: {emsg}")
+                            if "INVALID_IP" in emsg:
+                                raise ZebuError(f"{k}: {emsg}")
                     except Exception as e:
-                        errors.append(f"{k}: {str(e)}")
+                        err_str = str(e)
+                        errors.append(f"{k}: {err_str}")
+                        if "INVALID_IP" in err_str or "Proxy Connection Error" in err_str:
+                            raise ZebuError(err_str) from e
 
         raise ZebuError("; ".join(dict.fromkeys(errors)) or "Token exchange failed")
 
@@ -232,9 +238,15 @@ class ZebuClient:
                             r["access_token"] = tok
                             return r
                         if isinstance(r, dict) and r.get("emsg"):
-                            errors.append(f"{k}: {r['emsg']}")
+                            emsg = r["emsg"]
+                            errors.append(f"{k}: {emsg}")
+                            if "INVALID_IP" in emsg:
+                                raise ZebuError(f"{k}: {emsg}")
                     except Exception as e:
-                        errors.append(f"{k}: {str(e)}")
+                        err_str = str(e)
+                        errors.append(f"{k}: {err_str}")
+                        if "INVALID_IP" in err_str or "Proxy Connection Error" in err_str:
+                            raise ZebuError(err_str) from e
 
         raise ZebuError("; ".join(dict.fromkeys(errors)) or "Token exchange failed")
 

@@ -72,6 +72,8 @@ class ZebuClient:
     # ---------- OAuth ----------
     def authorize_url(self, client_id: str = "", state: str = "", redirect_uri: str = "") -> str:
         cid = (client_id or self.client_id).strip()
+        if cid and not cid.endswith("_U") and "_" not in cid:
+            cid = f"{cid}_U"
         url = f"{self.base}/OAuthlogin/authorize/oauth?client_id={cid}&prompt=login"
         if redirect_uri:
             import urllib.parse

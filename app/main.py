@@ -773,6 +773,70 @@ async def test_proxy(proxy: str = ""):
     }
 
 
+@app.get("/api/account-pnl/{aid}")
+async def get_raw_account_pnl(aid: str):
+    acc = await DB.get_account_async(aid)
+    if not acc:
+        all_acc = await DB.get_all_accounts_async()
+        for a in all_acc:
+            if a.get("zebu_uid") == aid:
+                acc = a
+                break
+    if not acc:
+        return {"error": f"Account {aid} not found", "accounts": [a.get("id") for a in await DB.get_all_accounts_async()]}
+
+    tok = await token_for_account_async(acc["id"])
+    uid = acc.get("zebu_uid")
+    actid = acc.get("zebu_actid") or uid
+    proxy_url = acc.get("proxy_url")
+
+    token_info = {"present": bool(tok), "uid": uid, "actid": actid}
+    zebu_data = {}
+    if tok and uid:
+        try:
+            positions = await ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url)
+            total_rpnl = sum(float(p.get("rpnl") or 0) for p in positions)
+            total_urmtom = sum(float(p.get("urmtom") or 0) for p in positions)
+            total_m2m = sum(float(p.get("m2m") or 0) for p in positions)
+            total_pnl = total_rpnl + total_urmtom
+            if total_pnl == 0 and total_m2m != 0:
+                total_pnl = total_m2m
+            zebu_data = {
+                "ok": True,
+                "total_pnl": round(total_pnl, 2),
+                "rpnl": round(total_rpnl, 2),
+                "urmtom": round(total_urmtom, 2),
+                "positions_count": len(positions),
+                "positions": positions,
+            }
+        except Exception as e:
+            zebu_data = {"ok": False, "error": str(e), "error_type": type(e).__name__}
+
+    # Also poll to rebuild if valid
+    poll_result = None
+    if tok and uid:
+        try:
+            poll_result = await poll_account_async(acc, now_ist())
+        except Exception as e:
+            poll_result = f"error: {e}"
+
+    today_str = now_ist().date().isoformat()
+    trades = await DB._all_trades()
+    acc_trades = [t for t in trades if t.get("account") == acc["id"] or t.get("trader") in (acc["id"], uid)]
+    today_trades = [t for t in acc_trades if t.get("date") == today_str or t.get("exitDate") == today_str]
+
+    return {
+        "account": acc["id"],
+        "zebu_uid": uid,
+        "token": token_info,
+        "zebu": zebu_data,
+        "poll_result": poll_result,
+        "stored_today_trades_count": len(today_trades),
+        "stored_today_trades_pnl": sum(float(t.get("pnl") or 0) for t in today_trades),
+        "stored_today_trades": today_trades,
+    }
+
+
 # ---------------- API Endpoints (Preserving 100% contracts) ----------------
 @app.post("/api/login")
 async def login(request: Request):

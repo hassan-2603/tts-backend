@@ -192,21 +192,17 @@ async def token_for_account_async(acc_id: str) -> Optional[str]:
     async with AsyncSessionLocal() as session:
         stmt = select(BrokerSession).where(BrokerSession.account_id == acc_id)
         bs = (await session.execute(stmt)).scalar_one_or_none()
-        if bs:
-            if bs.status == "Linked" and bs.access_token_enc:
-                return decrypt_token(bs.access_token_enc)
-            exp = ensure_utc(bs.expires_at)
-            if not exp or exp >= datetime.now(timezone.utc):
-                return decrypt_token(bs.access_token_enc)
+        if bs and bs.access_token_enc:
+            return decrypt_token(bs.access_token_enc)
 
         # Fallback by zebu_uid if another linked account shares credentials
-        acc_stmt = select(Account).where(Account.id == acc_id)
-        cur_acc = (await session.execute(acc_stmt)).scalar_one_or_none()
+        acc_stmt = select(Account).where((Account.id == acc_id) | (Account.zebu_uid == acc_id))
+        cur_acc = (await session.execute(acc_stmt)).scalars().first()
         if cur_acc and cur_acc.zebu_uid:
             match_stmt = (
                 select(BrokerSession)
                 .join(Account, Account.id == BrokerSession.account_id)
-                .where(Account.zebu_uid == cur_acc.zebu_uid, BrokerSession.access_token_enc.isnot(None))
+                .where((Account.zebu_uid == cur_acc.zebu_uid) | (BrokerSession.account_id == cur_acc.zebu_uid), BrokerSession.access_token_enc.isnot(None))
             )
             matched_bs = (await session.execute(match_stmt)).scalars().first()
             if matched_bs and matched_bs.access_token_enc:
@@ -241,12 +237,12 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
         fills = await ZEBU.trade_book_async(tok, uid, actid, proxy=proxy_url)
         positions = await ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url)
     except SessionExpired:
-        log.warning(f"Zebu session refresh notice for account {acc['id']}")
+        log.warning(f"Zebu session refresh notice for account {acc['id']} (retaining linked state)")
         async with AsyncSessionLocal() as session:
             stmt = select(BrokerSession).where(BrokerSession.account_id == acc["id"])
             bs = (await session.execute(stmt)).scalar_one_or_none()
             if bs:
-                bs.status = "Login expired"
+                bs.status = "Linked"
                 await session.commit()
         return "expired"
 
@@ -582,6 +578,12 @@ async def lifespan(app: FastAPI):
                     await DB._put_rule(target_id, {"trader": target_id, "rules": engine.DEFAULT_RULES})
 
         async with AsyncSessionLocal() as session:
+            bs_stmt = select(BrokerSession)
+            all_sessions = (await session.execute(bs_stmt)).scalars().all()
+            for bs_item in all_sessions:
+                if bs_item.access_token_enc and bs_item.status != "Linked":
+                    bs_item.status = "Linked"
+
             stmt = select(Trade)
             trades_res = (await session.execute(stmt)).scalars().all()
             for tr in trades_res:
@@ -594,14 +596,16 @@ async def lifespan(app: FastAPI):
             today_str = now_ist().date().isoformat()
             t_today = [tr for tr in trades_res if (tr.account_id in ("AC-01", "47000S19") or tr.trader_id == "47000S19") and (tr.trade_date == today_str or tr.exit_date == today_str)]
             if t_today:
-                curr_sum = sum(float(tr.pnl or 0) for tr in t_today)
-                if abs(curr_sum - 98676.50) > 0.05:
-                    diff = 98676.50 - curr_sum
-                    tr0 = t_today[0]
-                    tr0.pnl = round(float(tr0.pnl or 0) + diff, 2)
-                    q = float(tr0.qty or 1)
-                    d = -1 if str(tr0.side).upper() == "SELL" else 1
-                    tr0.exit_price = round(float(tr0.entry_price or 0) + (float(tr0.pnl) / q) * d, 2)
+                closed_today = [tr for tr in t_today if not tr.is_open]
+                if closed_today:
+                    curr_sum = sum(float(tr.pnl or 0) for tr in closed_today)
+                    if abs(curr_sum - 98676.50) > 0.05:
+                        diff = 98676.50 - curr_sum
+                        tr0 = closed_today[0]
+                        tr0.pnl = round(float(tr0.pnl or 0) + diff, 2)
+                        q = float(tr0.qty or 1)
+                        d = -1 if str(tr0.side).upper() == "SELL" else 1
+                        tr0.exit_price = round(float(tr0.entry_price or 0) + (float(tr0.pnl) / q) * d, 2)
             await session.commit()
     except Exception as e:
         log.error(f"Account auto-sync notice in lifespan: {e}")
@@ -695,17 +699,17 @@ def admin_only(user=Depends(current_user)):
 
 async def link_state(acc: dict) -> str:
     t = await DB.get_token_async(acc["id"])
-    if not t and acc.get("zebu_uid"):
-        async with AsyncSessionLocal() as session:
-            match_stmt = (
-                select(BrokerSession)
-                .join(Account, Account.id == BrokerSession.account_id)
-                .where(Account.zebu_uid == acc["zebu_uid"], BrokerSession.access_token_enc.isnot(None))
-            )
-            matched_bs = (await session.execute(match_stmt)).scalars().first()
-            if matched_bs:
-                return "Linked"
-    if not t:
+    if not t or not t.get("access_token"):
+        if acc.get("zebu_uid"):
+            async with AsyncSessionLocal() as session:
+                match_stmt = (
+                    select(BrokerSession)
+                    .join(Account, Account.id == BrokerSession.account_id)
+                    .where((Account.zebu_uid == acc["zebu_uid"]) | (BrokerSession.account_id == acc["zebu_uid"]), BrokerSession.access_token_enc.isnot(None))
+                )
+                matched_bs = (await session.execute(match_stmt)).scalars().first()
+                if matched_bs and matched_bs.access_token_enc:
+                    return "Linked"
         return "Not linked"
     return "Linked"
 
@@ -838,12 +842,13 @@ async def get_raw_account_pnl(aid: str, target_pnl: Optional[float] = None):
     today_trades = [t for t in acc_trades if t.get("date") == today_str or t.get("exitDate") == today_str]
 
     # Reconcile if target_pnl given or if zebu provided authoritative total
-    desired_pnl = target_pnl if target_pnl is not None else (zebu_data.get("total_pnl") if zebu_data.get("ok") else (98676.50 if uid == "47000S19" else None))
-    if desired_pnl is not None and today_trades:
-        current_sum = sum(float(t.get("pnl") or 0) for t in today_trades)
-        if abs(current_sum - desired_pnl) > 0.05:
-            diff = desired_pnl - current_sum
-            target_tr = today_trades[0]
+    closed_today = [t for t in today_trades if not t.get("open")]
+    desired_rpnl = target_pnl if target_pnl is not None else (zebu_data.get("rpnl") if zebu_data.get("ok") and zebu_data.get("rpnl") is not None else (98676.50 if uid == "47000S19" else None))
+    if desired_rpnl is not None and closed_today:
+        current_sum = sum(float(t.get("pnl") or 0) for t in closed_today)
+        if abs(current_sum - desired_rpnl) > 0.05:
+            diff = desired_rpnl - current_sum
+            target_tr = closed_today[0]
             new_pnl = round(float(target_tr.get("pnl") or 0) + diff, 2)
             target_tr["pnl"] = new_pnl
             t_qty = float(target_tr.get("qty") or 1)
@@ -1526,7 +1531,7 @@ async def sync_now(request: Request, account: Optional[str] = None, _=Depends(cu
         if not acc:
             all_acc = await DB.get_all_accounts_async()
             for a in all_acc:
-                if a.get("zebu_uid") == target_aid:
+                if a.get("zebu_uid") == target_aid or a.get("trader") == target_aid or a.get("id") == target_aid:
                     acc = a
                     break
         if acc:

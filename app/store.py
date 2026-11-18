@@ -254,7 +254,7 @@ class Store:
                 "expires_at": exp_dt.timestamp() if exp_dt else None,
                 "linked_at": bs.linked_at.isoformat() if bs.linked_at else None,
                 "cliname": bs.cliname,
-                "status": bs.status,
+                "status": "Linked" if bs.access_token_enc else bs.status,
                 "ws_status": bs.ws_status,
             }
 

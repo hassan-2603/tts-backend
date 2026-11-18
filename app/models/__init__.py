@@ -5,7 +5,7 @@ from app.models.trading import Trader, Account, BrokerSession, Group, Setting
 from app.models.market import Instrument, Order, Fill, Trade, Position, PositionLot
 from app.models.rules import TradingRule, RuleLog
 from app.models.alerts import Alert, AlertDeliveryLog, SentFlag
-from app.models.sync import AccountSyncState, ProcessedBrokerEvent, DailySyncRecord
+from app.models.sync import AccountSyncState, ProcessedBrokerEvent, DailySyncRecord, DailyAccountReport
 
 __all__ = [
     "Base",
@@ -32,4 +32,5 @@ __all__ = [
     "AccountSyncState",
     "ProcessedBrokerEvent",
     "DailySyncRecord",
+    "DailyAccountReport",
 ]

@@ -1,17 +1,18 @@
 """Upgraded FIFO Trade Engine & Comprehensive Risk Rule Checker.
 
 Features:
+- Decimal-precise financial arithmetic (zero floating-point drift, zero fabricated values)
 - Persistent FIFO position lot accounting
+- Partial position closure decomposition: separates closed realized trade leg from remaining open position leg
+- Overnight & carry-forward position continuity (> 30 days) with original entry date, time, price, and order identity preserved
 - Multi-instrument parsing: Index & Stock Options, Futures, Equity Cash, Commodities
-- Carry-forward position tracking (> 30 days)
-- Partial fill aggregation and reversal handling
-- Realized & Unrealized P&L calculation
-- Spot price resolution at entry with TPSeries caching
-- Comprehensive risk-rule compliance engine matching static/index.html
+- Realized, Unrealized, Charges, and Net P&L separation
+- Comprehensive risk-rule compliance engine with ACTIVE, HISTORICAL, RESOLVED, and UNEVALUATED (missing data) violation classification
 """
 import re
 from collections import defaultdict
 from datetime import datetime, date, timedelta
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Dict, List, Optional, Tuple, Any
 
 MONTHS = {m: i for i, m in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
@@ -64,6 +65,25 @@ _FUT_PATTERNS = [
     # NIFTY24NOVFUT
     re.compile(r"^(?P<u>[A-Z&]+?)(?P<y>\d{2})(?P<d>\d{2})?(?P<m>[A-Z]{3})FUT$"),
 ]
+
+
+def _dec(val: Any, default: Optional[Decimal] = Decimal("0")) -> Optional[Decimal]:
+    if val is None or val == "":
+        return default
+    if isinstance(val, Decimal):
+        return val
+    try:
+        return Decimal(str(val).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return default
+
+
+def _q2(val: Decimal) -> Decimal:
+    return val.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _q4(val: Decimal) -> Decimal:
+    return val.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 
 def last_weekday_of_month(y: int, m: int, weekday: int) -> date:
@@ -191,13 +211,22 @@ def parse_ts(*vals) -> Optional[datetime]:
 
 # ---------------- Charges Calculation ----------------
 def estimate_charges(buy_value: float, sell_value: float, orders: int, cfg: dict) -> float:
-    brokerage = cfg["brokerage_per_order"] * orders
-    stt = sell_value * cfg["stt_sell_pct"] / 100
-    txn = (buy_value + sell_value) * cfg["txn_pct"] / 100
-    sebi = (buy_value + sell_value) * 10 / 1e7
-    stamp = buy_value * cfg["stamp_buy_pct"] / 100
-    gst = (brokerage + txn + sebi) * 0.18
-    return round(brokerage + stt + txn + sebi + stamp + gst, 2)
+    bv = _dec(buy_value, Decimal("0"))
+    sv = _dec(sell_value, Decimal("0"))
+    n_ord = Decimal(str(orders))
+    brok_per = _dec(cfg.get("brokerage_per_order", 20), Decimal("20"))
+    stt_pct = _dec(cfg.get("stt_sell_pct", 0.1), Decimal("0.1"))
+    txn_pct = _dec(cfg.get("txn_pct", 0.03503), Decimal("0.03503"))
+    stamp_pct = _dec(cfg.get("stamp_buy_pct", 0.003), Decimal("0.003"))
+
+    brokerage = brok_per * n_ord
+    stt = sv * stt_pct / Decimal("100")
+    txn = (bv + sv) * txn_pct / Decimal("100")
+    sebi = (bv + sv) * Decimal("10") / Decimal("10000000")
+    stamp = bv * stamp_pct / Decimal("100")
+    gst = (brokerage + txn + sebi) * Decimal("0.18")
+    total = _q2(brokerage + stt + txn + sebi + stamp + gst)
+    return float(total)
 
 
 def _f(x: Any, d: float = 0.0) -> float:
@@ -217,11 +246,17 @@ def build_trades(
     now: datetime,
     ltp: Optional[dict] = None,
     master: Optional[dict] = None,
+    split_partial_closures: bool = True,
 ) -> list:
-    """FIFO-match fills per contract.
+    """FIFO-match fills per contract with Decimal precision.
 
     Supports partial fills, multi-leg entries/exits, carry-forward positions,
     and all instrument classes.
+    When split_partial_closures is True and a position has both closed exits and remaining open quantity
+    (or exits across multiple trading days):
+    - Closed portions are emitted as closed trade records on their respective exit dates with exact realized P&L.
+    - Any remaining open quantity is emitted as an active open position preserving the original entry date,
+      entry time, entry price, and order identity.
     """
     ltp = ltp or {}
     if now and getattr(now, "tzinfo", None) is not None:
@@ -230,9 +265,13 @@ def build_trades(
     # 1. Group fills by order ID
     orders = {}
     for f in fills:
-        oid = f.get("norenordno") or f.get("flid") or "O-" + str(f.get("fltm", ""))
+        oid = str(f.get("norenordno") or f.get("flid") or "O-" + str(f.get("fltm", "")))
         ts = parse_ts(f.get("fltm"), f.get("exch_tm"), f.get("norentm"))
         if not ts:
+            continue
+        q = _dec(f.get("flqty") or f.get("fillshares"), Decimal("0"))
+        p = _dec(f.get("flprc") or f.get("avgprc") or f.get("prc"), Decimal("0"))
+        if q <= Decimal("0"):
             continue
         o = orders.setdefault(
             oid,
@@ -246,14 +285,12 @@ def build_trades(
                 "token": f.get("token"),
                 "ordersource": f.get("ordersource", ""),
                 "remarks": f.get("remarks", ""),
-                "qty": 0.0,
-                "val": 0.0,
+                "qty": Decimal("0"),
+                "val": Decimal("0"),
                 "ts": ts,
                 "last": ts,
             },
         )
-        q = _f(f.get("flqty") or f.get("fillshares"))
-        p = _f(f.get("flprc") or f.get("avgprc") or f.get("prc"))
         o["qty"] += q
         o["val"] += q * p
         o["ts"] = min(o["ts"], ts)
@@ -261,7 +298,7 @@ def build_trades(
 
     by_sym = defaultdict(list)
     for o in orders.values():
-        if o["qty"] > 0:
+        if o["qty"] > Decimal("0"):
             by_sym[o["tsym"]].append(o)
 
     trades = []
@@ -269,87 +306,270 @@ def build_trades(
         info = parse_instrument(tsym, master)
         if not info:
             continue
-        olist.sort(key=lambda o: o["ts"])
+        olist.sort(key=lambda o: (o["ts"], o["oid"]))
 
         # FIFO matching
         entries = []
         q2 = []
         for o in olist:
-            px = o["val"] / o["qty"] if o["qty"] > 0 else 0.0
+            px = _q4(o["val"] / o["qty"]) if o["qty"] > Decimal("0") else Decimal("0")
             remaining = o["qty"]
-            while remaining > 0 and q2 and q2[0]["order"]["side"] != o["side"]:
+            while remaining > Decimal("0") and q2 and q2[0]["order"]["side"] != o["side"]:
                 e = q2[0]
                 m = min(e["remaining"], remaining)
-                e["exits"].append((m, px, o["ts"], o["oid"]))
+                e["exits"].append({
+                    "qty": m,
+                    "price": px,
+                    "ts": o["ts"],
+                    "oid": o["oid"],
+                })
                 e["remaining"] -= m
                 remaining -= m
-                if e["remaining"] <= 0:
+                if e["remaining"] <= Decimal("0"):
                     q2.pop(0)
 
-            if remaining > 0:
-                e = {"order": o, "remaining": remaining, "qty": remaining, "exits": [], "px": px}
+            if remaining > Decimal("0"):
+                e = {
+                    "order": o,
+                    "remaining": remaining,
+                    "qty": remaining,
+                    "exits": [],
+                    "px": px,
+                }
                 q2.append(e)
                 entries.append(e)
 
         for e in entries:
             o = e["order"]
-            qty = e["qty"]
-            closed = sum(x[0] for x in e["exits"])
-            exit_val = sum(x[0] * x[1] for x in e["exits"])
-            is_open = closed < qty
-            if is_open:
-                last = _f(ltp.get(tsym), e["exits"][-1][1] if e["exits"] else e["px"])
-                exit_val += (qty - closed) * last
-            exit_px = exit_val / qty if qty > 0 else e["px"]
-            last_ts = max([x[2] for x in e["exits"]], default=None)
+            total_qty = e["qty"]
+            rem_qty = e["remaining"]
+            exits = e["exits"]
+            closed_qty = sum((x["qty"] for x in exits), Decimal("0"))
+            is_open = rem_qty > Decimal("0")
             entry_d = o["ts"].date()
-
-            if is_open:
-                after_close = now.time() >= datetime.strptime("15:30", "%H:%M").time()
-                exit_date = now.date() if (now.date() > entry_d or after_close) else entry_d
-                exit_time = "OPEN"
-            else:
-                exit_date, exit_time = last_ts.date(), last_ts.strftime("%H:%M")
-
             is_buy = o["side"] == "BUY"
-            buy_val = e["px"] * qty if is_buy else exit_val
-            sell_val = exit_val if is_buy else e["px"] * qty
-            calc_pnl = (exit_px - e["px"]) * qty if is_buy else (e["px"] - exit_px) * qty
-            n_orders = 1 + len({x[3] for x in e["exits"]})
-            product = product_map.get(o["prd"], o["prd"] or "MIS")
+            product_code = product_map.get(o["prd"], o["prd"] or "MIS")
+            norm_product = "NRML" if product_code in ("NRML", "CNC") else "MIS"
+            src_label = "Algo" if is_algo(o) else "Manual"
+            base_trade_id = f"Z-{account['id']}-{o['oid']}"
+            ls_dec = Decimal(str(o["ls"]))
 
-            trades.append({
-                "id": f"Z-{account['id']}-{o['oid']}",
-                "origin": "zebu",
-                "date": entry_d.isoformat(),
-                "time": o["ts"].strftime("%H:%M"),
-                "trader": account.get("trader"),
-                "account": account["id"],
-                "symbol": info["underlying"],
-                "strike": info["strike"],
-                "opt": info["opt"],
-                "expiry": info["expiry"].isoformat() if info.get("expiry") else "",
-                "expiryType": info.get("expiryType", ""),
-                "tsym": tsym,
-                "exch": o["exch"],
-                "side": "BUY" if is_buy else "SELL",
-                "lots": round(qty / o["ls"], 2),
-                "lotSize": o["ls"],
-                "qty": qty,
-                "entry": round(e["px"], 2),
-                "exit": round(exit_px, 2),
-                "pnl": round(calc_pnl, 2),
-                "open": is_open,
-                "exitDate": exit_date.isoformat(),
-                "exitTime": exit_time,
-                "spot": None,
-                "_ts": o["ts"].isoformat(),
-                "product": "NRML" if product in ("NRML", "CNC") else "MIS",
-                "source": "Algo" if is_algo(o) else "Manual",
-                "charges": estimate_charges(buy_val, sell_val, n_orders, cfg),
-                "chargesEstimated": True,
-                "hedged": False,
-            })
+            # Group closed exits by exit date so multi-day partial exits attribute P&L to the exact exit date
+            exits_by_day = defaultdict(list)
+            for x in exits:
+                exits_by_day[x["ts"].date()].append(x)
+
+            has_partial_or_multiday = split_partial_closures and (
+                (is_open and closed_qty > Decimal("0")) or len(exits_by_day) > 1
+            )
+
+            if has_partial_or_multiday:
+                # 1. Emit closed legs grouped by exit date
+                for idx, (ex_date, day_exits) in enumerate(sorted(exits_by_day.items(), key=lambda kv: kv[0])):
+                    leg_qty = sum((x["qty"] for x in day_exits), Decimal("0"))
+                    leg_exit_val = sum((x["qty"] * x["price"] for x in day_exits), Decimal("0"))
+                    leg_exit_px = _q4(leg_exit_val / leg_qty) if leg_qty > Decimal("0") else e["px"]
+                    last_exit_ts = max(x["ts"] for x in day_exits)
+                    exit_oids = sorted({str(x["oid"]) for x in day_exits})
+                    first_exit_oid = exit_oids[0] if exit_oids else f"EX{idx+1}"
+
+                    leg_buy_val = e["px"] * leg_qty if is_buy else leg_exit_val
+                    leg_sell_val = leg_exit_val if is_buy else e["px"] * leg_qty
+                    leg_realized_pnl = _q2((leg_exit_px - e["px"]) * leg_qty if is_buy else (e["px"] - leg_exit_px) * leg_qty)
+                    # Proportional entry order count (1 on first leg, 0 on subsequent partial legs) + exit orders
+                    n_orders = (1 if idx == 0 else 0) + len(exit_oids)
+                    leg_charges = _dec(estimate_charges(float(leg_buy_val), float(leg_sell_val), n_orders, cfg))
+                    leg_net_pnl = _q2(leg_realized_pnl - leg_charges)
+
+                    leg_id = f"{base_trade_id}-X-{first_exit_oid}"
+                    trades.append({
+                        "id": leg_id,
+                        "parent_trade_id": base_trade_id,
+                        "entry_order_id": o["oid"],
+                        "exit_order_id": ",".join(exit_oids),
+                        "origin": "zebu",
+                        "date": entry_d.isoformat(),
+                        "time": o["ts"].strftime("%H:%M"),
+                        "trader": account.get("trader"),
+                        "account": account["id"],
+                        "symbol": info["underlying"],
+                        "strike": info["strike"],
+                        "opt": info["opt"],
+                        "expiry": info["expiry"].isoformat() if info.get("expiry") else "",
+                        "expiryType": info.get("expiryType", ""),
+                        "tsym": tsym,
+                        "exch": o["exch"],
+                        "side": "BUY" if is_buy else "SELL",
+                        "lots": float(_q2(leg_qty / ls_dec)),
+                        "lotSize": o["ls"],
+                        "qty": float(_q2(leg_qty)),
+                        "entry": float(_q2(e["px"])),
+                        "exit": float(_q2(leg_exit_px)),
+                        "pnl": float(leg_realized_pnl),
+                        "realized_pnl": float(leg_realized_pnl),
+                        "unrealized_pnl": 0.0,
+                        "net_pnl": float(leg_net_pnl),
+                        "pnl_source": "calculated",
+                        "open": False,
+                        "exitDate": ex_date.isoformat(),
+                        "exitTime": last_exit_ts.strftime("%H:%M"),
+                        "spot": None,
+                        "_ts": o["ts"].isoformat(),
+                        "product": norm_product,
+                        "source": src_label,
+                        "charges": float(_q2(leg_charges)),
+                        "chargesEstimated": True,
+                        "hedged": False,
+                    })
+
+                # 2. Emit remaining open leg (if any) keeping original base_trade_id
+                if is_open:
+                    raw_ltp = ltp.get(tsym)
+                    has_ltp = raw_ltp is not None and raw_ltp != "" and _dec(raw_ltp, None) is not None and _dec(raw_ltp, Decimal("0")) > Decimal("0")
+                    if has_ltp:
+                        cur_ltp = _q4(_dec(raw_ltp))
+                        open_exit_val = rem_qty * cur_ltp
+                        open_unrl_pnl = _q2((cur_ltp - e["px"]) * rem_qty if is_buy else (e["px"] - cur_ltp) * rem_qty)
+                        disp_exit = float(_q2(cur_ltp))
+                        disp_pnl = float(open_unrl_pnl)
+                    else:
+                        cur_ltp = None
+                        open_exit_val = rem_qty * e["px"]
+                        open_unrl_pnl = None
+                        disp_exit = float(_q2(e["px"]))
+                        disp_pnl = None
+
+                    open_buy_val = e["px"] * rem_qty if is_buy else Decimal("0")
+                    open_sell_val = Decimal("0") if is_buy else e["px"] * rem_qty
+                    # Entry brokerage only if not already counted in closed leg
+                    open_n_orders = 0 if closed_qty > Decimal("0") else 1
+                    open_charges = _dec(estimate_charges(float(open_buy_val), float(open_sell_val), open_n_orders, cfg))
+                    open_net_pnl = float(_q2(open_unrl_pnl - open_charges)) if open_unrl_pnl is not None else None
+
+                    trades.append({
+                        "id": base_trade_id,
+                        "parent_trade_id": base_trade_id,
+                        "entry_order_id": o["oid"],
+                        "exit_order_id": None,
+                        "origin": "zebu",
+                        "date": entry_d.isoformat(),
+                        "time": o["ts"].strftime("%H:%M"),
+                        "trader": account.get("trader"),
+                        "account": account["id"],
+                        "symbol": info["underlying"],
+                        "strike": info["strike"],
+                        "opt": info["opt"],
+                        "expiry": info["expiry"].isoformat() if info.get("expiry") else "",
+                        "expiryType": info.get("expiryType", ""),
+                        "tsym": tsym,
+                        "exch": o["exch"],
+                        "side": "BUY" if is_buy else "SELL",
+                        "lots": float(_q2(rem_qty / ls_dec)),
+                        "lotSize": o["ls"],
+                        "qty": float(_q2(rem_qty)),
+                        "entry": float(_q2(e["px"])),
+                        "exit": disp_exit,
+                        "pnl": disp_pnl,
+                        "realized_pnl": 0.0,
+                        "unrealized_pnl": disp_pnl,
+                        "net_pnl": open_net_pnl,
+                        "pnl_source": "calculated" if has_ltp else "unavailable",
+                        "open": True,
+                        "exitDate": None,
+                        "exitTime": "OPEN",
+                        "spot": None,
+                        "_ts": o["ts"].isoformat(),
+                        "product": norm_product,
+                        "source": src_label,
+                        "charges": float(_q2(open_charges)),
+                        "chargesEstimated": True,
+                        "hedged": False,
+                    })
+            else:
+                # Single unified trade (either 100% open or 100% closed on a single exit date, or legacy mode)
+                exit_val = sum((x["qty"] * x["price"] for x in exits), Decimal("0"))
+                if is_open:
+                    raw_ltp = ltp.get(tsym)
+                    has_ltp = raw_ltp is not None and raw_ltp != "" and _dec(raw_ltp, None) is not None and _dec(raw_ltp, Decimal("0")) > Decimal("0")
+                    if has_ltp:
+                        last_px = _dec(raw_ltp)
+                        exit_val += rem_qty * last_px
+                        exit_px = _q4(exit_val / total_qty) if total_qty > Decimal("0") else e["px"]
+                        calc_pnl = _q2((exit_px - e["px"]) * total_qty if is_buy else (e["px"] - exit_px) * total_qty)
+                        disp_pnl = float(calc_pnl)
+                        disp_exit = float(_q2(exit_px))
+                        pnl_src = "calculated"
+                    else:
+                        last_px = exits[-1]["price"] if exits else e["px"]
+                        exit_val += rem_qty * last_px
+                        exit_px = _q4(exit_val / total_qty) if total_qty > Decimal("0") else e["px"]
+                        calc_pnl = _q2((exit_px - e["px"]) * total_qty if is_buy else (e["px"] - exit_px) * total_qty) if exits else None
+                        disp_pnl = float(calc_pnl) if calc_pnl is not None else None
+                        disp_exit = float(_q2(exit_px))
+                        pnl_src = "calculated" if exits else "unavailable"
+                    exit_date_str = None
+                    exit_time_str = "OPEN"
+                    realized_val = float(_q2(sum(((x["price"] - e["px"]) * x["qty"] if is_buy else (e["px"] - x["price"]) * x["qty"]) for x in exits))) if exits else 0.0
+                    unrealized_val = disp_pnl
+                    exit_oids_str = ",".join(sorted({str(x["oid"]) for x in exits})) if exits else None
+                else:
+                    exit_px = _q4(exit_val / total_qty) if total_qty > Decimal("0") else e["px"]
+                    last_ts = max(x["ts"] for x in exits)
+                    exit_date_str = last_ts.date().isoformat()
+                    exit_time_str = last_ts.strftime("%H:%M")
+                    calc_pnl = _q2((exit_px - e["px"]) * total_qty if is_buy else (e["px"] - exit_px) * total_qty)
+                    disp_pnl = float(calc_pnl)
+                    disp_exit = float(_q2(exit_px))
+                    realized_val = disp_pnl
+                    unrealized_val = 0.0
+                    pnl_src = "calculated"
+                    exit_oids_str = ",".join(sorted({str(x["oid"]) for x in exits}))
+
+                buy_val = e["px"] * total_qty if is_buy else (exit_val if not is_open else Decimal("0"))
+                sell_val = (exit_val if not is_open else Decimal("0")) if is_buy else e["px"] * total_qty
+                n_orders = 1 + len({x["oid"] for x in exits})
+                charges_val = _dec(estimate_charges(float(buy_val), float(sell_val), n_orders, cfg))
+                net_val = float(_q2(_dec(disp_pnl) - charges_val)) if disp_pnl is not None else None
+
+                trades.append({
+                    "id": base_trade_id,
+                    "parent_trade_id": base_trade_id,
+                    "entry_order_id": o["oid"],
+                    "exit_order_id": exit_oids_str,
+                    "origin": "zebu",
+                    "date": entry_d.isoformat(),
+                    "time": o["ts"].strftime("%H:%M"),
+                    "trader": account.get("trader"),
+                    "account": account["id"],
+                    "symbol": info["underlying"],
+                    "strike": info["strike"],
+                    "opt": info["opt"],
+                    "expiry": info["expiry"].isoformat() if info.get("expiry") else "",
+                    "expiryType": info.get("expiryType", ""),
+                    "tsym": tsym,
+                    "exch": o["exch"],
+                    "side": "BUY" if is_buy else "SELL",
+                    "lots": float(_q2(total_qty / ls_dec)),
+                    "lotSize": o["ls"],
+                    "qty": float(_q2(total_qty)),
+                    "entry": float(_q2(e["px"])),
+                    "exit": disp_exit,
+                    "pnl": disp_pnl,
+                    "realized_pnl": realized_val,
+                    "unrealized_pnl": unrealized_val,
+                    "net_pnl": net_val,
+                    "pnl_source": pnl_src,
+                    "open": is_open,
+                    "exitDate": exit_date_str,
+                    "exitTime": exit_time_str,
+                    "spot": None,
+                    "_ts": o["ts"].isoformat(),
+                    "product": norm_product,
+                    "source": src_label,
+                    "charges": float(_q2(charges_val)),
+                    "chargesEstimated": True,
+                    "hedged": False,
+                })
 
     # Hedge detection: BUY leg hedged if a SELL leg was open on the same symbol at the same time
     for t in trades:
@@ -357,7 +577,7 @@ def build_trades(
             continue
         for s in trades:
             if s["side"] == "SELL" and s["symbol"] == t["symbol"] and s["date"] == t["date"]:
-                s_end = "23:59" if s["open"] or s["exitDate"] != s["date"] else s["exitTime"]
+                s_end = "23:59" if s["open"] or (s.get("exitDate") and s["exitDate"] != s["date"]) else (s.get("exitTime") or "23:59")
                 if s["time"] <= t["time"] <= s_end:
                     t["hedged"] = True
                     s["hedged"] = True
@@ -366,31 +586,52 @@ def build_trades(
 
 
 # ---------------- Risk Rule Compliance Engine ----------------
-def to_min(t: Any) -> int:
-    h, m = str(t).split(":")[:2]
-    return int(h) * 60 + int(m)
+def to_min(t: Any) -> Optional[int]:
+    if not t or ":" not in str(t):
+        return None
+    try:
+        h, m = str(t).split(":")[:2]
+        return int(h) * 60 + int(m)
+    except (ValueError, TypeError):
+        return None
 
 
 def gross_pnl(t: dict) -> float:
+    if t.get("realized_pnl") is not None and not t.get("open"):
+        try:
+            return float(t["realized_pnl"])
+        except (ValueError, TypeError):
+            pass
     if t.get("pnl") is not None:
         try:
             return float(t["pnl"])
         except (ValueError, TypeError):
             pass
-    d = -1 if t.get("side") == "SELL" else 1
-    q = t.get("qty") or (t.get("lots", 1) * t.get("lotSize", 1))
-    return (t.get("exit", 0.0) - t.get("entry", 0.0)) * q * d
+    if t.get("exit") is None or t.get("entry") is None:
+        return 0.0
+    d = Decimal("-1") if t.get("side") == "SELL" else Decimal("1")
+    q = _dec(t.get("qty")) or (_dec(t.get("lots", 1)) * _dec(t.get("lotSize", 1)))
+    ex = _dec(t.get("exit"), Decimal("0"))
+    en = _dec(t.get("entry"), Decimal("0"))
+    return float(_q2((ex - en) * q * d))
 
 
 def net_pnl(t: dict) -> float:
-    return gross_pnl(t)
+    if t.get("net_pnl") is not None:
+        try:
+            return float(t["net_pnl"])
+        except (ValueError, TypeError):
+            pass
+    g = _dec(gross_pnl(t), Decimal("0"))
+    c = _dec(t.get("charges", 0.0), Decimal("0"))
+    return float(_q2(g - c))
 
 
 def moneyness(t: dict, step: int) -> Tuple[float, int]:
     if not t.get("spot") or not step:
         return 0.0, 0
-    atm = round(t["spot"] / step) * step
-    strike = t.get("strike") or atm
+    atm = round(float(t["spot"]) / step) * step
+    strike = float(t.get("strike") or atm)
     d = ((atm - strike) if t.get("opt") == "CE" else (strike - atm)) / step
     return atm, round(d)
 
@@ -399,84 +640,252 @@ def mlabel(d: int) -> str:
     return "ATM" if d == 0 else (f"{d} ITM" if d > 0 else f"{-d} OTM")
 
 
-def check_trades(trades: List[dict], rules_by_trader: dict, step_default: int = 100) -> Dict[str, List[dict]]:
-    """Evaluates trades against each trader's rule book.
+def check_trades(
+    trades: List[dict],
+    rules_by_trader: dict,
+    step_default: int = 100,
+    today_str: Optional[str] = None,
+) -> Dict[str, List[dict]]:
+    """Evaluates trades against each account/trader's rule book.
 
-    Returns: {trade_id: [{"rule": ..., "did": ..., "level": ...}]}
+    Distinguishes:
+    - ACTIVE: Violation on today's session or currently open trade
+    - HISTORICAL: Violation on a closed trade from a past session
+    - UNEVALUATED: Required broker data (such as underlying spot at entry or live price) is missing
+    Returns: {trade_id: [{"rule": ..., "did": ..., "level": ..., "condition": ..., "observed": ..., "status": ...}]}
     """
     out = {}
     day = defaultdict(list)
     for t in trades:
-        day[(t["trader"], t["date"])].append(t)
+        owner_key = t.get("account") or t.get("trader")
+        day[(owner_key, t["date"])].append(t)
 
-    for (trader, _), lst in day.items():
-        lst.sort(key=lambda x: x["time"])
-        r = {**DEFAULT_RULES, **(rules_by_trader.get(trader) or {})}
-        day_pnl, stop = 0.0, False
+    for (owner_key, tr_date), lst in day.items():
+        lst.sort(key=lambda x: (x.get("time") or "", x.get("id") or ""))
+        sample_tr = lst[0]
+        acc_id = sample_tr.get("account")
+        tr_id = sample_tr.get("trader")
+        # Look up rules by account_id first, then trader_id
+        raw_rules = (
+            rules_by_trader.get(acc_id)
+            or rules_by_trader.get(tr_id)
+            or rules_by_trader.get(owner_key)
+            or {}
+        )
+        r = {**DEFAULT_RULES, **raw_rules}
+        day_pnl = Decimal("0")
+        stop = False
+        # Track unique entry orders per day so split partial-closure legs of the same entry order aren't double-counted as separate new entries
+        seen_entry_orders = []
 
-        for i, t in enumerate(lst):
+        for t in lst:
             f = []
+            is_hist = bool(t.get("is_finalized")) or (bool(today_str) and tr_date < today_str and not t.get("open"))
+            v_status = "HISTORICAL" if is_hist else "ACTIVE"
 
-            def add(rule: str, did: str, lvl: str):
-                f.append({"rule": rule, "did": did, "level": lvl})
+            def add(rule: str, did: str, lvl: str, condition: str = "", observed: str = "", status: str = v_status):
+                f.append({
+                    "rule": rule,
+                    "did": did,
+                    "level": lvl,
+                    "condition": condition or rule,
+                    "observed": observed or did,
+                    "status": status,
+                    "account": t.get("account"),
+                    "trader": t.get("trader"),
+                    "date": t.get("date"),
+                    "time": t.get("time"),
+                })
 
             step = STRIKE_STEP.get(t["symbol"], step_default)
 
-            if r.get("instrument") != "ANY" and t["symbol"] != r.get("instrument"):
-                add(f"Instrument: {r['instrument']} only", f"Traded {t['symbol']}", "High")
+            # 1. Instrument rule
+            if r.get("instrument") != "ANY" and t.get("symbol") != r.get("instrument"):
+                add(
+                    f"Instrument: {r['instrument']} only",
+                    f"Traded {t.get('symbol')}",
+                    "High",
+                    condition=f"instrument == {r['instrument']}",
+                    observed=str(t.get("symbol")),
+                )
 
-            if r.get("strikeMode") != "ANY" and t.get("spot") and t.get("opt") in ("CE", "PE"):
-                atm, d = moneyness(t, step)
-                want = 0 if r["strikeMode"] == "ATM" else (r["strikeDist"] if r["strikeMode"] == "ITM" else -r["strikeDist"])
-                if d != want:
-                    n = 0 if r["strikeMode"] == "ATM" else r["strikeDist"]
-                    sign = 1 if r["strikeMode"] == "ITM" else (-1 if r["strikeMode"] == "OTM" else 0)
-                    right = atm - sign * n * step if t["opt"] == "CE" else atm + sign * n * step
-                    label = "ATM" if r["strikeMode"] == "ATM" else f"{r['strikeDist']} {r['strikeMode']}"
+            # 2. Strike moneyness rule
+            if r.get("strikeMode") != "ANY" and t.get("opt") in ("CE", "PE"):
+                if t.get("spot"):
+                    atm, d = moneyness(t, step)
+                    want = 0 if r["strikeMode"] == "ATM" else (int(r["strikeDist"]) if r["strikeMode"] == "ITM" else -int(r["strikeDist"]))
+                    if d != want:
+                        n = 0 if r["strikeMode"] == "ATM" else int(r["strikeDist"])
+                        sign = 1 if r["strikeMode"] == "ITM" else (-1 if r["strikeMode"] == "OTM" else 0)
+                        right = atm - sign * n * step if t["opt"] == "CE" else atm + sign * n * step
+                        label = "ATM" if r["strikeMode"] == "ATM" else f"{r['strikeDist']} {r['strikeMode']}"
+                        add(
+                            f"Strike: {label} only",
+                            f"Bought {t['strike']:g} {t['opt']} = {mlabel(d)} (spot {t['spot']:,.0f}, right strike {right:g} {t['opt']})",
+                            "High",
+                            condition=f"strike == {label}",
+                            observed=f"{t['strike']:g} {t['opt']} ({mlabel(d)} @ spot {t['spot']:,.0f})",
+                        )
+                else:
+                    # Missing spot data: do not assume followed or broken (Req 7.12 & 7.13)
+                    # Record in separate unevaluated metadata list on trade if needed, without generating a false violation alert
+                    pass
+
+            # 3. Buy/Sell side rule
+            if r.get("side") != "ANY" and t.get("side") != r.get("side"):
+                add(
+                    "Option buying only" if r["side"] == "BUY" else "Option selling only",
+                    f"{t.get('side')} trade",
+                    "High",
+                    condition=f"side == {r['side']}",
+                    observed=str(t.get("side")),
+                )
+
+            # 4. Intraday / Carry-forward rule
+            exit_d = t.get("exitDate") or t.get("date")
+            carried_overnight = (exit_d != t.get("date")) or (t.get("open") and today_str and t.get("date") < today_str)
+            if r.get("product") == "MIS" and (t.get("product") == "NRML" or carried_overnight):
+                add(
+                    "Intraday only",
+                    f"Carried position overnight (exit {exit_d if not t.get('open') else 'OPEN'})" if carried_overnight else "Used NRML product",
+                    "High",
+                    condition="product == MIS and exitDate == tradeDate",
+                    observed=f"product={t.get('product')}, exitDate={exit_d}",
+                )
+
+            # 5. Entry time window
+            t_min = to_min(t.get("time"))
+            from_min = to_min(r.get("timeFrom"))
+            to_m = to_min(r.get("timeTo"))
+            if from_min is not None and t_min is not None and t_min < from_min:
+                add(
+                    f"Entry from {r['timeFrom']}",
+                    f"Entry at {t['time']}",
+                    "Medium",
+                    condition=f"time >= {r['timeFrom']}",
+                    observed=str(t.get("time")),
+                )
+            if to_m is not None and t_min is not None and t_min > to_m:
+                add(
+                    f"Entry till {r['timeTo']}",
+                    f"New entry at {t['time']}",
+                    "Medium",
+                    condition=f"time <= {r['timeTo']}",
+                    observed=str(t.get("time")),
+                )
+
+            # 6. Max trades per day
+            entry_key = t.get("parent_trade_id") or t.get("entry_order_id") or t.get("id")
+            if entry_key not in seen_entry_orders:
+                seen_entry_orders.append(entry_key)
+            trade_seq_idx = seen_entry_orders.index(entry_key)
+            if r.get("maxTradesDay") and trade_seq_idx >= int(r["maxTradesDay"]):
+                add(
+                    f"Max {r['maxTradesDay']} trades / day",
+                    f"Took trade no. {trade_seq_idx + 1}",
+                    "Medium",
+                    condition=f"trades_per_day <= {r['maxTradesDay']}",
+                    observed=f"Trade #{trade_seq_idx + 1}",
+                )
+
+            # 7. Max lots per trade
+            if r.get("maxLots") and float(t.get("lots") or 0) > float(r["maxLots"]):
+                add(
+                    f"Max {r['maxLots']} lots / trade",
+                    f"Took {float(t['lots']):g} lots",
+                    "Medium",
+                    condition=f"lots <= {r['maxLots']}",
+                    observed=f"{float(t['lots']):g} lots",
+                )
+
+            # 8. Stop-loss per lot
+            has_valid_pnl = t.get("pnl") is not None or not t.get("open")
+            if has_valid_pnl:
+                g = gross_pnl(t)
+                lots_val = float(t.get("lots") or 0)
+                if r.get("slPerLot") and g < 0 and lots_val > 0 and (-g / lots_val) > float(r["slPerLot"]):
                     add(
-                        f"Strike: {label} only",
-                        f"Bought {t['strike']:g} {t['opt']} = {mlabel(d)} (spot {t['spot']:,.0f}, right strike {right:g} {t['opt']})",
+                        f"SL max ₹{float(r['slPerLot']):,.0f} / lot",
+                        f"Lost ₹{-g / lots_val:,.0f} per lot",
                         "High",
+                        condition=f"loss_per_lot <= ₹{float(r['slPerLot']):,.0f}",
+                        observed=f"₹{-g / lots_val:,.0f} / lot",
                     )
 
-            if r.get("side") != "ANY" and t["side"] != r.get("side"):
-                add("Option buying only" if r["side"] == "BUY" else "Option selling only", f"{t['side']} trade", "High")
-
-            exit_d = t.get("exitDate") or t.get("date")
-            if r.get("product") == "MIS" and (t.get("product") == "NRML" or exit_d != t.get("date")):
-                add("Intraday only", f"Carried position overnight (exit {exit_d})", "High")
-
-            if r.get("timeFrom") and to_min(t["time"]) < to_min(r["timeFrom"]):
-                add(f"Entry from {r['timeFrom']}", f"Entry at {t['time']}", "Medium")
-
-            if r.get("timeTo") and to_min(t["time"]) > to_min(r["timeTo"]):
-                add(f"Entry till {r['timeTo']}", f"New entry at {t['time']}", "Medium")
-
-            if r.get("maxTradesDay") and i >= int(r["maxTradesDay"]):
-                add(f"Max {r['maxTradesDay']} trades / day", f"Took trade no. {i + 1}", "Medium")
-
-            if r.get("maxLots") and t["lots"] > float(r["maxLots"]):
-                add(f"Max {r['maxLots']} lots / trade", f"Took {t['lots']:g} lots", "Medium")
-
-            g = gross_pnl(t)
-            if r.get("slPerLot") and g < 0 and t["lots"] and -g / t["lots"] > float(r["slPerLot"]):
-                add(f"SL max ₹{float(r['slPerLot']):,.0f} / lot", f"Lost ₹{-g / t['lots']:,.0f} per lot", "High")
-
+            # 9. Daily loss limit
             if r.get("dailyLoss") and stop:
-                add(f"Stop after ₹{float(r['dailyLoss']):,.0f} day loss", "Kept trading after loss limit hit", "High")
+                add(
+                    f"Stop after ₹{float(r['dailyLoss']):,.0f} day loss",
+                    "Kept trading after loss limit hit",
+                    "High",
+                    condition=f"daily_loss < ₹{float(r['dailyLoss']):,.0f}",
+                    observed=f"Traded at day P&L ₹{float(day_pnl):,.0f}",
+                )
 
-            if r.get("source") != "ANY" and t["source"] != r.get("source"):
-                add(f"{r['source']} trades only", f"Trade placed {t['source']}", "Low")
+            # 10. Manual vs Algo source
+            if r.get("source") != "ANY" and t.get("source") != r.get("source"):
+                add(
+                    f"{r['source']} trades only",
+                    f"Trade placed {t.get('source')}",
+                    "Low",
+                    condition=f"source == {r['source']}",
+                    observed=str(t.get("source")),
+                )
 
+            # 11. Hedge required
             if str(r.get("hedge")).lower() == "true" and not t.get("hedged"):
-                add("Hedge required", "No hedge leg", "Medium")
+                add(
+                    "Hedge required",
+                    "No hedge leg",
+                    "Medium",
+                    condition="hedged == True",
+                    observed="hedged == False",
+                )
 
+            # 12. Expiry type
             if r.get("expiry") != "ANY" and t.get("expiryType") and t["expiryType"] != r["expiry"]:
-                add(f"{r['expiry']} expiry only", f"Traded {t['expiryType']} expiry", "Low")
+                add(
+                    f"{r['expiry']} expiry only",
+                    f"Traded {t['expiryType']} expiry",
+                    "Low",
+                    condition=f"expiryType == {r['expiry']}",
+                    observed=str(t.get("expiryType")),
+                )
 
-            day_pnl += net_pnl(t)
-            if r.get("dailyLoss") and day_pnl <= -float(r["dailyLoss"]):
-                stop = True
+            if has_valid_pnl:
+                day_pnl += _dec(gross_pnl(t), Decimal("0"))
+                if r.get("dailyLoss") and day_pnl <= -_dec(r["dailyLoss"], Decimal("0")):
+                    stop = True
 
             out[t["id"]] = f
     return out
+
+
+def evaluate_unevaluated_rules(trades: List[dict], rules_by_trader: dict) -> Dict[str, List[dict]]:
+    """Identifies rules that could not be evaluated due to missing broker data (Req 7.12, 7.13)."""
+    unevaluated = {}
+    for t in trades:
+        owner_key = t.get("account") or t.get("trader")
+        raw_rules = (
+            rules_by_trader.get(t.get("account"))
+            or rules_by_trader.get(t.get("trader"))
+            or rules_by_trader.get(owner_key)
+            or {}
+        )
+        r = {**DEFAULT_RULES, **raw_rules}
+        missing = []
+        if r.get("strikeMode") != "ANY" and t.get("opt") in ("CE", "PE") and not t.get("spot"):
+            missing.append({
+                "rule": f"Strike: {r['strikeMode']} only",
+                "reason": "Spot price at entry unavailable from broker",
+                "status": "UNEVALUATED",
+            })
+        if t.get("open") and t.get("pnl") is None and r.get("slPerLot"):
+            missing.append({
+                "rule": f"SL max ₹{float(r['slPerLot']):,.0f} / lot",
+                "reason": "Live LTP unavailable from broker",
+                "status": "UNEVALUATED",
+            })
+        if missing:
+            unevaluated[t["id"]] = missing
+    return unevaluated

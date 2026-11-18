@@ -110,6 +110,8 @@ try:
 
     # OAuth Account Link
     url = httpx.post(B + "/accounts/AC-01/link", headers=H).json()["url"]
+    if url.startswith("/"):
+        url = "http://127.0.0.1:8000" + url
     with httpx.Client(follow_redirects=True) as c:
         page = c.get(url).text
     assert "linked to Zebu" in page, f"Linking response: {page}"

@@ -242,12 +242,37 @@ class ZebuClient:
 
         raise ZebuError("; ".join(dict.fromkeys(errors)) or "Token exchange failed")
 
+    async def refresh_token_async(
+        self,
+        refresh_token: str,
+        uid: str = "",
+        client_id: str = "",
+        secret_key: str = "",
+        proxy: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Attempts official OAuth refresh_token exchange via GenAcsTok if supported by Zebu."""
+        if not refresh_token:
+            return None
+        try:
+            r = await self.exchange_code_async(
+                code=refresh_token,
+                uid=uid,
+                client_id=client_id,
+                secret_key=secret_key,
+                proxy=proxy,
+            )
+            if isinstance(r, dict) and r.get("access_token"):
+                return r
+        except Exception as e:
+            log.debug(f"Token refresh attempt failed for {uid}: {e}")
+        return None
+
     # ---------- Low Level Async Request with Exponential Backoff ----------
     async def _post_async(self, endpoint: str, payload: dict, token: Optional[str] = None, retries: int = 2, proxy: Optional[str] = None) -> Any:
         if endpoint not in READ_ONLY_ENDPOINTS:
             raise PermissionError(f"{endpoint} is not allowed — tracking software is strictly read-only")
 
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        headers = {"Content-Type": "text/plain"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         body = "jData=" + json.dumps(payload, separators=(",", ":"))
@@ -294,7 +319,7 @@ class ZebuClient:
         if endpoint not in READ_ONLY_ENDPOINTS:
             raise PermissionError(f"{endpoint} is not allowed — tracking software is strictly read-only")
 
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        headers = {"Content-Type": "text/plain"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         body = "jData=" + json.dumps(payload, separators=(",", ":"))

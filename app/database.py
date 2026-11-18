@@ -1,5 +1,6 @@
 """Database engine and session management with PostgreSQL asyncpg and SQLite aiosqlite support."""
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import (
@@ -16,8 +17,6 @@ log = logging.getLogger("tts.database")
 
 Base = declarative_base()
 
-
-import os
 
 def get_db_url() -> str:
     url = os.environ.get("DATABASE_URL") or CFG.DATABASE_URL
@@ -64,19 +63,41 @@ def set_engine_url(url: str):
     AsyncSessionLocal.configure(bind=async_engine)
 
 
-
 async def init_models(engine: AsyncEngine = None):
-    """Create all tables in database if they do not exist."""
+    """Create all tables in database if they do not exist, and migrate new columns safely."""
     eng = engine or async_engine
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Graceful column migration for accounts and trades tables (PostgreSQL & SQLite)
-        for tbl, col, col_type in [
+        migrations = [
             ("accounts", "zebu_client_id", "VARCHAR(100)"),
             ("accounts", "zebu_secret_key", "VARCHAR(200)"),
             ("accounts", "proxy_url", "VARCHAR(300)"),
             ("trades", "pnl", "NUMERIC(14, 2)"),
-        ]:
+            ("trades", "realized_pnl", "NUMERIC(14, 2)"),
+            ("trades", "unrealized_pnl", "NUMERIC(14, 2)"),
+            ("trades", "net_pnl", "NUMERIC(14, 2)"),
+            ("trades", "pnl_source", "VARCHAR(30)"),
+            ("trades", "parent_trade_id", "VARCHAR(120)"),
+            ("trades", "entry_order_id", "VARCHAR(100)"),
+            ("trades", "exit_order_id", "VARCHAR(100)"),
+            ("trades", "is_finalized", "BOOLEAN DEFAULT FALSE"),
+            ("trades", "finalized_at", "TIMESTAMP WITH TIME ZONE"),
+            ("trades", "is_archived", "BOOLEAN DEFAULT FALSE"),
+            ("trades", "archived_at", "TIMESTAMP WITH TIME ZONE"),
+            ("positions", "raw_payload", "JSON"),
+            ("account_sync_states", "is_stale", "BOOLEAN DEFAULT FALSE"),
+            ("daily_sync_records", "finalized", "BOOLEAN DEFAULT FALSE"),
+            ("daily_sync_records", "archived", "BOOLEAN DEFAULT FALSE"),
+            ("trading_rules", "account_id", "VARCHAR(100)"),
+            ("alerts", "order_id", "VARCHAR(100)"),
+            ("alerts", "trade_date", "VARCHAR(20)"),
+            ("alerts", "trade_time", "VARCHAR(20)"),
+            ("alerts", "configured_condition", "VARCHAR(250)"),
+            ("alerts", "observed_value", "VARCHAR(250)"),
+            ("alerts", "explanation", "TEXT"),
+            ("alerts", "violation_status", "VARCHAR(30) DEFAULT 'ACTIVE'"),
+        ]
+        for tbl, col, col_type in migrations:
             try:
                 await conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {col_type}"))
             except Exception:

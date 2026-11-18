@@ -58,9 +58,10 @@ FILLS = [
 
 async def jdata(req: Request):
     raw = (await req.body()).decode()
-    assert req.headers.get("content-type", "").startswith("text/plain"), "Content-Type must be text/plain"
+    assert req.headers.get("content-type", "").startswith(("text/plain", "application/x-www-form-urlencoded")), "Content-Type must be text/plain or form-urlencoded"
     assert raw.startswith("jData="), "body must be jData=<json>"
-    return json.loads(unquote_plus(raw[6:]) if "%7B" in raw[:10] else raw[6:])
+    json_part = raw[6:].split("&jKey=", 1)[0]
+    return json.loads(unquote_plus(json_part) if "%7B" in json_part[:10] else json_part)
 
 
 def authed(req):
@@ -68,9 +69,10 @@ def authed(req):
 
 
 @app.get("/OAuthlogin/authorize/oauth")
-def authorize(client_id: str):
-    assert client_id == CID
-    return RedirectResponse(f"{CALLBACK}?code=AUTHCODE123")
+def authorize(client_id: str, state: str = "", redirect_uri: str = ""):
+    assert client_id in (CID, f"{CID}_U", "ZP1001", "ZP1001_U")
+    cb = redirect_uri or CALLBACK
+    return RedirectResponse(f"{cb}?code=AUTHCODE123&state={state}")
 
 
 @app.post("/NorenWClientAPI/{ep}")
@@ -78,7 +80,11 @@ async def noren(ep: str, req: Request):
     CALLS.append(ep)
     d = await jdata(req)
     if ep == "GenAcsTok":
-        ok = d.get("checksum") == hashlib.sha256((CID + SECRET + d.get("code", "")).encode()).hexdigest()
+        valid_hashes = {
+            hashlib.sha256((c + SECRET + d.get("code", "")).encode()).hexdigest()
+            for c in (CID, f"{CID}_U", "ZP1001", "ZP1001_U")
+        }
+        ok = d.get("checksum") in valid_hashes
         return {
             "stat": "Ok",
             "access_token": "ACCESS-OK",
@@ -94,6 +100,8 @@ async def noren(ep: str, req: Request):
         return {"stat": "Ok", "actid": d["actid"], "cliname": "TEST CLIENT"}
     if ep == "TradeBook":
         return FILLS
+    if ep == "OrderBook":
+        return []
     if ep == "PositionBook":
         return [{"stat": "Ok", "exch": "NFO", "tsym": TSYM_PE, "netqty": "30", "lp": "295.00", "prd": "M"}]
     if ep == "GetIndexList":

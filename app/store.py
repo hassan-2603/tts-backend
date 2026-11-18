@@ -7,6 +7,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple, Union
 from sqlalchemy import select, delete as sa_delete, update as sa_update, insert as sa_insert
 from sqlalchemy.orm import Session as SyncSession
@@ -36,6 +37,7 @@ from app.models import (
     AccountSyncState,
     ProcessedBrokerEvent,
     DailySyncRecord,
+    DailyAccountReport,
 )
 from app.security import encrypt_token, decrypt_token
 
@@ -48,6 +50,8 @@ COLLECTIONS = [
     "rule_log",
     "trades",
     "fills",
+    "orders",
+    "positions",
     "groups",
     "settings",
     "users",
@@ -56,6 +60,8 @@ COLLECTIONS = [
     "link_nonces",
     "sent_flags",
     "status",
+    "daily_reports",
+    "alerts",
 ]
 
 
@@ -236,26 +242,23 @@ class Store:
             stmt = select(BrokerSession).where(BrokerSession.account_id == aid)
             bs = (await session.execute(stmt)).scalar_one_or_none()
             if not bs:
-                acc_stmt = select(Account).where((Account.id == aid) | (Account.zebu_uid == aid))
-                cur_acc = (await session.execute(acc_stmt)).scalars().first()
-                if cur_acc and cur_acc.zebu_uid:
-                    other_stmt = select(BrokerSession).join(Account, Account.id == BrokerSession.account_id).where(
-                        (Account.zebu_uid == cur_acc.zebu_uid) | (Account.id == cur_acc.id)
-                    )
-                    bs = (await session.execute(other_stmt)).scalars().first()
-            if not bs:
                 return None
             exp_dt = bs.expires_at
             if exp_dt and exp_dt.tzinfo is None:
                 exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            last_sync_dt = bs.last_sync_at
+            if last_sync_dt and last_sync_dt.tzinfo is None:
+                last_sync_dt = last_sync_dt.replace(tzinfo=timezone.utc)
             return {
                 "access_token": decrypt_token(bs.access_token_enc),
                 "refresh_token": decrypt_token(bs.refresh_token_enc),
                 "expires_at": exp_dt.timestamp() if exp_dt else None,
                 "linked_at": bs.linked_at.isoformat() if bs.linked_at else None,
                 "cliname": bs.cliname,
-                "status": "Linked" if bs.access_token_enc else bs.status,
+                "status": bs.status or ("Linked" if bs.access_token_enc else "Not linked"),
                 "ws_status": bs.ws_status,
+                "last_sync_at": last_sync_dt.isoformat() if last_sync_dt else None,
+                "sync_message": bs.sync_message,
             }
 
     async def put_token_async(self, aid: str, doc: Dict[str, Any]):
@@ -273,13 +276,23 @@ class Store:
                 except Exception:
                     linked_dt = datetime.now(timezone.utc)
 
-            acc_token_enc = encrypt_token(doc.get("access_token"))
-            ref_token_enc = encrypt_token(doc.get("refresh_token"))
+            last_sync_dt = None
+            if doc.get("last_sync_at"):
+                if isinstance(doc["last_sync_at"], datetime):
+                    last_sync_dt = doc["last_sync_at"]
+                else:
+                    try:
+                        last_sync_dt = datetime.fromisoformat(str(doc["last_sync_at"]))
+                    except Exception:
+                        last_sync_dt = datetime.now(timezone.utc)
+
+            acc_token_enc = encrypt_token(doc["access_token"]) if "access_token" in doc and doc["access_token"] is not None else None
+            ref_token_enc = encrypt_token(doc["refresh_token"]) if "refresh_token" in doc and doc["refresh_token"] is not None else None
 
             if bs:
-                if acc_token_enc is not None:
+                if "access_token" in doc:
                     bs.access_token_enc = acc_token_enc
-                if ref_token_enc is not None:
+                if "refresh_token" in doc:
                     bs.refresh_token_enc = ref_token_enc
                 if exp_dt is not None:
                     bs.expires_at = exp_dt
@@ -291,6 +304,10 @@ class Store:
                     bs.status = doc["status"]
                 if doc.get("ws_status"):
                     bs.ws_status = doc["ws_status"]
+                if last_sync_dt is not None:
+                    bs.last_sync_at = last_sync_dt
+                if "sync_message" in doc:
+                    bs.sync_message = doc["sync_message"]
             else:
                 bs = BrokerSession(
                     account_id=aid,
@@ -299,8 +316,10 @@ class Store:
                     expires_at=exp_dt,
                     linked_at=linked_dt,
                     cliname=doc.get("cliname"),
-                    status=doc.get("status", "Linked"),
+                    status=doc.get("status", "Linked" if acc_token_enc else "Not linked"),
                     ws_status=doc.get("ws_status", "DISCONNECTED"),
+                    last_sync_at=last_sync_dt,
+                    sync_message=doc.get("sync_message"),
                 )
                 session.add(bs)
             await session.commit()
@@ -309,6 +328,353 @@ class Store:
         async with AsyncSessionLocal() as session:
             await session.execute(sa_delete(BrokerSession).where(BrokerSession.account_id == aid))
             await session.commit()
+
+    # ---------------- Account Sync State & Daily Reports ----------------
+
+    async def get_sync_state_async(self, aid: str) -> Optional[Dict[str, Any]]:
+        async with AsyncSessionLocal() as session:
+            stmt = select(AccountSyncState).where(AccountSyncState.account_id == aid)
+            st = (await session.execute(stmt)).scalar_one_or_none()
+            if not st:
+                return None
+            return {
+                "account_id": st.account_id,
+                "status": st.status,
+                "is_stale": bool(getattr(st, "is_stale", False)),
+                "last_sync_start": st.last_sync_start.isoformat() if st.last_sync_start else None,
+                "last_sync_success": st.last_sync_success.isoformat() if st.last_sync_success else None,
+                "last_error": st.last_error,
+                "error_count": st.error_count,
+                "consecutive_failures": st.consecutive_failures,
+                "circuit_open": st.circuit_open,
+                "total_fills_today": st.total_fills_today,
+                "total_trades_today": st.total_trades_today,
+            }
+
+    async def put_sync_state_async(self, aid: str, doc: Dict[str, Any]):
+        async with AsyncSessionLocal() as session:
+            stmt = select(AccountSyncState).where(AccountSyncState.account_id == aid)
+            st = (await session.execute(stmt)).scalar_one_or_none()
+            if not st:
+                st = AccountSyncState(account_id=aid)
+                session.add(st)
+            if "status" in doc:
+                st.status = doc["status"]
+            if "is_stale" in doc:
+                st.is_stale = bool(doc["is_stale"])
+            if "last_sync_start" in doc and doc["last_sync_start"]:
+                st.last_sync_start = doc["last_sync_start"]
+            if "last_sync_success" in doc and doc["last_sync_success"]:
+                st.last_sync_success = doc["last_sync_success"]
+            if "last_error" in doc:
+                st.last_error = doc["last_error"]
+            if "error_count" in doc:
+                st.error_count = int(doc["error_count"])
+            if "consecutive_failures" in doc:
+                st.consecutive_failures = int(doc["consecutive_failures"])
+            if "circuit_open" in doc:
+                st.circuit_open = bool(doc["circuit_open"])
+            if "total_fills_today" in doc:
+                st.total_fills_today = int(doc["total_fills_today"])
+            if "total_trades_today" in doc:
+                st.total_trades_today = int(doc["total_trades_today"])
+            await session.commit()
+
+    async def get_daily_reports_async(self, account_id: Optional[str] = None, from_date: Optional[str] = None) -> List[Dict[str, Any]]:
+        async with AsyncSessionLocal() as session:
+            stmt = select(DailyAccountReport)
+            if account_id:
+                stmt = stmt.where((DailyAccountReport.account_id == account_id) | (DailyAccountReport.trader_id == account_id))
+            if from_date:
+                stmt = stmt.where(DailyAccountReport.trade_date >= from_date)
+            stmt = stmt.order_by(DailyAccountReport.trade_date.asc())
+            rows = (await session.execute(stmt)).scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "account": r.account_id,
+                    "trader": r.trader_id,
+                    "date": r.trade_date,
+                    "status": r.status,
+                    "realized_pnl": float(r.realized_pnl or 0),
+                    "unrealized_pnl": float(r.unrealized_pnl or 0),
+                    "charges": float(r.charges or 0),
+                    "net_pnl": float(r.net_pnl or 0),
+                    "total_trades": r.total_trades,
+                    "closed_trades": r.closed_trades,
+                    "open_trades": r.open_trades,
+                    "partially_closed_trades": r.partially_closed_trades,
+                    "winning_trades": r.winning_trades,
+                    "losing_trades": r.losing_trades,
+                    "finalized_at": r.finalized_at.isoformat() if r.finalized_at else None,
+                    "archived_at": r.archived_at.isoformat() if r.archived_at else None,
+                    "source_info": r.source_info,
+                    "reconciliation_notes": r.reconciliation_notes,
+                    "trade_details": r.trade_details or [],
+                }
+                for r in rows
+            ]
+
+    async def put_daily_report_async(self, report_id: str, doc: Dict[str, Any], allow_overwrite_finalized: bool = False):
+        async with AsyncSessionLocal() as session:
+            stmt = select(DailyAccountReport).where(DailyAccountReport.id == report_id)
+            r = (await session.execute(stmt)).scalar_one_or_none()
+            if r and r.status in ("FINALIZED", "ARCHIVED") and not allow_overwrite_finalized:
+                # Only allow transitioning FINALIZED -> ARCHIVED without altering financial figures
+                if doc.get("status") == "ARCHIVED" and r.status == "FINALIZED":
+                    r.status = "ARCHIVED"
+                    r.archived_at = doc.get("archived_at") or datetime.now(timezone.utc)
+                    await session.commit()
+                return
+            if not r:
+                r = DailyAccountReport(id=report_id)
+                session.add(r)
+            r.account_id = doc.get("account") or r.account_id
+            r.trader_id = doc.get("trader") or r.trader_id
+            r.trade_date = doc.get("date") or r.trade_date
+            r.status = doc.get("status") or r.status or "LIVE"
+            r.realized_pnl = doc.get("realized_pnl", r.realized_pnl or 0)
+            r.unrealized_pnl = doc.get("unrealized_pnl", r.unrealized_pnl or 0)
+            r.charges = doc.get("charges", r.charges or 0)
+            r.net_pnl = doc.get("net_pnl", r.net_pnl or 0)
+            r.total_trades = int(doc.get("total_trades", r.total_trades or 0))
+            r.closed_trades = int(doc.get("closed_trades", r.closed_trades or 0))
+            r.open_trades = int(doc.get("open_trades", r.open_trades or 0))
+            r.partially_closed_trades = int(doc.get("partially_closed_trades", r.partially_closed_trades or 0))
+            r.winning_trades = int(doc.get("winning_trades", r.winning_trades or 0))
+            r.losing_trades = int(doc.get("losing_trades", r.losing_trades or 0))
+            if doc.get("finalized_at"):
+                r.finalized_at = doc["finalized_at"] if isinstance(doc["finalized_at"], datetime) else datetime.now(timezone.utc)
+            if doc.get("archived_at"):
+                r.archived_at = doc["archived_at"] if isinstance(doc["archived_at"], datetime) else datetime.now(timezone.utc)
+            if "source_info" in doc:
+                r.source_info = doc["source_info"]
+            if "reconciliation_notes" in doc:
+                r.reconciliation_notes = doc["reconciliation_notes"]
+            if "trade_details" in doc:
+                r.trade_details = doc["trade_details"]
+            await session.commit()
+
+    # ---------------- Orders & Positions Persistence ----------------
+
+    async def put_many_orders_async(self, account_id: str, orders: List[Dict[str, Any]]):
+        from app.engine import parse_ts
+        async with AsyncSessionLocal() as session:
+            for o in orders:
+                ord_no = str(o.get("norenordno") or "")
+                if not ord_no:
+                    continue
+                oid = f"{account_id}|{ord_no}"
+                stmt = select(Order).where(Order.id == oid)
+                row = (await session.execute(stmt)).scalar_one_or_none()
+                ot = parse_ts(o.get("norentm"), o.get("exch_tm"), o.get("ordenttm")) or datetime.now(timezone.utc)
+                side_raw = str(o.get("trantype", "B")).upper()
+                side = "BUY" if side_raw in ("B", "BUY") else "SELL"
+                qty = float(o.get("qty") or 0)
+                filled_qty = float(o.get("fillshares") or o.get("flqty") or 0)
+                avg_prc = float(o.get("avgprc") or o.get("prc") or 0)
+                status = str(o.get("status") or "OPEN").upper()
+
+                if not row:
+                    row = Order(
+                        id=oid,
+                        account_id=account_id,
+                        norenordno=ord_no,
+                        exch=o.get("exch", "NFO"),
+                        tsym=str(o.get("tsym", "")),
+                        side=side,
+                        product=o.get("prd", "MIS"),
+                        price_type=o.get("prctyp", "MKT"),
+                        status=status,
+                        qty=qty,
+                        filled_qty=filled_qty,
+                        avg_price=avg_prc,
+                        order_source=o.get("ordersource", ""),
+                        remarks=o.get("remarks", ""),
+                        order_time=ot,
+                        raw_payload=o,
+                    )
+                    session.add(row)
+                else:
+                    row.status = status
+                    row.qty = qty
+                    row.filled_qty = filled_qty
+                    row.avg_price = avg_prc
+                    row.raw_payload = o
+            await session.commit()
+
+    async def get_orders_async(self, account_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        async with AsyncSessionLocal() as session:
+            stmt = select(Order)
+            if account_id:
+                stmt = stmt.where(Order.account_id == account_id)
+            stmt = stmt.order_by(Order.order_time.desc())
+            rows = (await session.execute(stmt)).scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "account": r.account_id,
+                    "norenordno": r.norenordno,
+                    "exch": r.exch,
+                    "tsym": r.tsym,
+                    "side": r.side,
+                    "product": r.product,
+                    "price_type": r.price_type,
+                    "status": r.status,
+                    "qty": float(r.qty or 0),
+                    "filled_qty": float(r.filled_qty or 0),
+                    "avg_price": float(r.avg_price or 0),
+                    "order_source": r.order_source,
+                    "remarks": r.remarks,
+                    "order_time": r.order_time.isoformat() if r.order_time else None,
+                }
+                for r in rows
+            ]
+
+    async def put_many_positions_async(self, account_id: str, positions: List[Dict[str, Any]]):
+        async with AsyncSessionLocal() as session:
+            for p in positions:
+                tsym = str(p.get("tsym") or "")
+                if not tsym:
+                    continue
+                prd = str(p.get("prd") or "MIS")
+                pid = f"{account_id}|{tsym}|{prd}"
+                stmt = select(Position).where(Position.id == pid)
+                row = (await session.execute(stmt)).scalar_one_or_none()
+                net_qty = float(p.get("netqty") or 0)
+                buy_qty = float(p.get("daybuyqty") or p.get("totbuyqty") or 0)
+                sell_qty = float(p.get("daysellqty") or p.get("totsellqty") or 0)
+                buy_avg = float(p.get("daybuyavgprc") or p.get("totbuyavgprc") or p.get("netavgprc") or 0)
+                sell_avg = float(p.get("daysellavgprc") or p.get("totsellavgprc") or 0)
+                lp_raw = p.get("lp")
+                ltp_val = float(lp_raw) if lp_raw is not None and lp_raw != "" else None
+                rpnl = float(p.get("rpnl") or 0)
+                urmtom = float(p.get("urmtom") or 0)
+
+                if not row:
+                    row = Position(
+                        id=pid,
+                        account_id=account_id,
+                        tsym=tsym,
+                        product=prd,
+                        exch=p.get("exch", "NFO"),
+                        net_qty=net_qty,
+                        buy_qty=buy_qty,
+                        sell_qty=sell_qty,
+                        buy_avg=buy_avg,
+                        sell_avg=sell_avg,
+                        ltp=ltp_val,
+                        realized_pnl=rpnl,
+                        unrealized_pnl=urmtom,
+                        raw_payload=p,
+                    )
+                    session.add(row)
+                else:
+                    row.net_qty = net_qty
+                    row.buy_qty = buy_qty
+                    row.sell_qty = sell_qty
+                    row.buy_avg = buy_avg
+                    row.sell_avg = sell_avg
+                    if ltp_val is not None:
+                        row.ltp = ltp_val
+                    row.realized_pnl = rpnl
+                    row.unrealized_pnl = urmtom
+                    row.raw_payload = p
+                    row.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+
+    async def get_positions_async(self, account_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        async with AsyncSessionLocal() as session:
+            stmt = select(Position)
+            if account_id:
+                stmt = stmt.where(Position.account_id == account_id)
+            rows = (await session.execute(stmt)).scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "account": r.account_id,
+                    "tsym": r.tsym,
+                    "product": r.product,
+                    "exch": r.exch,
+                    "net_qty": float(r.net_qty or 0),
+                    "buy_qty": float(r.buy_qty or 0),
+                    "sell_qty": float(r.sell_qty or 0),
+                    "buy_avg": float(r.buy_avg or 0),
+                    "sell_avg": float(r.sell_avg or 0),
+                    "ltp": float(r.ltp) if r.ltp is not None else None,
+                    "realized_pnl": float(r.realized_pnl or 0),
+                    "unrealized_pnl": float(r.unrealized_pnl or 0),
+                    "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+                }
+                for r in rows
+            ]
+
+    # ---------------- Persistent Rule Violations (Alerts) ----------------
+
+    async def upsert_rule_violation_async(self, dedup_key: str, doc: Dict[str, Any]) -> bool:
+        """Persists a structured rule violation in the alerts table idempotently. Returns True if newly created."""
+        async with AsyncSessionLocal() as session:
+            stmt = select(Alert).where(Alert.dedup_key == dedup_key)
+            existing = (await session.execute(stmt)).scalar_one_or_none()
+            if existing:
+                # Update status if changed (e.g. ACTIVE -> HISTORICAL or RESOLVED)
+                if doc.get("violation_status") and existing.violation_status != doc["violation_status"]:
+                    existing.violation_status = doc["violation_status"]
+                    await session.commit()
+                return False
+
+            import uuid
+            alert_id = doc.get("id") or f"FLG-{uuid.uuid4().hex[:12]}"
+            alert = Alert(
+                id=alert_id,
+                dedup_key=dedup_key,
+                account_id=doc.get("account_id"),
+                trader_id=doc.get("trader_id"),
+                trade_id=doc.get("trade_id"),
+                order_id=doc.get("order_id"),
+                trade_date=doc.get("trade_date"),
+                trade_time=doc.get("trade_time"),
+                rule_name=doc.get("rule_name"),
+                configured_condition=doc.get("configured_condition"),
+                observed_value=doc.get("observed_value"),
+                explanation=doc.get("explanation"),
+                violation_status=doc.get("violation_status", "ACTIVE"),
+                severity=doc.get("severity", "High"),
+                title=doc.get("title", doc.get("rule_name", "Rule violation")),
+                message=doc.get("message", doc.get("explanation", "")),
+                event_time=datetime.now(timezone.utc),
+            )
+            session.add(alert)
+            await session.commit()
+            return True
+
+    async def get_rule_violations_async(self, account_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        async with AsyncSessionLocal() as session:
+            stmt = select(Alert).where(Alert.rule_name.isnot(None))
+            if account_id:
+                stmt = stmt.where((Alert.account_id == account_id) | (Alert.trader_id == account_id))
+            stmt = stmt.order_by(Alert.created_at.desc())
+            rows = (await session.execute(stmt)).scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "dedup_key": r.dedup_key,
+                    "account": r.account_id,
+                    "trader": r.trader_id,
+                    "trade_id": r.trade_id,
+                    "order_id": r.order_id,
+                    "date": r.trade_date,
+                    "time": r.trade_time,
+                    "rule": r.rule_name,
+                    "condition": r.configured_condition,
+                    "observed": r.observed_value,
+                    "did": r.explanation or r.message,
+                    "status": getattr(r, "violation_status", "ACTIVE") or "ACTIVE",
+                    "level": r.severity,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
 
     # ---------------- Generic Asynchronous Operations ----------------
 
@@ -330,6 +696,14 @@ class Store:
             return await self._all_trades()
         elif collection == "fills":
             return await self._all_fills()
+        elif collection == "orders":
+            return await self.get_orders_async()
+        elif collection == "positions":
+            return await self.get_positions_async()
+        elif collection == "daily_reports":
+            return await self.get_daily_reports_async()
+        elif collection == "alerts":
+            return await self.get_rule_violations_async()
         elif collection == "settings":
             return await self._all_settings()
         elif collection == "sessions":
@@ -523,7 +897,7 @@ class Store:
         async with AsyncSessionLocal() as session:
             stmt = select(TradingRule)
             res = (await session.execute(stmt)).scalars().all()
-            return [{"trader": r.trader_id, "rules": r.rules} for r in res]
+            return [{"trader": r.trader_id, "account": getattr(r, "account_id", None) or r.trader_id, "rules": r.rules} for r in res]
 
     async def _get_rule(self, tid: str) -> Optional[Dict[str, Any]]:
         async with AsyncSessionLocal() as session:
@@ -531,7 +905,7 @@ class Store:
             r = (await session.execute(stmt)).scalar_one_or_none()
             if not r:
                 return None
-            return {"trader": r.trader_id, "rules": r.rules}
+            return {"trader": r.trader_id, "account": getattr(r, "account_id", None) or r.trader_id, "rules": r.rules}
 
     async def _put_rule(self, tid: str, doc: Dict[str, Any]):
         async with AsyncSessionLocal() as session:
@@ -540,8 +914,10 @@ class Store:
             rules_data = doc.get("rules", doc)
             if r:
                 r.rules = rules_data
+                if doc.get("account"):
+                    r.account_id = doc["account"]
             else:
-                r = TradingRule(trader_id=tid, rules=rules_data)
+                r = TradingRule(trader_id=tid, account_id=doc.get("account") or tid, rules=rules_data)
                 session.add(r)
             await session.commit()
 
@@ -571,7 +947,7 @@ class Store:
             stmt = select(Group)
             res = (await session.execute(stmt)).scalars().all()
             return [
-                {"id": g.id, "name": g.name, "description": g.description, "traders": g.traders or []}
+                {"id": g.id, "name": g.name, "description": g.description, "traders": g.traders or [], "accounts": g.traders or []}
                 for g in res
             ]
 
@@ -581,18 +957,19 @@ class Store:
             g = (await session.execute(stmt)).scalar_one_or_none()
             if not g:
                 return None
-            return {"id": g.id, "name": g.name, "description": g.description, "traders": g.traders or []}
+            return {"id": g.id, "name": g.name, "description": g.description, "traders": g.traders or [], "accounts": g.traders or []}
 
     async def _put_group(self, gid: str, doc: Dict[str, Any]):
         async with AsyncSessionLocal() as session:
             stmt = select(Group).where(Group.id == gid)
             g = (await session.execute(stmt)).scalar_one_or_none()
+            members = doc.get("accounts") if "accounts" in doc else doc.get("traders", [])
             if g:
                 g.name = doc.get("name", g.name)
                 g.description = doc.get("description", g.description)
-                g.traders = doc.get("traders", g.traders)
+                g.traders = members if members is not None else g.traders
             else:
-                g = Group(id=gid, name=doc.get("name", gid), description=doc.get("description"), traders=doc.get("traders", []))
+                g = Group(id=gid, name=doc.get("name", gid), description=doc.get("description"), traders=members or [])
                 session.add(g)
             await session.commit()
 
@@ -605,7 +982,10 @@ class Store:
         async with AsyncSessionLocal() as session:
             stmt = select(Trade)
             if from_date:
-                stmt = stmt.where(Trade.trade_date >= from_date)
+                # Include open positions regardless of entry date, or trades whose trade_date or exit_date >= from_date
+                stmt = stmt.where(
+                    (Trade.is_open == True) | (Trade.trade_date >= from_date) | (Trade.exit_date >= from_date)
+                )
             stmt = stmt.order_by(Trade.trade_date.desc(), Trade.trade_time.desc())
             res = (await session.execute(stmt)).scalars().all()
             return [self._trade_to_dict(t) for t in res]
@@ -616,11 +996,18 @@ class Store:
             t = (await session.execute(stmt)).scalar_one_or_none()
             return self._trade_to_dict(t) if t else None
 
-    async def _put_trade(self, tid: str, doc: Dict[str, Any]):
+    async def _put_trade(self, tid: str, doc: Dict[str, Any], allow_overwrite_finalized: bool = False):
         async with AsyncSessionLocal() as session:
             stmt = select(Trade).where(Trade.id == tid)
             t = (await session.execute(stmt)).scalar_one_or_none()
             if t:
+                if getattr(t, "is_finalized", False) and not allow_overwrite_finalized:
+                    # Only allow setting is_archived on a finalized trade; never mutate financial values
+                    if doc.get("is_archived") and not getattr(t, "is_archived", False):
+                        t.is_archived = True
+                        t.archived_at = doc.get("archived_at") or datetime.now(timezone.utc)
+                        await session.commit()
+                    return
                 self._update_trade_model(t, doc)
             else:
                 t = Trade(id=tid)
@@ -628,12 +1015,17 @@ class Store:
                 session.add(t)
             await session.commit()
 
-    async def _put_many_trades(self, items: List[Tuple[str, Dict[str, Any]]]):
+    async def _put_many_trades(self, items: List[Tuple[str, Dict[str, Any]]], allow_overwrite_finalized: bool = False):
         async with AsyncSessionLocal() as session:
             for tid, doc in items:
                 stmt = select(Trade).where(Trade.id == tid)
                 t = (await session.execute(stmt)).scalar_one_or_none()
                 if t:
+                    if getattr(t, "is_finalized", False) and not allow_overwrite_finalized:
+                        if doc.get("is_archived") and not getattr(t, "is_archived", False):
+                            t.is_archived = True
+                            t.archived_at = doc.get("archived_at") or datetime.now(timezone.utc)
+                        continue
                     self._update_trade_model(t, doc)
                 else:
                     t = Trade(id=tid)
@@ -641,23 +1033,31 @@ class Store:
                     session.add(t)
             await session.commit()
 
-    async def _delete_trade(self, tid: str):
+    async def _delete_trade(self, tid: str, allow_delete_finalized: bool = False):
         async with AsyncSessionLocal() as session:
+            if not allow_delete_finalized:
+                stmt = select(Trade).where(Trade.id == tid)
+                t = (await session.execute(stmt)).scalar_one_or_none()
+                if t and getattr(t, "is_finalized", False):
+                    log.warning(f"Prevented deletion of finalized historical trade {tid}")
+                    return
             await session.execute(sa_delete(Trade).where(Trade.id == tid))
             await session.commit()
 
     async def _delete_trades_by_prefix(self, prefix: str):
         async with AsyncSessionLocal() as session:
-            await session.execute(sa_delete(Trade).where(Trade.id.like(f"{prefix}%")))
+            await session.execute(
+                sa_delete(Trade).where(Trade.id.like(f"{prefix}%"), Trade.is_finalized == False)
+            )
             await session.commit()
 
     def _update_trade_model(self, t: Trade, doc: Dict[str, Any]):
         t.origin = doc.get("origin") or t.origin or "import"
-        t.account_id = doc.get("account") or t.account_id or "AC-01"
+        t.account_id = doc.get("account") or t.account_id
         t.trader_id = doc.get("trader") or t.trader_id
         t.trade_date = doc.get("date") or t.trade_date
-        t.trade_time = doc.get("time") or t.trade_time or "10:00"
-        t.symbol = doc.get("symbol") or t.symbol or "BANKNIFTY"
+        t.trade_time = doc.get("time") or t.trade_time or "09:15"
+        t.symbol = doc.get("symbol") or t.symbol or "UNKNOWN"
         t.strike = doc.get("strike", t.strike)
         t.opt = doc.get("opt", t.opt)
         t.expiry = doc.get("expiry", t.expiry)
@@ -666,36 +1066,89 @@ class Store:
         t.exch = doc.get("exch", t.exch or "NFO")
         t.side = (doc.get("side") or t.side or "BUY").upper()
         lots = doc.get("lots") if doc.get("lots") is not None else (t.lots or 1)
-        t.lots = float(lots) if lots is not None else 1.0
+        t.lots = Decimal(str(lots)) if lots is not None else Decimal("1")
         lot_size = doc.get("lotSize") or doc.get("lot_size") or t.lot_size or 1
         t.lot_size = int(lot_size)
         qty = doc.get("qty")
         if qty is None:
             qty = float(t.lots) * int(t.lot_size)
-        t.qty = float(qty)
-        t.entry_price = float(doc.get("entry") if doc.get("entry") is not None else (t.entry_price if t.entry_price is not None else 0.0))
-        t.exit_price = float(doc.get("exit") if doc.get("exit") is not None else (t.exit_price if t.exit_price is not None else 0.0))
-        if doc.get("pnl") is not None:
-            try:
-                t.pnl = float(doc["pnl"])
-            except (ValueError, TypeError):
-                pass
-        t.is_open = bool(doc.get("open", False))
-        t.exit_date = doc.get("exitDate", t.exit_date or t.trade_date)
-        t.exit_time = doc.get("exitTime", t.exit_time or t.trade_time)
+        t.qty = Decimal(str(qty))
+        entry_val = doc.get("entry") if doc.get("entry") is not None else (t.entry_price if t.entry_price is not None else 0.0)
+        t.entry_price = Decimal(str(entry_val))
+        if "exit" in doc:
+            t.exit_price = Decimal(str(doc["exit"])) if doc["exit"] is not None else None
+        elif t.exit_price is None:
+            t.exit_price = t.entry_price
+
+        is_open = bool(doc.get("open", False))
+        t.is_open = is_open
+
+        if "pnl" in doc:
+            t.pnl = Decimal(str(doc["pnl"])) if doc["pnl"] is not None else None
+        if "realized_pnl" in doc:
+            t.realized_pnl = Decimal(str(doc["realized_pnl"])) if doc["realized_pnl"] is not None else None
+        elif not is_open and t.pnl is not None and t.realized_pnl is None:
+            t.realized_pnl = t.pnl
+        if "unrealized_pnl" in doc:
+            t.unrealized_pnl = Decimal(str(doc["unrealized_pnl"])) if doc["unrealized_pnl"] is not None else None
+        elif is_open and t.pnl is not None:
+            t.unrealized_pnl = t.pnl
+
+        charges_val = doc.get("charges") if doc.get("charges") is not None else (t.charges if t.charges is not None else 0.0)
+        t.charges = Decimal(str(charges_val))
+        t.charges_estimated = doc.get("chargesEstimated", True)
+
+        if "net_pnl" in doc and doc["net_pnl"] is not None:
+            t.net_pnl = Decimal(str(doc["net_pnl"]))
+        elif t.pnl is not None:
+            t.net_pnl = Decimal(str(t.pnl)) - Decimal(str(t.charges or 0))
+
+        if "pnl_source" in doc:
+            t.pnl_source = doc["pnl_source"]
+
+        if is_open:
+            t.exit_date = doc.get("exitDate")  # Should be None for open positions
+            t.exit_time = doc.get("exitTime", "OPEN")
+        else:
+            t.exit_date = doc.get("exitDate") or t.exit_date or t.trade_date
+            t.exit_time = doc.get("exitTime") or t.exit_time or t.trade_time
+
         t.spot = doc.get("spot", t.spot)
         t.product = doc.get("product", t.product or "MIS")
         t.source = doc.get("source", t.source or "Manual")
-        t.charges = float(doc.get("charges") if doc.get("charges") is not None else (t.charges if t.charges is not None else 0.0))
-        t.charges_estimated = doc.get("chargesEstimated", True)
         t.hedged = bool(doc.get("hedged", False))
+
+        if "parent_trade_id" in doc:
+            t.parent_trade_id = doc["parent_trade_id"]
+        if "entry_order_id" in doc:
+            t.entry_order_id = doc["entry_order_id"]
+        if "exit_order_id" in doc:
+            t.exit_order_id = doc["exit_order_id"]
+        if "is_finalized" in doc:
+            t.is_finalized = bool(doc["is_finalized"])
+        if "finalized_at" in doc and doc["finalized_at"]:
+            t.finalized_at = doc["finalized_at"] if isinstance(doc["finalized_at"], datetime) else datetime.now(timezone.utc)
+        if "is_archived" in doc:
+            t.is_archived = bool(doc["is_archived"])
+        if "archived_at" in doc and doc["archived_at"]:
+            t.archived_at = doc["archived_at"] if isinstance(doc["archived_at"], datetime) else datetime.now(timezone.utc)
 
     def _trade_to_dict(self, t: Trade) -> Dict[str, Any]:
         lots = float(t.lots) if t.lots is not None else 1.0
         lot_size = int(t.lot_size) if t.lot_size is not None else 1
         qty = float(t.qty) if t.qty is not None else (lots * lot_size)
+        entry_f = float(t.entry_price) if t.entry_price is not None else 0.0
+        exit_f = float(t.exit_price) if t.exit_price is not None else entry_f
+        pnl_f = float(t.pnl) if getattr(t, "pnl", None) is not None else None
+        realized_f = float(t.realized_pnl) if getattr(t, "realized_pnl", None) is not None else (pnl_f if not t.is_open else 0.0)
+        unrealized_f = float(t.unrealized_pnl) if getattr(t, "unrealized_pnl", None) is not None else (pnl_f if t.is_open else 0.0)
+        charges_f = float(t.charges) if t.charges is not None else 0.0
+        net_f = float(t.net_pnl) if getattr(t, "net_pnl", None) is not None else ((pnl_f - charges_f) if pnl_f is not None else None)
         return {
             "id": t.id,
+            "parent_trade_id": getattr(t, "parent_trade_id", None) or t.id,
+            "entry_order_id": getattr(t, "entry_order_id", None),
+            "exit_order_id": getattr(t, "exit_order_id", None),
             "origin": t.origin,
             "date": t.trade_date,
             "time": t.trade_time,
@@ -712,23 +1165,33 @@ class Store:
             "lots": lots,
             "lotSize": lot_size,
             "qty": qty,
-            "entry": float(t.entry_price) if t.entry_price is not None else 0.0,
-            "exit": float(t.exit_price) if t.exit_price is not None else 0.0,
-            "pnl": float(t.pnl) if getattr(t, "pnl", None) is not None else None,
+            "entry": entry_f,
+            "exit": exit_f,
+            "pnl": pnl_f,
+            "realized_pnl": realized_f,
+            "unrealized_pnl": unrealized_f,
+            "net_pnl": net_f,
+            "pnl_source": getattr(t, "pnl_source", "calculated"),
             "open": t.is_open,
             "exitDate": t.exit_date,
             "exitTime": t.exit_time,
             "spot": float(t.spot) if t.spot is not None else None,
             "product": t.product,
             "source": t.source,
-            "charges": float(t.charges) if t.charges is not None else 0.0,
+            "charges": charges_f,
             "chargesEstimated": t.charges_estimated,
             "hedged": t.hedged,
+            "is_finalized": bool(getattr(t, "is_finalized", False)),
+            "finalized_at": t.finalized_at.isoformat() if getattr(t, "finalized_at", None) else None,
+            "is_archived": bool(getattr(t, "is_archived", False)),
+            "archived_at": t.archived_at.isoformat() if getattr(t, "archived_at", None) else None,
         }
 
-    async def _all_fills(self) -> List[Dict[str, Any]]:
+    async def _all_fills(self, account_id: Optional[str] = None) -> List[Dict[str, Any]]:
         async with AsyncSessionLocal() as session:
             stmt = select(Fill)
+            if account_id:
+                stmt = stmt.where(Fill.account_id == account_id)
             res = (await session.execute(stmt)).scalars().all()
             return [
                 {
@@ -757,7 +1220,12 @@ class Store:
             for fid, f in items:
                 stmt = select(Fill).where(Fill.id == fid)
                 row = (await session.execute(stmt)).scalar_one_or_none()
-                ft = parse_ts(f.get("fltm"), f.get("exch_tm"), f.get("norentm")) or datetime.now(timezone.utc)
+                ft = parse_ts(f.get("fltm"), f.get("exch_tm"), f.get("norentm"))
+                if not ft:
+                    # Fallback if only trade_day is known
+                    day_str = f.get("_day") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    ft = datetime.strptime(f"{day_str} 09:15:00", "%Y-%m-%d %H:%M:%S")
+                actual_trade_day = ft.strftime("%Y-%m-%d")
                 if not row:
                     row = Fill(
                         id=fid,
@@ -768,11 +1236,11 @@ class Store:
                         exch=f.get("exch", "NFO"),
                         side=f.get("trantype", "B"),
                         product=f.get("prd", "MIS"),
-                        qty=float(f.get("flqty") or f.get("fillshares") or 0),
-                        price=float(f.get("flprc") or f.get("avgprc") or 0),
+                        qty=Decimal(str(f.get("flqty") or f.get("fillshares") or 0)),
+                        price=Decimal(str(f.get("flprc") or f.get("avgprc") or 0)),
                         lot_size=int(float(f.get("ls") or 1)),
                         fill_time=ft,
-                        trade_day=f.get("_day") or ft.strftime("%Y-%m-%d"),
+                        trade_day=actual_trade_day,
                         order_source=f.get("ordersource", ""),
                         remarks=f.get("remarks", ""),
                         token=f.get("token"),
@@ -842,7 +1310,6 @@ class Store:
             await session.commit()
 
     async def _get_status(self, key: str) -> Optional[Dict[str, Any]]:
-        # Map status to AccountSyncState or Setting
         return await self._get_setting(f"status_{key}")
 
     async def _put_status(self, key: str, doc: Dict[str, Any]):

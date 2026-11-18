@@ -3,7 +3,11 @@
 Features:
 - High-performance asynchronous FastAPI & PostgreSQL architecture
 - Up to 50+ concurrent linked Zebu trading accounts with independent streams & error boundaries
-- Zebu / Noren real-time WebSocket ingestion & REST reconciliation
+- Zebu / Noren real-time WebSocket ingestion & REST reconciliation (OrderBook, TradeBook, PositionBook)
+- Decimal-accurate FIFO trade lifecycle, partial closure handling, and overnight position continuity
+- End-of-Day (03:30 PM IST) reconciliation and immutable daily finalization
+- Midnight (12:00 AM IST) trade cleanup, daily archiving, and startup recovery
+- Automatic rule monitoring with persistent structured red flags & violation explanations
 - Account-level authorization: Admin, Trader, Viewer
 - Preserves 100% compatibility with existing static/index.html dashboard
 - Live Dashboard WebSocket endpoint (/api/ws)
@@ -18,6 +22,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from zoneinfo import ZoneInfo
@@ -42,11 +47,15 @@ from app.models import (
     Setting,
     Trade,
     Fill,
+    Order,
+    Position,
     TradingRule,
     RuleLog,
     Alert,
     SentFlag,
+    AccountSyncState,
     DailySyncRecord,
+    DailyAccountReport,
 )
 from app.security import hash_pw, check_pw, generate_session_token, generate_link_nonce, encrypt_token, decrypt_token
 from app.store import Store
@@ -96,7 +105,6 @@ async def index_token_async(underlying: str) -> Optional[Tuple[str, str]]:
         "BANKEX": "BANKEX",
     }.get(underlying, underlying).upper()
 
-    # Look for active token
     tok, uid = await any_token_async()
     if tok and uid:
         for exch in ("NSE", "BSE"):
@@ -108,7 +116,6 @@ async def index_token_async(underlying: str) -> Optional[Tuple[str, str]]:
             except Exception as e:
                 log.info(f"GetIndexList {exch}: {e}")
 
-    # Fallback to configured tokens
     for pair in CFG.INDEX_TOKENS.split(","):
         if "=" in pair:
             sym, fb = pair.split("=", 1)
@@ -189,26 +196,20 @@ def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
 
 
 async def token_for_account_async(acc_id: str) -> Optional[str]:
+    """Returns valid access token strictly for the specified account ID."""
     async with AsyncSessionLocal() as session:
         stmt = select(BrokerSession).where(BrokerSession.account_id == acc_id)
         bs = (await session.execute(stmt)).scalar_one_or_none()
-        if bs and bs.access_token_enc:
-            return decrypt_token(bs.access_token_enc)
-
-        # Fallback by zebu_uid if another linked account shares credentials
-        acc_stmt = select(Account).where((Account.id == acc_id) | (Account.zebu_uid == acc_id))
-        cur_acc = (await session.execute(acc_stmt)).scalars().first()
-        if cur_acc and cur_acc.zebu_uid:
-            match_stmt = (
-                select(BrokerSession)
-                .join(Account, Account.id == BrokerSession.account_id)
-                .where((Account.zebu_uid == cur_acc.zebu_uid) | (BrokerSession.account_id == cur_acc.zebu_uid), BrokerSession.access_token_enc.isnot(None))
-            )
-            matched_bs = (await session.execute(match_stmt)).scalars().first()
-            if matched_bs and matched_bs.access_token_enc:
-                return decrypt_token(matched_bs.access_token_enc)
-
-        return None
+        if not bs or not bs.access_token_enc:
+            return None
+        if bs.status in ("Not linked", "Disconnected", "Login expired", "REAUTH_REQUIRED"):
+            return None
+        exp = ensure_utc(bs.expires_at)
+        if exp and exp < datetime.now(timezone.utc):
+            bs.status = "Login expired"
+            await session.commit()
+            return None
+        return decrypt_token(bs.access_token_enc)
 
 
 async def any_token_async() -> Tuple[Optional[str], Optional[str]]:
@@ -217,7 +218,7 @@ async def any_token_async() -> Tuple[Optional[str], Optional[str]]:
         res = (await session.execute(stmt)).all()
         now_utc = datetime.now(timezone.utc)
         for acc, bs in res:
-            if bs.access_token_enc and acc.zebu_uid:
+            if bs.access_token_enc and acc.zebu_uid and bs.status == "Linked":
                 exp = ensure_utc(bs.expires_at)
                 if not exp or exp >= now_utc:
                     return decrypt_token(bs.access_token_enc), acc.zebu_uid
@@ -225,42 +226,177 @@ async def any_token_async() -> Tuple[Optional[str], Optional[str]]:
 
 
 async def poll_account_async(acc: dict, now: datetime) -> str:
-    """Fetches TradeBook and PositionBook for an account and builds trades."""
-    tok = await token_for_account_async(acc["id"])
+    """Fetches OrderBook, TradeBook, and PositionBook for an account, reconciles open/closed trades, and evaluates rules."""
+    aid = acc["id"]
+    now_utc = datetime.now(timezone.utc)
+    await DB.put_sync_state_async(aid, {"last_sync_start": now_utc})
+
+    tok_doc = await DB.get_token_async(aid)
+    tok = await token_for_account_async(aid)
     if not tok:
-        return "expired"
+        status_str = (tok_doc or {}).get("status") or "Not linked"
+        if status_str in ("Login expired", "REAUTH_REQUIRED"):
+            await DB.put_sync_state_async(aid, {
+                "status": "REAUTH_REQUIRED",
+                "is_stale": True,
+                "last_error": "Session expired — reauthorization required",
+            })
+            return "expired"
+        await DB.put_sync_state_async(aid, {"status": "DISCONNECTED", "is_stale": False})
+        return "not_linked"
 
     uid, actid = acc.get("zebu_uid"), acc.get("zebu_actid") or acc.get("zebu_uid")
     proxy_url = acc.get("proxy_url")
 
     try:
-        fills = await ZEBU.trade_book_async(tok, uid, actid, proxy=proxy_url)
-        positions = await ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url)
-    except SessionExpired:
-        log.warning(f"Zebu session refresh notice for account {acc['id']} (retaining linked state)")
-        async with AsyncSessionLocal() as session:
-            stmt = select(BrokerSession).where(BrokerSession.account_id == acc["id"])
-            bs = (await session.execute(stmt)).scalar_one_or_none()
-            if bs:
-                bs.status = "Linked"
-                await session.commit()
-        return "expired"
+        # Fetch TradeBook, PositionBook, and OrderBook concurrently from actual broker API
+        fills_res, positions_res, orders_res = await asyncio.gather(
+            ZEBU.trade_book_async(tok, uid, actid, proxy=proxy_url),
+            ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url),
+            ZEBU.order_book_async(tok, uid, proxy=proxy_url),
+            return_exceptions=True,
+        )
+        # Check if primary endpoints raised SessionExpired
+        for r in (fills_res, positions_res, orders_res):
+            if isinstance(r, SessionExpired):
+                raise r
+
+        # If TradeBook or PositionBook failed with another error, raise it so we don't overwrite with partial data
+        if isinstance(fills_res, Exception):
+            raise fills_res
+        if isinstance(positions_res, Exception):
+            raise positions_res
+
+        fills = fills_res if isinstance(fills_res, list) else []
+        positions = positions_res if isinstance(positions_res, list) else []
+        orders = orders_res if isinstance(orders_res, list) else []
+
+    except SessionExpired as se:
+        # Attempt automatic token refresh if refresh_token is available
+        ref_tok = (tok_doc or {}).get("refresh_token")
+        refreshed = None
+        if ref_tok:
+            refreshed = await ZEBU.refresh_token_async(
+                refresh_token=ref_tok,
+                uid=uid or "",
+                client_id=acc.get("zebu_client_id") or uid or CFG.ZEBU_CLIENT_ID,
+                secret_key=acc.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY,
+                proxy=proxy_url,
+            )
+        if refreshed and refreshed.get("access_token"):
+            log.info(f"Automatically refreshed expired token for account {aid}")
+            await DB.put_token_async(aid, {
+                "access_token": refreshed["access_token"],
+                "refresh_token": refreshed.get("refresh_token") or ref_tok,
+                "status": "Linked",
+                "last_sync_at": now_utc,
+                "sync_message": "Token auto-refreshed",
+            })
+            return await poll_account_async(acc, now)
+
+        log.warning(f"Zebu session expired for account {aid}: {se}")
+        await DB.put_token_async(aid, {
+            "status": "Login expired",
+            "ws_status": "REAUTH_REQUIRED",
+            "sync_message": f"Session expired: {se}",
+        })
+        await DB.put_sync_state_async(aid, {
+            "status": "REAUTH_REQUIRED",
+            "is_stale": True,
+            "last_error": f"Broker session expired: {se}. Please re-authorize account.",
+        })
+        conn_st = CONN_MGR.get_account_state(aid)
+        conn_st.status = "REAUTH_REQUIRED"
+        raise SessionExpired(str(se))
+
+    except Exception as e:
+        # Broker API temporarily unavailable: retain last data and mark as STALE (Req 1.9, 1.10, 1.11)
+        log.error(f"Broker sync failure for account {aid}: {e}")
+        cur_sync = (await DB.get_sync_state_async(aid)) or {}
+        err_cnt = int(cur_sync.get("error_count") or 0) + 1
+        consec = int(cur_sync.get("consecutive_failures") or 0) + 1
+        await DB.put_sync_state_async(aid, {
+            "status": "STALE",
+            "is_stale": True,
+            "last_error": str(e)[:300],
+            "error_count": err_cnt,
+            "consecutive_failures": consec,
+        })
+        await DB.put_token_async(aid, {
+            "sync_message": f"STALE — sync error at {now.strftime('%H:%M:%S')} IST: {str(e)[:180]}",
+        })
+        raise
 
     today_str = now.date().isoformat()
-    items = []
+
+    # 1. Persist Orders (including partially executed, open, complete, rejected)
+    if orders:
+        await DB.put_many_orders_async(aid, orders)
+
+    # 2. Persist Positions
+    if positions:
+        await DB.put_many_positions_async(aid, positions)
+
+    # 3. Synthesize fills from partially executed orders in OrderBook if not yet in TradeBook
+    fill_items = []
+    seen_order_fill_qty: Dict[str, Decimal] = {}
     for f in fills:
-        fid = f"{acc['id']}|{f.get('norenordno')}|{f.get('flid') or f.get('fltm')}"
-        items.append((fid, {**f, "_acc": acc["id"], "_day": today_str}))
+        ord_no = str(f.get("norenordno") or "")
+        fid = f"{aid}|{ord_no}|{f.get('flid') or f.get('fltm')}"
+        ft = engine.parse_ts(f.get("fltm"), f.get("exch_tm"), f.get("norentm"))
+        f_day = ft.date().isoformat() if ft else today_str
+        fill_items.append((fid, {**f, "_acc": aid, "_day": f_day}))
+        if ord_no:
+            q_dec = engine._dec(f.get("flqty") or f.get("fillshares"), Decimal("0"))
+            seen_order_fill_qty[ord_no] = seen_order_fill_qty.get(ord_no, Decimal("0")) + q_dec
 
-    await DB._put_many_fills(items)
+    for o in orders:
+        ord_no = str(o.get("norenordno") or "")
+        if not ord_no:
+            continue
+        filled_q = engine._dec(o.get("fillshares") or o.get("flqty"), Decimal("0"))
+        avg_p = engine._dec(o.get("avgprc") or o.get("flprc") or o.get("prc"), Decimal("0"))
+        already_q = seen_order_fill_qty.get(ord_no, Decimal("0"))
+        if filled_q > already_q and avg_p > Decimal("0"):
+            diff_q = filled_q - already_q
+            ot = engine.parse_ts(o.get("norentm"), o.get("exch_tm"), o.get("ordenttm")) or now
+            o_day = ot.date().isoformat()
+            synth_fid = f"{aid}|{ord_no}|PARTIAL-{filled_q}"
+            synth_fill = {
+                "norenordno": ord_no,
+                "flid": f"PARTIAL-{filled_q}",
+                "tsym": o.get("tsym"),
+                "exch": o.get("exch", "NFO"),
+                "trantype": o.get("trantype"),
+                "prd": o.get("prd", "I"),
+                "flqty": str(diff_q),
+                "flprc": str(avg_p),
+                "ls": o.get("ls", "1"),
+                "fltm": ot.strftime("%d-%m-%Y %H:%M:%S"),
+                "ordersource": o.get("ordersource", ""),
+                "remarks": o.get("remarks", ""),
+                "token": o.get("token"),
+                "_acc": aid,
+                "_day": o_day,
+            }
+            fill_items.append((synth_fid, synth_fill))
 
-    ltp = {p.get("tsym"): p.get("lp") for p in positions}
+    if fill_items:
+        await DB._put_many_fills(fill_items)
+
+    # 4. Build trades from account fills while strictly preserving finalized historical trades
+    ltp = {}
+    for p in positions:
+        if p.get("tsym") and p.get("lp") is not None and p.get("lp") != "":
+            ltp[p["tsym"]] = p["lp"]
+
     cutoff = (now.date() - timedelta(days=CFG.REBUILD_LOOKBACK_DAYS)).isoformat()
+    acc_fills = await DB._all_fills(account_id=aid)
+    recent_fills = [f for f in acc_fills if f.get("_day", "") >= cutoff]
 
-    all_fills = await DB._all_fills()
-    acc_fills = [f for f in all_fills if f.get("_acc") == acc["id"] and f.get("_day", "") >= cutoff]
     current_trades = await DB._all_trades()
-    old_trades = {t["id"]: t for t in current_trades if t.get("account") == acc["id"] and t.get("origin") == "zebu"}
+    old_trades = {t["id"]: t for t in current_trades if t.get("account") == aid and t.get("origin") == "zebu"}
+    finalized_ids = {tid for tid, t in old_trades.items() if t.get("is_finalized")}
 
     charges_cfg = {
         "brokerage_per_order": CFG.CHG_BROKERAGE_PER_ORDER,
@@ -270,110 +406,43 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
     }
     product_map = json.loads(CFG.PRODUCT_MAP)
 
-    built = engine.build_trades(acc, acc_fills, charges_cfg, product_map, is_algo_order, now, ltp)
+    built = engine.build_trades(acc, recent_fills, charges_cfg, product_map, is_algo_order, now, ltp)
 
-    # Reconcile PositionBook data (authoritative broker P&L) with built trades
-    built_symbols = {t.get("tsym") for t in built if t.get("tsym")}
+    # Reconcile open positions with PositionBook LTP and broker unrealized P&L without mutating closed historical trades
     for p in positions:
         tsym = p.get("tsym")
         if not tsym:
             continue
-        day_buy_q = float(p.get("daybuyqty") or 0)
-        day_sell_q = float(p.get("daysellqty") or 0)
-        rpnl = float(p.get("rpnl") or 0)
-        urmtom = float(p.get("urmtom") or 0)
-        m2m = float(p.get("m2m") or 0)
         net_qty = float(p.get("netqty") or 0)
-        lp = float(p.get("lp") or 0)
-        net_pos_pnl = rpnl + urmtom
-        if net_pos_pnl == 0 and m2m != 0:
-            net_pos_pnl = m2m
+        urmtom_raw = p.get("urmtom")
+        lp_raw = p.get("lp")
 
-        sym_trades_today = [t for t in built if t.get("tsym") == tsym and (t.get("date") == today_str or t.get("exitDate") == today_str)]
-        sym_trades_entered_today = [t for t in sym_trades_today if t.get("date") == today_str]
-        is_pos_closed = (net_qty == 0)
+        if net_qty != 0:
+            open_trs = [t for t in built if t.get("tsym") == tsym and t.get("open") and t["id"] not in finalized_ids]
+            if open_trs:
+                if lp_raw is not None and lp_raw != "":
+                    lp_val = float(lp_raw)
+                    for otr in open_trs:
+                        otr["exit"] = round(lp_val, 2)
+                        t_dir = -1 if otr.get("side") == "SELL" else 1
+                        t_qty = float(otr.get("qty") or (otr.get("lots", 1) * otr.get("lotSize", 1)))
+                        calc_unrl = round((lp_val - float(otr["entry"])) * t_qty * t_dir, 2)
+                        otr["pnl"] = calc_unrl
+                        otr["unrealized_pnl"] = calc_unrl
+                        otr["net_pnl"] = round(calc_unrl - float(otr.get("charges") or 0), 2)
+                        otr["pnl_source"] = "broker_ltp"
+                elif urmtom_raw is not None and urmtom_raw != "" and len(open_trs) == 1:
+                    ur_val = round(float(urmtom_raw), 2)
+                    otr = open_trs[0]
+                    otr["pnl"] = ur_val
+                    otr["unrealized_pnl"] = ur_val
+                    otr["net_pnl"] = round(ur_val - float(otr.get("charges") or 0), 2)
+                    otr["pnl_source"] = "broker_urmtom"
 
-        if sym_trades_today:
-            if is_pos_closed:
-                # If broker position is closed, any historical trades did not exit today
-                for t in sym_trades_today:
-                    if t.get("date") != today_str:
-                        t["exitDate"] = t["date"]
-                        t["open"] = False
-
-                target_list = sym_trades_entered_today if sym_trades_entered_today else sym_trades_today
-                for t in target_list:
-                    t["open"] = False
-                    t["exitDate"] = today_str
-            else:
-                # Position has net open quantity
-                open_trs = [t for t in sym_trades_today if t.get("open")]
-                if open_trs:
-                    open_tr = open_trs[-1]
-                    open_tr["pnl"] = round(urmtom, 2)
-                    t_qty = open_tr.get("qty") or (open_tr.get("lots", 1) * open_tr.get("lotSize", 1))
-                    if t_qty > 0:
-                        t_dir = -1 if open_tr.get("side") == "SELL" else 1
-                        open_tr["exit"] = round(open_tr["entry"] + (open_tr["pnl"] / t_qty) * t_dir, 2)
-        elif day_buy_q > 0 or day_sell_q > 0 or rpnl != 0 or net_qty != 0 or urmtom != 0 or m2m != 0:
-            # Position active today but not in fill book (e.g. carried forward or bulk fill)
-            # Skip creating dummy closed trades from residual overnight position books before market open
-            if is_pos_closed and (now.hour < 9 or (now.hour == 9 and now.minute < 15)):
-                continue
-
-            parsed = engine.parse_instrument(tsym)
-            qty = max(day_buy_q, day_sell_q, abs(net_qty))
-            if qty <= 0:
-                qty = float(parsed.get("lotSize") or 1)
-            ls = int(p.get("ls") or parsed.get("lotSize") or 1) or 1
-            lots = round(qty / ls, 2)
-            is_open = (net_qty != 0)
-
-            is_buy = (net_pos_pnl >= 0) if (day_buy_q == 0 and day_sell_q == 0) else ((day_buy_q >= day_sell_q) if day_buy_q != day_sell_q else (net_qty >= 0))
-            side_str = "BUY" if is_buy else "SELL"
-            t_dir = 1 if is_buy else -1
-
-            base_px = float(p.get("openprc") or p.get("netavgprc") or lp or 100.0)
-            if base_px <= 0:
-                base_px = 100.0
-
-            entry_px = round(base_px, 2)
-            exit_px = round(entry_px + (net_pos_pnl / qty) * t_dir, 2)
-            trader_id = acc.get("trader") or acc.get("zebu_uid") or acc["id"]
-
-            built.append({
-                "id": f"Z-POS-{acc['id']}-{tsym}",
-                "origin": "zebu",
-                "date": today_str,
-                "time": "09:15",
-                "trader": trader_id,
-                "account": acc["id"],
-                "symbol": parsed.get("underlying") or tsym,
-                "strike": parsed.get("strike") or 0,
-                "opt": parsed.get("opt") or "",
-                "expiry": parsed.get("expiry").isoformat() if parsed.get("expiry") else "",
-                "expiryType": parsed.get("expiryType", ""),
-                "tsym": tsym,
-                "exch": p.get("exch", "NFO"),
-                "side": side_str,
-                "lots": lots,
-                "lotSize": ls,
-                "qty": qty,
-                "entry": entry_px,
-                "exit": exit_px,
-                "pnl": round(net_pos_pnl, 2),
-                "open": is_open,
-                "exitDate": today_str,
-                "exitTime": "OPEN" if is_open else "15:30",
-                "spot": None,
-                "product": p.get("prd", "MIS"),
-                "source": "Manual",
-                "charges": round(20 * (int(day_buy_q > 0) + int(day_sell_q > 0)), 2),
-                "chargesEstimated": True,
-                "hedged": False,
-            })
-
+    # Resolve spot price at entry
     for t in built:
+        if t["id"] in finalized_ids:
+            continue
         prev = old_trades.get(t["id"])
         if prev and prev.get("spot"):
             t["spot"] = prev["spot"]
@@ -382,20 +451,54 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
             t["spot"] = await spot_at_async(t["symbol"], ts_val)
         t.pop("_ts", None)
 
+    # Delete only non-finalized trades from the current rebuild window that are no longer present in `built`
+    built_ids = {t["id"] for t in built}
     for tid, t in old_trades.items():
-        if t["date"] >= cutoff or (t.get("exitDate") and t.get("exitDate") >= cutoff):
-            await DB._delete_trade(tid)
+        if tid in finalized_ids:
+            continue
+        if tid not in built_ids:
+            if t.get("date", "") >= cutoff or t.get("open") or (t.get("exitDate") and t.get("exitDate") >= cutoff):
+                await DB._delete_trade(tid)
 
-    await DB._put_many_trades([(t["id"], t) for t in built])
+    # Upsert only non-finalized trades
+    to_save = [(t["id"], t) for t in built if t["id"] not in finalized_ids]
+    if to_save:
+        await DB._put_many_trades(to_save, allow_overwrite_finalized=False)
+
+    # Update sync state & session timestamps (Req 1.9, 1.10, 1.11)
+    today_fills_cnt = sum(1 for _, f in fill_items if f.get("_day") == today_str)
+    today_trades_cnt = sum(1 for t in built if t.get("date") == today_str or t.get("exitDate") == today_str or t.get("open"))
+    await DB.put_sync_state_async(aid, {
+        "status": "LIVE",
+        "is_stale": False,
+        "last_sync_success": now_utc,
+        "last_error": None,
+        "consecutive_failures": 0,
+        "circuit_open": False,
+        "total_fills_today": today_fills_cnt,
+        "total_trades_today": today_trades_cnt,
+    })
+    await DB.put_token_async(aid, {
+        "status": "Linked",
+        "last_sync_at": now_utc,
+        "sync_message": f"ok · {today_fills_cnt} fills today · {len(built)} trades active/rebuilt",
+    })
+
+    # Continuous rule evaluation & persistent violation logging for this account (Req 7.5, 7.6)
+    await evaluate_and_record_violations_async(now, account_id=aid)
 
     # Broadcast updates to dashboard websockets
-    asyncio.create_task(WS_HUB.broadcast({"type": "trades_updated", "account": acc["id"]}))
+    asyncio.create_task(WS_HUB.broadcast({
+        "type": "trades_updated",
+        "account": aid,
+        "last_sync_at": now.isoformat(timespec="seconds"),
+    }))
 
-    return f"ok · {len(fills)} fills today · {len(built)} trades rebuilt"
+    return f"ok · {today_fills_cnt} fills today · {len(built)} trades rebuilt"
 
 
 async def poll_all_async(reason: str = "schedule") -> dict:
-    """Executes asynchronous concurrent polling across all accounts using ConnectionManager."""
+    """Executes asynchronous concurrent polling across all connected accounts using ConnectionManager."""
     now = now_ist()
     accounts = await DB.get_all_accounts_async()
     results = {}
@@ -420,53 +523,402 @@ async def poll_all_async(reason: str = "schedule") -> dict:
                 log.error(f"Error during parallel poll: {item}")
 
     await DB._put_status("poll", {"last": now.isoformat(timespec="seconds"), "reason": reason, "results": results})
-    await send_flag_alerts_async(now)
+    await evaluate_and_record_violations_async(now)
     await notify_expired_async(now, results)
     return results
 
 
-async def all_flags_async():
-    rules_list = await DB._all_rules()
-    rules = {x["trader"]: x["rules"] for x in rules_list}
+# ---------------- End-of-Day Finalization & Midnight Archiving ----------------
+
+async def finalize_eod_async(now: Optional[datetime] = None, target_date: Optional[str] = None) -> Dict[str, Any]:
+    """Performs End-of-Day (after 03:30 PM IST) final synchronization, reconciliation, and permanent finalization.
+
+    Idempotent: running multiple times never creates duplicate trades or duplicate P&L records,
+    and never overwrites already finalized historical records.
+    """
+    now = now or now_ist()
+    day_str = target_date or now.date().isoformat()
+    now_utc = datetime.now(timezone.utc)
+    accounts = await DB.get_all_accounts_async()
+    finalized_count = 0
+    pending_count = 0
+    account_reports = {}
+
+    for acc in accounts:
+        aid = acc["id"]
+        tid = acc.get("trader") or aid
+        rep_id = f"{aid}|{day_str}"
+
+        # Check if already finalized
+        existing_reps = await DB.get_daily_reports_async(account_id=aid)
+        existing_for_day = next((r for r in existing_reps if r["account"] == aid and r["date"] == day_str), None)
+        if existing_for_day and existing_for_day.get("status") in ("FINALIZED", "ARCHIVED"):
+            account_reports[aid] = existing_for_day["status"]
+            finalized_count += 1
+            continue
+
+        # 1. Perform final synchronization if account is a linked Zebu account and target_date is today
+        sync_ok = True
+        sync_note = "verified_from_database"
+        tok = await token_for_account_async(aid)
+        if acc.get("broker", "Zebu") == "Zebu" and acc.get("zebu_uid") and tok and day_str == now.date().isoformat():
+            try:
+                sync_res = await poll_account_async(acc, now)
+                sync_note = f"zebu_eod_sync: {sync_res}"
+            except Exception as e:
+                sync_ok = False
+                sync_note = f"EOD broker sync failed: {e}"
+                log.warning(f"EOD finalization sync failed for {aid} on {day_str}: {e}")
+
+        # 2. Check for incomplete or pending orders if syncing today
+        orders = await DB.get_orders_async(account_id=aid)
+        day_orders = [o for o in orders if (o.get("order_time") or "").startswith(day_str)]
+        pending_orders = [o for o in day_orders if o.get("status") in ("OPEN", "TRIGGER PENDING", "PENDING")]
+
+        if not sync_ok:
+            # Req 2.9: If final broker data is unavailable, do not finalize incomplete information as accurate.
+            # Mark report as PENDING_RECONCILIATION and retry safely.
+            await DB.put_daily_report_async(rep_id, {
+                "account": aid,
+                "trader": tid,
+                "date": day_str,
+                "status": "PENDING_RECONCILIATION",
+                "source_info": "zebu_eod_reconciliation",
+                "reconciliation_notes": sync_note,
+            })
+            pending_count += 1
+            account_reports[aid] = "PENDING_RECONCILIATION"
+            continue
+
+        # 3. Reconcile all trades for this account and trading date
+        all_trades = await DB._all_trades()
+        acc_trades = [t for t in all_trades if t.get("account") == aid]
+
+        # Closed trades whose exitDate is day_str (or date == day_str if exitDate missing)
+        closed_today = [
+            t for t in acc_trades
+            if not t.get("open") and ((t.get("exitDate") or t.get("date")) == day_str)
+        ]
+        # Open positions still open at EOD that were entered on or before day_str
+        open_eod = [
+            t for t in acc_trades
+            if t.get("open") and (t.get("date") or "") <= day_str
+        ]
+        # Identify partially closed trades (closed legs that share parent_trade_id with an open leg or multiple exit legs)
+        open_parents = {t.get("parent_trade_id") or t["id"] for t in open_eod}
+        partial_closed = [t for t in closed_today if (t.get("parent_trade_id") in open_parents) or ("-X-" in t["id"])]
+
+        # 4. Lock all closed trades for day_str as finalized (Req 2.6, 2.7)
+        realized_dec = Decimal("0")
+        charges_dec = Decimal("0")
+        net_dec = Decimal("0")
+        wins = 0
+        losses = 0
+        finalized_trade_details = []
+
+        for ct in closed_today:
+            g_val = engine._dec(engine.gross_pnl(ct), Decimal("0"))
+            c_val = engine._dec(ct.get("charges"), Decimal("0"))
+            n_val = engine._q2(g_val - c_val)
+            realized_dec += g_val
+            charges_dec += c_val
+            net_dec += n_val
+            if g_val > Decimal("0"):
+                wins += 1
+            else:
+                losses += 1
+
+            ct["realized_pnl"] = float(engine._q2(g_val))
+            ct["pnl"] = float(engine._q2(g_val))
+            ct["net_pnl"] = float(n_val)
+            ct["is_finalized"] = True
+            ct["finalized_at"] = now_utc
+            await DB._put_trade(ct["id"], ct, allow_overwrite_finalized=True)
+
+            finalized_trade_details.append({
+                "id": ct["id"],
+                "parent_trade_id": ct.get("parent_trade_id") or ct["id"],
+                "account": aid,
+                "trader": tid,
+                "date": ct.get("date"),
+                "time": ct.get("time"),
+                "exitDate": ct.get("exitDate") or ct.get("date"),
+                "exitTime": ct.get("exitTime"),
+                "symbol": ct.get("symbol"),
+                "tsym": ct.get("tsym"),
+                "strike": ct.get("strike"),
+                "opt": ct.get("opt"),
+                "side": ct.get("side"),
+                "lots": ct.get("lots"),
+                "lotSize": ct.get("lotSize"),
+                "qty": ct.get("qty"),
+                "entry": ct.get("entry"),
+                "exit": ct.get("exit"),
+                "realized_pnl": float(engine._q2(g_val)),
+                "charges": float(engine._q2(c_val)),
+                "net_pnl": float(n_val),
+                "product": ct.get("product"),
+                "source": ct.get("source"),
+            })
+
+        unrealized_dec = sum(
+            (engine._dec(t.get("pnl"), Decimal("0")) for t in open_eod if t.get("pnl") is not None),
+            Decimal("0"),
+        )
+
+        notes = sync_note
+        if pending_orders:
+            notes += f" | {len(pending_orders)} pending orders noted at close"
+
+        await DB.put_daily_report_async(
+            rep_id,
+            {
+                "account": aid,
+                "trader": tid,
+                "date": day_str,
+                "status": "FINALIZED",
+                "realized_pnl": float(engine._q2(realized_dec)),
+                "unrealized_pnl": float(engine._q2(unrealized_dec)),
+                "charges": float(engine._q2(charges_dec)),
+                "net_pnl": float(engine._q2(net_dec)),
+                "total_trades": len(closed_today) + len(open_eod),
+                "closed_trades": len(closed_today),
+                "open_trades": len(open_eod),
+                "partially_closed_trades": len(partial_closed),
+                "winning_trades": wins,
+                "losing_trades": losses,
+                "finalized_at": now_utc,
+                "source_info": "zebu_eod_reconciliation",
+                "reconciliation_notes": notes,
+                "trade_details": finalized_trade_details,
+            },
+            allow_overwrite_finalized=False,
+        )
+        finalized_count += 1
+        account_reports[aid] = "FINALIZED"
+
+    log.info(f"EOD Finalization complete for {day_str}: {finalized_count} finalized, {pending_count} pending reconciliation")
+    return {
+        "date": day_str,
+        "finalized_accounts": finalized_count,
+        "pending_accounts": pending_count,
+        "accounts": account_reports,
+    }
+
+
+async def midnight_archive_async(now: Optional[datetime] = None) -> Dict[str, Any]:
+    """At/after 12:00 AM IST:
+    1. Identifies all closed trades belonging to previous trading days (< today_str).
+    2. Finalizes any past trading day that missed EOD finalization (e.g. server slept/restarted).
+    3. Marks previous days' closed trades as archived (`is_archived = True`) so they are removed from the active Today Trader Report while permanently preserved in the database and Daily P&L Calendar.
+    4. Keeps overnight open positions (`is_open == True`) active and unarchived for the new trading day.
+    """
+    now = now or now_ist()
+    today_str = now.date().isoformat()
+    now_utc = datetime.now(timezone.utc)
+
+    all_trades = await DB._all_trades()
+    past_dates = sorted({
+        (t.get("exitDate") or t.get("date"))
+        for t in all_trades
+        if not t.get("open") and (t.get("exitDate") or t.get("date")) and (t.get("exitDate") or t.get("date")) < today_str
+    })
+
+    # Ensure every past trading date has a finalized daily report before archiving
+    for d_str in past_dates:
+        await finalize_eod_async(now=now, target_date=d_str)
+
+    archived_trades_count = 0
+    active_overnight_count = 0
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(Trade)
+        rows = (await session.execute(stmt)).scalars().all()
+        for tr in rows:
+            if tr.is_open:
+                active_overnight_count += 1
+                continue
+            ex_d = tr.exit_date or tr.trade_date
+            if ex_d and ex_d < today_str:
+                if not getattr(tr, "is_finalized", False):
+                    tr.is_finalized = True
+                    tr.finalized_at = now_utc
+                if not getattr(tr, "is_archived", False):
+                    tr.is_archived = True
+                    tr.archived_at = now_utc
+                    archived_trades_count += 1
+
+        # Transition finalized DailyAccountReport rows for dates < today_str to ARCHIVED
+        rep_stmt = select(DailyAccountReport).where(
+            DailyAccountReport.trade_date < today_str,
+            DailyAccountReport.status == "FINALIZED",
+        )
+        rep_rows = (await session.execute(rep_stmt)).scalars().all()
+        for rep in rep_rows:
+            rep.status = "ARCHIVED"
+            rep.archived_at = now_utc
+
+        await session.commit()
+
+    # Update historical rule violations from past days to HISTORICAL status
+    async with AsyncSessionLocal() as session:
+        alt_stmt = select(Alert).where(
+            Alert.trade_date.isnot(None),
+            Alert.trade_date < today_str,
+            Alert.violation_status == "ACTIVE",
+        )
+        alt_rows = (await session.execute(alt_stmt)).scalars().all()
+        for alt in alt_rows:
+            alt.violation_status = "HISTORICAL"
+        await session.commit()
+
+    log.info(
+        f"Midnight archiving completed for dates < {today_str}: "
+        f"{archived_trades_count} closed trades archived, {active_overnight_count} overnight open positions retained active."
+    )
+    return {
+        "today": today_str,
+        "archived_trades": archived_trades_count,
+        "active_overnight_positions": active_overnight_count,
+        "processed_dates": past_dates,
+    }
+
+
+async def reconcile_daily_calendar_async(account_id: Optional[str] = None) -> Dict[str, Any]:
+    """Audits and verifies that DailyAccountReport totals match underlying finalized closed trades (Req 6.10, 6.14)."""
+    all_trades = await DB._all_trades()
+    reports = await DB.get_daily_reports_async(account_id=account_id)
+    mismatches = []
+    verified_days = 0
+
+    for rep in reports:
+        if rep["status"] not in ("FINALIZED", "ARCHIVED"):
+            continue
+        aid = rep["account"]
+        d_str = rep["date"]
+        day_closed = [
+            t for t in all_trades
+            if t.get("account") == aid and not t.get("open") and (t.get("exitDate") or t.get("date")) == d_str
+        ]
+        calc_realized = float(engine._q2(sum((engine._dec(engine.gross_pnl(t)) for t in day_closed), Decimal("0"))))
+        calc_charges = float(engine._q2(sum((engine._dec(t.get("charges")) for t in day_closed), Decimal("0"))))
+        calc_net = float(engine._q2(Decimal(str(calc_realized)) - Decimal(str(calc_charges))))
+
+        if abs(calc_realized - rep["realized_pnl"]) > 0.01 or abs(calc_net - rep["net_pnl"]) > 0.01 or len(day_closed) != rep["closed_trades"]:
+            mismatches.append({
+                "account": aid,
+                "date": d_str,
+                "report_realized_pnl": rep["realized_pnl"],
+                "trades_realized_pnl": calc_realized,
+                "report_net_pnl": rep["net_pnl"],
+                "trades_net_pnl": calc_net,
+                "report_closed_trades": rep["closed_trades"],
+                "actual_closed_trades": len(day_closed),
+            })
+        else:
+            verified_days += 1
+
+    return {
+        "ok": len(mismatches) == 0,
+        "verified_days": verified_days,
+        "mismatches": mismatches,
+    }
+
+
+# ---------------- Rule Evaluation & Alerting ----------------
+
+async def all_flags_async() -> Dict[str, List[dict]]:
+    rules_map = await get_rules_map_async()
     trades = await DB._all_trades()
-    return engine.check_trades(trades, rules)
+    today_str = now_ist().date().isoformat()
+    return engine.check_trades(trades, rules_map, today_str=today_str)
 
 
-async def send_flag_alerts_async(now: datetime):
+async def get_rules_map_async() -> Dict[str, dict]:
+    all_rules = await DB._all_rules()
+    res = {r["trader"]: {**engine.DEFAULT_RULES, **r["rules"]} for r in all_rules}
+    for r in all_rules:
+        if r.get("account") and r["account"] not in res:
+            res[r["account"]] = {**engine.DEFAULT_RULES, **r["rules"]}
+    accounts = await DB.get_all_accounts_async()
+    for acc in accounts:
+        aid = acc["id"]
+        uid = acc.get("zebu_uid")
+        tid = acc.get("trader")
+        # If an account has no specific rule row yet, inherit from its assigned trader or DEFAULT_RULES
+        base_r = res.get(aid) or (res.get(uid) if uid else None) or (res.get(tid) if tid else None) or engine.DEFAULT_RULES
+        if aid not in res:
+            res[aid] = {**engine.DEFAULT_RULES, **base_r}
+        if uid and uid not in res:
+            res[uid] = {**engine.DEFAULT_RULES, **base_r}
+    return res
+
+
+async def evaluate_and_record_violations_async(now: datetime, account_id: Optional[str] = None):
+    """Evaluates rules across active/historical trades, persists structured Red Flags in DB, and dispatches alerts."""
     t0 = time.perf_counter()
+    today = now.date().isoformat()
     s = (await DB._get_setting("main")) or {}
     alerts_cfg = s.get("alerts") or DEFAULT_SETTINGS["alerts"]
-    if not alerts_cfg.get("onHigh"):
-        return
-    today = now.date().isoformat()
-    all_trades = await DB._all_trades()
-    trades = {t["id"]: t for t in all_trades}
-    all_traders = await DB._all_traders()
-    traders = {t["id"]: t for t in all_traders}
 
-    flags_dict = await all_flags_async()
+    all_trades = await DB._all_trades()
+    if account_id:
+        all_trades = [t for t in all_trades if t.get("account") == account_id or t.get("trader") == account_id]
+    trades_by_id = {t["id"]: t for t in all_trades}
+
+    all_traders = await DB._all_traders()
+    traders_by_id = {t["id"]: t for t in all_traders}
+    rules_map = await get_rules_map_async()
+
+    flags_dict = engine.check_trades(all_trades, rules_map, today_str=today)
+
     for tid, fl in flags_dict.items():
-        t = trades.get(tid)
-        if not t or t["date"] != today:
+        t = trades_by_id.get(tid)
+        if not t:
             continue
         for f in fl:
-            if f["level"] != "High":
-                continue
-            key = f"{tid}|{f['rule']}"
-            if await DB._get_sent_flag(key):
-                continue
-            name = traders.get(t["trader"], {}).get("name", t["trader"])
-            text_msg = (
-                f"🚩 Red flag · {name} · {t['time']}\nRule: {f['rule']}\nWhat he did: {f['did']}\n"
-                f"{t['symbol']} {t['strike']:g} {t['opt']} · {t['lots']:g} lots · {t['account']}"
-            )
-            await ALERT.send_async(
-                text=text_msg,
-                settings_alerts=alerts_cfg,
-                dedup_key=key,
-                severity="High",
-                metadata={"account_id": t["account"], "trader_id": t["trader"], "trade_id": tid, "rule_name": f["rule"]},
-            )
+            dedup_key = f"VIOL|{t.get('account')}|{tid}|{f['rule']}"
+            v_status = f.get("status") or ("HISTORICAL" if t["date"] < today and not t.get("open") else "ACTIVE")
+            name = traders_by_id.get(t.get("trader"), {}).get("name") or t.get("account") or t.get("trader")
+            explanation = f"{f['did']} (Rule condition: {f.get('condition', f['rule'])})"
+
+            await DB.upsert_rule_violation_async(dedup_key, {
+                "account_id": t.get("account"),
+                "trader_id": t.get("trader"),
+                "trade_id": tid,
+                "order_id": t.get("entry_order_id"),
+                "trade_date": t.get("date"),
+                "trade_time": t.get("time"),
+                "rule_name": f["rule"],
+                "configured_condition": f.get("condition", f["rule"]),
+                "observed_value": f.get("observed", f["did"]),
+                "explanation": f["did"],
+                "violation_status": v_status,
+                "severity": f["level"],
+                "title": f"🚩 {f['rule']} · {name}",
+                "message": explanation,
+            })
+
+            # External notification (Telegram/WhatsApp/Email) for today's High severity flags
+            if alerts_cfg.get("onHigh") and t["date"] == today and f["level"] == "High":
+                sent_key = f"{tid}|{f['rule']}"
+                if not await DB._get_sent_flag(sent_key):
+                    text_msg = (
+                        f"🚩 Red flag · {name} · {t['time']}\nRule: {f['rule']}\nWhat he did: {f['did']}\n"
+                        f"{t['symbol']} {t.get('strike') or 0:g} {t.get('opt') or ''} · {t['lots']:g} lots · {t['account']}"
+                    )
+                    await ALERT.send_async(
+                        text=text_msg,
+                        settings_alerts=alerts_cfg,
+                        dedup_key=sent_key,
+                        severity="High",
+                        metadata={
+                            "account_id": t["account"],
+                            "trader_id": t["trader"],
+                            "trade_id": tid,
+                            "rule_name": f["rule"],
+                        },
+                    )
 
     METRICS.record_risk_latency((time.perf_counter() - t0) * 1000)
 
@@ -495,20 +947,20 @@ async def daily_summary_async(now: datetime):
     flags = await all_flags_async()
     lines = [f"📊 Daily summary · {today}"]
     all_trades = await DB._all_trades()
-    trades = [t for t in all_trades if t["date"] == today]
+    trades = [t for t in all_trades if (t.get("exitDate") or t.get("date")) == today and not t.get("open")]
 
     all_traders = await DB._all_traders()
     for tr in all_traders:
-        mine = [t for t in trades if t["trader"] == tr["id"]]
+        mine = [t for t in trades if t.get("trader") == tr["id"] or t.get("account") == tr["id"]]
         if not mine:
             continue
         pnl = sum(engine.net_pnl(t) for t in mine)
         nf = sum(len(flags.get(t["id"], [])) for t in mine)
         clean = sum(1 for t in mine if not flags.get(t["id"]))
-        lines.append(f"{tr['name']}: {len(mine)} trades · P&L ₹{pnl:,.0f} · {nf} flags · rule-follow {clean / len(mine) * 100:.0f}%")
+        lines.append(f"{tr['name']}: {len(mine)} trades · Net P&L ₹{pnl:,.2f} · {nf} flags · rule-follow {clean / len(mine) * 100:.0f}%")
 
     total = sum(engine.net_pnl(t) for t in trades)
-    lines.append(f"Total: ₹{total:,.0f} · {len(trades)} trades")
+    lines.append(f"Total: ₹{total:,.2f} · {len(trades)} trades")
     await ALERT.send_async("\n".join(lines), alerts_cfg, severity="Medium")
 
 
@@ -524,13 +976,15 @@ SCHEDULER = MarketScheduler(
     poll_fn=lambda: poll_all_async("schedule"),
     summary_fn=daily_summary_async,
     get_settings_fn=get_settings_dict,
+    finalize_eod_fn=finalize_eod_async,
+    midnight_archive_fn=midnight_archive_async,
 )
 
 
 # ---------------- Lifespan & App Setup ----------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Initialize DB tables
+    # 1. Initialize DB tables and schema migrations
     await init_models()
 
     # 2. Ensure initial admin exists
@@ -543,20 +997,14 @@ async def lifespan(app: FastAPI):
     if not settings_existing:
         await DB._put_setting("main", DEFAULT_SETTINGS)
 
-    # 2b. Auto-sync accounts to traders table and ensure sessions & rules exist
+    # 3. Ensure every configured account has a corresponding trader profile and rule book entry (zero hardcoded trade tampering)
     try:
         all_acc = await DB.get_all_accounts_async()
         existing_traders = {t["id"]: t for t in (await DB._all_traders())}
         for acc in all_acc:
             aid = acc["id"]
             uid = acc.get("zebu_uid")
-            if uid and uid == "47000S19":
-                tok_ac01 = await DB.get_token_async("AC-01")
-                tok_19 = await DB.get_token_async("47000S19")
-                if tok_ac01 and not tok_19:
-                    await DB.put_token_async("47000S19", tok_ac01)
-
-            for target_id in filter(None, [aid, uid]):
+            for target_id in filter(None, [aid, uid, acc.get("trader")]):
                 if target_id not in existing_traders:
                     name = acc.get("name") or target_id
                     if uid and uid not in name and uid != target_id:
@@ -564,79 +1012,36 @@ async def lifespan(app: FastAPI):
                     t_doc = {
                         "id": target_id,
                         "name": name,
-                        "ra": "Arshiyan",
+                        "ra": acc.get("trader") or "",
                         "style": "Manual",
                         "holding": "Intraday",
                         "segment": "Nifty options",
-                        "testCapital": 300000.0,
+                        "testCapital": 0.0,
                         "status": "Live" if (await link_state(acc)) == "Linked" else "Testing",
-                        "start": "2026-11-14",
+                        "start": now_ist().date().isoformat(),
                     }
                     await DB._put_trader(target_id, t_doc)
                     existing_traders[target_id] = t_doc
 
                 if not await DB._get_rule(target_id):
-                    await DB._put_rule(target_id, {"trader": target_id, "rules": engine.DEFAULT_RULES})
+                    await DB._put_rule(target_id, {"trader": target_id, "account": aid, "rules": engine.DEFAULT_RULES})
 
+        # Remove any legacy synthetic Z-POS dummy rows if present
         async with AsyncSessionLocal() as session:
-            bs_stmt = select(BrokerSession)
-            all_sessions = (await session.execute(bs_stmt)).scalars().all()
-            for bs_item in all_sessions:
-                if bs_item.access_token_enc and bs_item.status != "Linked":
-                    bs_item.status = "Linked"
-
-            stmt = select(Trade)
-            trades_res = (await session.execute(stmt)).scalars().all()
-            today_str = now_ist().date().isoformat()
-
-            # 1. Remove duplicate dummy Z-POS trades
-            for tr in trades_res:
-                if tr.id and tr.id.startswith("Z-POS-"):
-                    await session.delete(tr)
-
-            for tr in trades_res:
-                if tr.id and tr.id.startswith("Z-POS-"):
-                    continue
-                if tr.account_id:
-                    if tr.account_id in ("AC-01", "47000S19"):
-                        tr.trader_id = "47000S19"
-                    else:
-                        tr.trader_id = tr.account_id
-
-                # Clean up any trade from a previous day that was incorrectly given exit_date of today or later
-                if tr.trade_date and tr.trade_date < today_str and tr.exit_date == today_str:
-                    tr.exit_date = tr.trade_date
-
-                if tr.trade_date and tr.trade_date < "2026-11-18" and tr.exit_date and tr.exit_date >= "2026-11-18":
-                    tr.exit_date = tr.trade_date
-                    tr.is_open = False
-
-                if tr.id == "Z-AC-01-26111700039219":
-                    tr.is_open = False
-                    tr.exit_date = "2026-11-17"
-
-            # 2. Reconcile 2026-11-18 trades strictly to 18-Nov session
-            t_18 = [tr for tr in trades_res if not (tr.id and tr.id.startswith("Z-POS-")) and (tr.account_id in ("AC-01", "47000S19") or tr.trader_id == "47000S19") and (tr.trade_date == "2026-11-18" or tr.exit_date == "2026-11-18")]
-            for tr in t_18:
-                tr.trade_date = "2026-11-18"
-                if tr.symbol == "NIFTY":
-                    tr.exit_date = "2026-11-18"
-                    tr.is_open = False
-                    if tr.id == "Z-AC-01-26111800058675":
-                        tr.pnl = 28625.99
-                        tr.exit_price = 186.38
-                elif tr.id in ("Z-AC-01-26111800059526", "Z-AC-01-26111800059472", "Z-AC-01-26111800059274"):
-                    tr.is_open = True
-                    tr.exit_date = None
-
+            stmt = select(Trade).where(Trade.id.like("Z-POS-%"))
+            dummy_rows = (await session.execute(stmt)).scalars().all()
+            for dr in dummy_rows:
+                await session.delete(dr)
             await session.commit()
-    except Exception as e:
-        log.error(f"Account auto-sync notice in lifespan: {e}")
 
-    # 3. Start Connection Manager & Scheduler if configured for in-process execution
+        # Run startup recovery for midnight archiving and past unfinalized trading days (Req 3.8, 3.9, 9.6)
+        await midnight_archive_async(now_ist())
+    except Exception as e:
+        log.error(f"Startup recovery notice in lifespan: {e}")
+
+    # 4. Start Connection Manager & Scheduler if configured for in-process execution
     if CFG.RUN_WORKER_IN_PROCESS:
         await CONN_MGR.start()
-        # 4. Attach real-time streams for accounts with valid tokens
         all_accounts = await DB.get_all_accounts_async()
         for acc in all_accounts:
             tok = await token_for_account_async(acc["id"])
@@ -648,7 +1053,6 @@ async def lifespan(app: FastAPI):
                     token=tok,
                     on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
                 )
-        # 5. Immediate background sync on startup so today's session is populated
         asyncio.create_task(poll_all_async("startup"))
 
     if CFG.RUN_SCHEDULER_IN_PROCESS and not CFG.DISABLE_SCHEDULER:
@@ -697,7 +1101,6 @@ _login_rate_limits: Dict[str, List[float]] = {}
 def check_login_rate_limit(client_ip: str):
     now = time.time()
     attempts = _login_rate_limits.setdefault(client_ip, [])
-    # Keep attempts from last 60 seconds
     _login_rate_limits[client_ip] = [t for t in attempts if t > now - 60]
     if len(_login_rate_limits[client_ip]) >= CFG.RATE_LIMIT_LOGIN_PER_MINUTE:
         raise HTTPException(429, "Too many login attempts. Please try again in 1 minute.")
@@ -721,19 +1124,15 @@ def admin_only(user=Depends(current_user)):
 
 
 async def link_state(acc: dict) -> str:
+    """Returns true connection status without masking expired or disconnected sessions (Req 8.6, 8.7, 8.8)."""
     t = await DB.get_token_async(acc["id"])
     if not t or not t.get("access_token"):
-        if acc.get("zebu_uid"):
-            async with AsyncSessionLocal() as session:
-                match_stmt = (
-                    select(BrokerSession)
-                    .join(Account, Account.id == BrokerSession.account_id)
-                    .where((Account.zebu_uid == acc["zebu_uid"]) | (BrokerSession.account_id == acc["zebu_uid"]), BrokerSession.access_token_enc.isnot(None))
-                )
-                matched_bs = (await session.execute(match_stmt)).scalars().first()
-                if matched_bs and matched_bs.access_token_enc:
-                    return "Linked"
         return "Not linked"
+    st = t.get("status") or "Linked"
+    if st in ("Login expired", "REAUTH_REQUIRED", "Not linked", "Disconnected"):
+        return st
+    if t.get("expires_at") and float(t["expires_at"]) < time.time():
+        return "Login expired"
     return "Linked"
 
 
@@ -767,7 +1166,6 @@ async def websocket_endpoint(websocket: WebSocket):
     await WS_HUB.connect(websocket)
     try:
         while True:
-            # Keepalive / listen for ping
             data = await websocket.receive_text()
             if data == "ping":
                 await websocket.send_text("pong")
@@ -778,47 +1176,36 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/api/test-proxy")
 async def test_proxy(proxy: str = ""):
     import socket
-    p = proxy or "http://u084BWjx_2:HctOYpF0z5@79.127.168.43:50100"
+    p = proxy
     t0 = time.time()
-    
     tcp_results = {}
-    for port in (50100, 50101):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(3.0)
-            s.connect(("79.127.168.43", port))
-            s.close()
-            tcp_results[str(port)] = "OPEN"
-        except Exception as e:
-            tcp_results[str(port)] = f"{type(e).__name__}: {e}"
-
     http_res = None
-    try:
-        async with httpx.AsyncClient(proxy=p, timeout=12.0) as cl:
-            r = await cl.get("https://api.ipify.org?format=json")
-            http_res = {"ok": True, "ip": r.json().get("ip")}
-    except Exception as e:
-        http_res = {"ok": False, "error": str(e), "type": type(e).__name__}
+    if p:
+        try:
+            async with httpx.AsyncClient(proxy=p, timeout=12.0) as cl:
+                r = await cl.get("https://api.ipify.org?format=json")
+                http_res = {"ok": True, "ip": r.json().get("ip")}
+        except Exception as e:
+            http_res = {"ok": False, "error": str(e), "type": type(e).__name__}
 
     sec_preview = (CFG.ZEBU_SECRET_KEY[:4] + "..." + CFG.ZEBU_SECRET_KEY[-4:]) if len(CFG.ZEBU_SECRET_KEY) >= 8 else "NOT_SET"
     cid_cfg = CFG.ZEBU_CLIENT_ID or "NOT_SET"
 
     return {
-        "server_outbound_ip": "74.220.48.71",
         "tcp": tcp_results,
         "http_client": http_res,
         "server_cfg": {"client_id": cid_cfg, "secret_key": sec_preview},
-        "duration": round(time.time() - t0, 2)
+        "duration": round(time.time() - t0, 2),
     }
 
 
 @app.get("/api/account-pnl/{aid}")
-async def get_raw_account_pnl(aid: str, target_pnl: Optional[float] = None):
+async def get_raw_account_pnl(aid: str, _=Depends(current_user)):
     acc = await DB.get_account_async(aid)
     if not acc:
         all_acc = await DB.get_all_accounts_async()
         for a in all_acc:
-            if a.get("zebu_uid") == aid:
+            if a.get("zebu_uid") == aid or a.get("trader") == aid:
                 acc = a
                 break
     if not acc:
@@ -829,8 +1216,9 @@ async def get_raw_account_pnl(aid: str, target_pnl: Optional[float] = None):
     actid = acc.get("zebu_actid") or uid
     proxy_url = acc.get("proxy_url")
 
-    token_info = {"present": bool(tok), "uid": uid, "actid": actid}
+    token_info = {"present": bool(tok), "uid": uid, "actid": actid, "link": await link_state(acc)}
     zebu_data = {}
+    poll_result = None
     if tok and uid:
         try:
             positions = await ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url)
@@ -848,37 +1236,28 @@ async def get_raw_account_pnl(aid: str, target_pnl: Optional[float] = None):
                 "positions_count": len(positions),
                 "positions": positions,
             }
-        except Exception as e:
-            zebu_data = {"ok": False, "error": str(e), "error_type": type(e).__name__}
-
-    # Also poll to rebuild if valid
-    poll_result = None
-    if tok and uid:
-        try:
             poll_result = await poll_account_async(acc, now_ist())
         except Exception as e:
+            zebu_data = {"ok": False, "error": str(e), "error_type": type(e).__name__}
             poll_result = f"error: {e}"
 
     today_str = now_ist().date().isoformat()
-    trades = await DB._all_trades()
-    acc_trades = [t for t in trades if t.get("account") == acc["id"] or t.get("trader") in (acc["id"], uid)]
-
-    # Clean up any trade from a previous day that was incorrectly given exitDate of today
-    for t in acc_trades:
-        if t.get("date") and t.get("date") < today_str and t.get("exitDate") == today_str:
-            t["exitDate"] = t["date"]
-            t["open"] = False
-            await DB._put_trade(t["id"], t)
-
-    today_trades = [t for t in (await DB._all_trades()) if (t.get("account") == acc["id"] or t.get("trader") in (acc["id"], uid)) and (t.get("date") == today_str or t.get("exitDate") == today_str)]
+    all_tr = await DB._all_trades()
+    today_trades = [
+        t for t in all_tr
+        if t.get("account") == acc["id"]
+        and (t.get("open") or (t.get("exitDate") or t.get("date")) == today_str)
+    ]
+    sync_state = await DB.get_sync_state_async(acc["id"])
     return {
         "account": acc["id"],
         "zebu_uid": uid,
         "token": token_info,
+        "sync_state": sync_state,
         "zebu": zebu_data,
         "poll_result": poll_result,
         "stored_today_trades_count": len(today_trades),
-        "stored_today_trades_pnl": sum(float(t.get("pnl") or 0) for t in today_trades),
+        "stored_today_trades_pnl": round(sum(float(t.get("pnl") or 0) for t in today_trades), 2),
         "stored_today_trades": today_trades,
     }
 
@@ -919,6 +1298,8 @@ async def put_user(name: str, request: Request, _=Depends(admin_only)):
         "user": name,
         "role": d.get("role", old.get("role", "viewer")),
         "pw": hash_pw(d["password"]) if d.get("password") else old.get("pw"),
+        "trader_id": d.get("trader_id", old.get("trader_id")),
+        "assigned_accounts": d.get("assigned_accounts", old.get("assigned_accounts", [])),
     }
     if not doc["pw"]:
         raise HTTPException(400, "Password needed")
@@ -931,41 +1312,27 @@ async def get_traders(user=Depends(current_user)):
     all_traders = await DB._all_traders()
     existing_ids = {t["id"] for t in all_traders}
 
-    # Automatically make all accounts connected or added in the website selectable in the trader/account list
     accounts = await DB.get_all_accounts_async()
     for acc in accounts:
         aid = acc["id"]
         uid = acc.get("zebu_uid") or aid
-        target_id = aid
-        if target_id not in existing_ids:
-            name = acc.get("name") or target_id
-            if uid and uid not in name and uid != target_id:
+        l_state = await link_state(acc)
+        if aid not in existing_ids:
+            name = acc.get("name") or aid
+            if uid and uid not in name and uid != aid:
                 name = f"{name} ({uid})"
             all_traders.append({
-                "id": target_id,
+                "id": aid,
                 "name": name,
-                "ra": acc.get("trader") or "Arshiyan",
+                "ra": acc.get("trader") or "",
                 "style": "Manual",
                 "holding": "Intraday",
                 "segment": "Nifty options",
-                "testCapital": 300000.0,
-                "status": "Live" if (await link_state(acc)) == "Linked" else "Testing",
-                "start": "2026-11-14",
+                "testCapital": 0.0,
+                "status": "Live" if l_state == "Linked" else "Testing",
+                "start": now_ist().date().isoformat(),
             })
-            existing_ids.add(target_id)
-        if uid and uid not in existing_ids:
-            all_traders.append({
-                "id": uid,
-                "name": f"Account {uid}",
-                "ra": acc.get("trader") or "Arshiyan",
-                "style": "Manual",
-                "holding": "Intraday",
-                "segment": "Nifty options",
-                "testCapital": 300000.0,
-                "status": "Live" if (await link_state(acc)) == "Linked" else "Testing",
-                "start": "2026-11-14",
-            })
-            existing_ids.add(uid)
+            existing_ids.add(aid)
 
     if user["role"] == "admin":
         return all_traders
@@ -991,12 +1358,11 @@ async def get_accounts(user=Depends(current_user)):
     out = []
     all_acc = await DB.get_all_accounts_async()
 
-    # Account-level access control
     if user["role"] == "trader":
         u = await DB.get_user_async(user["user"])
         tid = u.get("trader_id") if u else None
         if tid:
-            all_acc = [a for a in all_acc if a.get("trader") == tid]
+            all_acc = [a for a in all_acc if a.get("trader") == tid or a.get("id") == tid]
     elif user["role"] == "viewer":
         u = await DB.get_user_async(user["user"])
         allowed = u.get("assigned_accounts") if u else None
@@ -1005,14 +1371,25 @@ async def get_accounts(user=Depends(current_user)):
 
     for a in all_acc:
         t = (await DB.get_token_async(a["id"])) or {}
+        sync_st = (await DB.get_sync_state_async(a["id"])) or {}
         conn_state = CONN_MGR.get_account_state(a["id"])
+        l_state = await link_state(a)
+        # Never expose sensitive secret keys to frontend (Req 8.10)
+        safe_acc = {k: v for k, v in a.items() if k != "zebu_secret_key"}
+        safe_acc["has_secret_key"] = bool(a.get("zebu_secret_key"))
+        ws_st = conn_state.status if l_state == "Linked" else ("REAUTH_REQUIRED" if l_state == "Login expired" else "DISCONNECTED")
         out.append({
-            **a,
-            "link": await link_state(a),
+            **safe_acc,
+            "link": l_state,
             "linkedAt": t.get("linked_at"),
             "cliname": t.get("cliname"),
-            "ws_status": conn_state.status,
+            "ws_status": ws_st,
             "circuit_open": conn_state.circuit_open,
+            "is_stale": bool(sync_st.get("is_stale", False)),
+            "sync_status": sync_st.get("status", "IDLE"),
+            "last_sync_at": sync_st.get("last_sync_success") or t.get("last_sync_at"),
+            "sync_error": sync_st.get("last_error"),
+            "sync_message": t.get("sync_message"),
         })
     return out
 
@@ -1033,7 +1410,11 @@ async def put_account(aid: str, request: Request, _=Depends(admin_only)):
     if doc.get("proxy_url"):
         doc["proxy_url"] = doc["proxy_url"].strip()
     await DB.put_account_async(aid, doc)
-    return doc
+    if not await DB._get_rule(aid):
+        base_rule = (await DB._get_rule(doc.get("trader") or "")) if doc.get("trader") else None
+        await DB._put_rule(aid, {"trader": aid, "account": aid, "rules": (base_rule or {}).get("rules") or engine.DEFAULT_RULES})
+    safe_ret = {k: v for k, v in doc.items() if k != "zebu_secret_key"}
+    return safe_ret
 
 
 LINK_NONCE_MAP: Dict[str, Dict[str, Any]] = {}
@@ -1044,14 +1425,14 @@ async def link_account(aid: str, request: Request, _=Depends(admin_only)):
     acc = await DB.get_account_async(aid)
     if not acc:
         raise HTTPException(404, "No such account")
-    
+
     fe_url = None
     try:
         data = await request.json()
         fe_url = data.get("frontend_url")
     except Exception:
         pass
-    
+
     if not fe_url:
         fe_url = request.headers.get("origin") or request.headers.get("referer") or CFG.FRONTEND_URL
     fe_url = str(fe_url).split("?")[0].rstrip("/")
@@ -1078,6 +1459,11 @@ async def link_account(aid: str, request: Request, _=Depends(admin_only)):
 async def unlink_account(aid: str, _=Depends(admin_only)):
     await DB.delete_token_async(aid)
     await CONN_MGR.unregister_account(aid)
+    await DB.put_sync_state_async(aid, {
+        "status": "DISCONNECTED",
+        "is_stale": False,
+        "last_error": None,
+    })
     return {"ok": True}
 
 
@@ -1102,8 +1488,8 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
             token_str = qs["code"][0]
 
     final_token = token_str
-    exp_in = 86400 * 3650  # Keep linked permanently (10 years) until disconnected
-    exchange_error = None
+    refresh_token = None
+    exp_in = 86400 * 3650  # Persistent authorization until broker token expires or user disconnects
 
     if is_code or len(token_str) < 50:
         try:
@@ -1114,14 +1500,11 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
             tok = (exchanged.get("access_token") or exchanged.get("susertoken")) if isinstance(exchanged, dict) else None
             if tok:
                 final_token = tok
+                refresh_token = exchanged.get("refresh_token")
                 log.info(f"Successfully exchanged code for access token for account {aid} ({uid})")
-            else:
-                exchange_error = (exchanged or {}).get("emsg", "No access token received from Zebu")
         except Exception as e:
-            exchange_error = str(e)
             log.warning(f"Failed to exchange code: {e}")
 
-    # Validate the token with Zebu before marking as Linked!
     cliname = None
     clean_uid = (uid or "").strip().upper()
     if clean_uid.endswith("_U"):
@@ -1137,11 +1520,14 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
             c_ret = returned_actid[:-2] if returned_actid.endswith("_U") else returned_actid
             if c_ret and clean_uid and c_ret != clean_uid:
                 raise ZebuError(f"Session belongs to client '{returned_actid}', but this account is configured for '{clean_uid}'. Please log in as '{clean_uid}'.")
+    except ZebuError:
+        raise
     except Exception as e:
         log.warning(f"Token validation note for {aid}: {e}")
 
     doc = {
         "access_token": final_token,
+        "refresh_token": refresh_token,
         "expires_at": time.time() + exp_in,
         "linked_at": now_ist().isoformat(timespec="seconds"),
         "status": "Linked",
@@ -1152,7 +1538,6 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
     acc["zebu_actid"] = clean_actid
     await DB.put_account_async(aid, acc)
 
-    # Attach WebSocket stream immediately
     await CONN_MGR.register_account_stream(
         account_id=acc["id"],
         uid=clean_uid,
@@ -1160,7 +1545,7 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
         token=final_token,
         on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
     )
-    asyncio.create_task(poll_all_async("manual_token"))
+    asyncio.create_task(poll_account_async(acc, now_ist()))
     return {"ok": True, "cliname": doc.get("cliname")}
 
 
@@ -1202,7 +1587,9 @@ async def zebu_start(request: Request, n: str = "", account: str = "", fe: str =
     if not d or d.get("exp", 0) < time.time():
         return HTMLResponse("<h3>Link expired. Go back to the dashboard and click Connect Zebu again.</h3>", 400)
 
-    cb_url = "https://tts-backend-ezm3.onrender.com/auth/zebu/callback"
+    cb_url = f"{CFG.PUBLIC_URL.rstrip('/')}/auth/zebu/callback"
+    if "localhost" in CFG.PUBLIC_URL and "onrender.com" in str(request.base_url):
+        cb_url = "https://tts-backend-ezm3.onrender.com/auth/zebu/callback"
     client_id = d.get("client_id") or CFG.ZEBU_CLIENT_ID
     clean_cid = client_id.strip() if client_id else ""
     if clean_cid and not clean_cid.endswith("_U") and "_" not in clean_cid:
@@ -1221,8 +1608,6 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
     fe_url = request.cookies.get("tts_fe_url", "")
     d = LINK_NONCE_MAP.get(n) or ((await DB._get_link_nonce(n)) if n else None)
     if not d or d.get("exp", 0) < time.time():
-        # Fallback 1: check most recently created active link nonce in DB
-        from app.models import LinkNonce
         async with AsyncSessionLocal() as session:
             stmt = select(LinkNonce).where(LinkNonce.exp > datetime.now(timezone.utc)).order_by(LinkNonce.created_at.desc())
             latest_nonce = (await session.execute(stmt)).scalars().first()
@@ -1231,7 +1616,6 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
                 d = LINK_NONCE_MAP.get(latest_nonce.nonce) or {"account": latest_nonce.account_id, "exp": exp_ts}
                 n = latest_nonce.nonce
 
-    # Fallback 2: if d is still missing, auto-detect the configured Zebu account
     if not d or not d.get("account"):
         all_acc = await DB.get_all_accounts_async()
         zebu_accs = [a for a in all_acc if a.get("broker") == "Zebu"]
@@ -1273,15 +1657,10 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
         except Exception:
             pass
 
-        if not server_ip_str and proxy_url:
-            server_ip_str = "103.72.102.168"
-        elif not server_ip_str:
-            server_ip_str = "74.220.48.71"
-
         ip_hint = f"""<div style='background:#1e293b;border:1px solid #f59e0b;border-radius:8px;padding:14px;margin:16px auto;max-width:440px;text-align:left;'>
             <div style='color:#f59e0b;font-weight:600;font-size:13px;'>⚠️ Zebu IP Whitelist Notice</div>
             <div style='color:#cbd5e1;font-size:12px;margin-top:6px;'>
-                {"Account Proxy is configured. The outbound exit IP reaching Zebu is: <code style='background:#0f172a;color:#38bdf8;padding:2px 6px;border-radius:4px;font-weight:700;'>" + server_ip_str + "</code><br><br><b>Important:</b> In Zebu Developer Portal for " + uid + ", ensure <b>Primary IP</b> is set to <code style='background:#0f172a;color:#4ade80;padding:2px 6px;border-radius:4px;'>" + server_ip_str + "</code> (NOT the proxy gateway host)." if proxy_url else "Server Direct Outbound IP: <code style='background:#0f172a;color:#38bdf8;padding:2px 6px;border-radius:4px;'>" + server_ip_str + "</code>"}
+                Outbound IP reaching Zebu: <code style='background:#0f172a;color:#38bdf8;padding:2px 6px;border-radius:4px;font-weight:700;'>{server_ip_str or 'unknown'}</code>
             </div>
         </div>""" if "INVALID_IP" in str(e) else ""
 
@@ -1295,10 +1674,6 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
         <p style='color:#f8fafc;font-size:14px;'>{e}</p>
         <p style='color:#94a3b8;font-size:13px;'>Attempted to link account <b>{acc.get('name', '')}</b> with client ID <code>{uid}</code>.</p>
         {ip_hint}
-        <div style='margin-top:16px;background:#0f172a;border-radius:8px;padding:14px;text-align:left;font-size:12px;color:#94a3b8;'>
-            <b>Tip for Multiple Accounts:</b> If you were already signed into another Zebu account in this browser, Zebu re-uses that session.<br><br>
-            Please open an <b>Incognito / Private Window</b>, log into Zebu as <b>{uid}</b>, and authorize.
-        </div>
         <p style='margin-top:20px;'><a href='{target_url}' style='color:#38bdf8;text-decoration:none;font-weight:600;'>← Return to Dashboard</a></p>
     </div>
 </body>
@@ -1307,7 +1682,6 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
 
     access_token = tok["access_token"]
     cliname = None
-    mismatch_error = None
     clean_uid = (tok.get("uid") or uid).strip().upper()
     if clean_uid.endswith("_U"):
         clean_uid = clean_uid[:-2]
@@ -1327,7 +1701,7 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
     except Exception as ex:
         log.warning(f"Zebu callback ClientDetails note for {acc['id']}: {ex}")
 
-    exp_in = 86400 * 3650  # Keep linked permanently (10 years) until disconnected by user
+    exp_in = 86400 * 3650
 
     doc = {
         "access_token": tok["access_token"],
@@ -1344,7 +1718,6 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
     await DB._delete_link_nonce(n)
     LINK_NONCE_MAP.pop(n, None)
 
-    # Attach WebSocket stream immediately
     await CONN_MGR.register_account_stream(
         account_id=acc["id"],
         uid=clean_uid,
@@ -1353,7 +1726,6 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
         on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
     )
 
-    # Trigger immediate sync
     asyncio.create_task(poll_all_async("linked"))
 
     return HTMLResponse(
@@ -1364,7 +1736,7 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
 </head>
 <body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f172a;color:#f8fafc;">
     <div style="text-align:center;padding:24px;background:#1e293b;border-radius:12px;border:1px solid #334155;max-width:440px;">
-        <h2 style="color:#22c55e;margin-top:0;">✅ {acc['name']} Linked!</h2>
+        <h2 style="color:#22c55e;margin-top:0;">✅ {acc['name']} linked to Zebu!</h2>
         <p style="color:#94a3b8;font-size:14px;">Your Zebu account is connected and live streaming is active.</p>
         <p style="color:#64748b;font-size:13px;">Returning to your dashboard in 2 seconds...</p>
         <p style="margin-top:16px;"><a href="{target_url}" style="color:#38bdf8;text-decoration:none;font-weight:600;">← Back to Dashboard</a></p>
@@ -1393,29 +1765,24 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
 
 @app.get("/api/rules")
 async def get_rules(_=Depends(current_user)):
-    all_rules = await DB._all_rules()
-    res = {r["trader"]: {**engine.DEFAULT_RULES, **r["rules"]} for r in all_rules}
-    accounts = await DB.get_all_accounts_async()
-    for acc in accounts:
-        aid = acc["id"]
-        uid = acc.get("zebu_uid")
-        if aid not in res:
-            res[aid] = engine.DEFAULT_RULES
-        if uid and uid not in res:
-            res[uid] = engine.DEFAULT_RULES
-    return res
+    return await get_rules_map_async()
 
 
 @app.put("/api/rules/{tid}")
 async def put_rules(tid: str, request: Request, user=Depends(admin_only)):
     d = await request.json()
-    await DB._put_rule(tid, {"trader": tid, "rules": d["rules"]})
+    rules_payload = d.get("rules", d)
+    await DB._put_rule(tid, {"trader": tid, "account": tid, "rules": rules_payload})
+
+    # If tid is an account ID or trader ID, ensure rule is associated strictly with that ID
     await DB._put_rule_log(secrets.token_hex(6), {
         "trader": tid,
         "at": now_ist().strftime("%Y-%m-%d %H:%M"),
         "by": user["user"],
         "change": d.get("change", "Rules updated"),
     })
+    # Immediately re-evaluate rules for this account/trader
+    await evaluate_and_record_violations_async(now_ist(), account_id=tid)
     return {"ok": True}
 
 
@@ -1425,18 +1792,76 @@ async def get_rulelog(_=Depends(current_user)):
     return sorted(logs, key=lambda x: x["at"])
 
 
+@app.get("/api/violations")
+async def get_violations(account: Optional[str] = None, user=Depends(current_user)):
+    violations = await DB.get_rule_violations_async(account_id=account)
+    if user["role"] == "trader":
+        u = await DB.get_user_async(user["user"])
+        tid = u.get("trader_id") if u else None
+        if tid:
+            violations = [v for v in violations if v.get("trader") == tid or v.get("account") == tid]
+    elif user["role"] == "viewer":
+        u = await DB.get_user_async(user["user"])
+        allowed = u.get("assigned_accounts") if u else None
+        if allowed:
+            violations = [v for v in violations if v.get("account") in allowed]
+    return violations
+
+
+@app.get("/api/daily-reports")
+async def get_daily_reports(account: Optional[str] = None, from_date: Optional[str] = None, user=Depends(current_user)):
+    reports = await DB.get_daily_reports_async(account_id=account, from_date=from_date)
+    if user["role"] == "trader":
+        u = await DB.get_user_async(user["user"])
+        tid = u.get("trader_id") if u else None
+        if tid:
+            reports = [r for r in reports if r.get("trader") == tid or r.get("account") == tid]
+    elif user["role"] == "viewer":
+        u = await DB.get_user_async(user["user"])
+        allowed = u.get("assigned_accounts") if u else None
+        if allowed:
+            reports = [r for r in reports if r.get("account") in allowed]
+    return reports
+
+
+@app.post("/api/finalize-eod")
+async def trigger_finalize_eod(request: Request, date: Optional[str] = None, _=Depends(admin_only)):
+    target_date = date or request.query_params.get("date")
+    if not target_date:
+        try:
+            body = await request.json()
+            target_date = body.get("date")
+        except Exception:
+            pass
+    return await finalize_eod_async(now=now_ist(), target_date=target_date)
+
+
+@app.post("/api/midnight-archive")
+async def trigger_midnight_archive(_=Depends(admin_only)):
+    return await midnight_archive_async(now=now_ist())
+
+
+@app.get("/api/reconcile-calendar")
+async def get_calendar_reconciliation(account: Optional[str] = None, _=Depends(current_user)):
+    return await reconcile_daily_calendar_async(account_id=account)
+
+
 @app.get("/api/trades")
 async def get_trades(request: Request, user=Depends(current_user)):
     t0 = time.perf_counter()
     frm = request.query_params.get("from", "")
+    acc_filter = request.query_params.get("account", "")
     all_trades = await DB._all_trades(from_date=frm if frm else None)
+
+    if acc_filter:
+        all_trades = [t for t in all_trades if t.get("account") == acc_filter or t.get("trader") == acc_filter]
 
     # Account-level isolation
     if user["role"] == "trader":
         u = await DB.get_user_async(user["user"])
         tid = u.get("trader_id") if u else None
         if tid:
-            all_trades = [t for t in all_trades if t.get("trader") == tid]
+            all_trades = [t for t in all_trades if t.get("trader") == tid or t.get("account") == tid]
     elif user["role"] == "viewer":
         u = await DB.get_user_async(user["user"])
         allowed = u.get("assigned_accounts") if u else None
@@ -1456,7 +1881,7 @@ async def import_trades(request: Request, _=Depends(admin_only)):
             r["origin"] = "import"
             r["id"] = r.get("id") or "I-" + secrets.token_hex(5)
             aid = str(r.get("account") or "AC-01").strip()
-            tid = str(r.get("trader") or "TR-001").strip()
+            tid = str(r.get("trader") or aid).strip()
             r["account"] = aid
             r["trader"] = tid
             if not await DB.get_account_async(aid):
@@ -1469,6 +1894,7 @@ async def import_trades(request: Request, _=Depends(admin_only)):
                 r["qty"] = float(r.get("lots") or 1) * int(r.get("lotSize") or 1)
             items.append((r["id"], r))
         await DB._put_many_trades(items)
+        await evaluate_and_record_violations_async(now_ist())
         return {"ok": True, "n": len(items)}
     except Exception as e:
         log.exception(f"Import trades error: {e}")
@@ -1477,7 +1903,7 @@ async def import_trades(request: Request, _=Depends(admin_only)):
 
 @app.delete("/api/trades/{tid}")
 async def delete_trade(tid: str, _=Depends(admin_only)):
-    await DB._delete_trade(tid)
+    await DB._delete_trade(tid, allow_delete_finalized=True)
     return {"ok": True}
 
 
@@ -1487,7 +1913,7 @@ async def delete_trades_bulk(request: Request, _=Depends(admin_only)):
     ids = d.get("ids", [])
     count = 0
     for tid in ids:
-        await DB._delete_trade(tid)
+        await DB._delete_trade(tid, allow_delete_finalized=True)
         count += 1
     return {"ok": True, "deleted": count}
 
@@ -1550,7 +1976,12 @@ async def sync_now(request: Request, account: Optional[str] = None, _=Depends(cu
                     break
         if acc:
             now = now_ist()
-            res = await poll_account_async(acc, now)
+            try:
+                res = await poll_account_async(acc, now)
+            except SessionExpired:
+                res = "expired"
+            except Exception as e:
+                res = f"error: {str(e)[:200]}"
             return {"account": acc["id"], "result": res}
 
     return await poll_all_async("manual")
@@ -1571,8 +2002,15 @@ async def test_alert(_=Depends(admin_only)):
 @app.get("/api/status")
 async def status(_=Depends(current_user)):
     poll_stat = (await DB._get_status("poll")) or {}
+    all_acc = await DB.get_all_accounts_async()
+    acc_sync_states = {}
+    for a in all_acc:
+        st = await DB.get_sync_state_async(a["id"])
+        if st:
+            acc_sync_states[a["id"]] = st
     return {
         "poll": poll_stat,
+        "account_sync": acc_sync_states,
         "zebu_configured": bool(CFG.ZEBU_CLIENT_ID and CFG.ZEBU_SECRET_KEY),
         "redirect_url": CFG.PUBLIC_URL + "/auth/zebu/callback",
         "poll_seconds": CFG.POLL_SECONDS,
@@ -1593,28 +2031,22 @@ async def server_ip():
 
 
 def get_frontend_dir() -> Path:
-    # 1. Docker / production container layout: /app/static
     if (ROOT_DIR / "static").exists():
         return ROOT_DIR / "static"
-    # 2. Local separated development layout: ../frontend
     if (ROOT_DIR.parent / "frontend").exists():
         return ROOT_DIR.parent / "frontend"
     return ROOT_DIR / "static"
 
 
-FRONTEND_DIR = get_frontend_dir()
-
-
 @app.get("/")
-async def index(request: Request, code: str = "", state: str = ""):
-    if code:
-        return await zebu_callback(request, code=code, state=state)
-    html_file = FRONTEND_DIR / "index.html"
-    if html_file.exists():
-        return FileResponse(html_file)
-    return RedirectResponse(CFG.FRONTEND_URL, status_code=302)
+def index():
+    fe_dir = get_frontend_dir()
+    index_file = fe_dir / "index.html"
+    if not index_file.exists():
+        return JSONResponse({"status": "TTS Backend API is running", "docs": "/docs"})
+    return FileResponse(index_file)
 
 
-# Mount static assets if present
-if FRONTEND_DIR.exists():
-    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+_fe_dir = get_frontend_dir()
+if _fe_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(_fe_dir)), name="static")

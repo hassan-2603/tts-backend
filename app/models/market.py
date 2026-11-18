@@ -91,13 +91,13 @@ class Fill(Base):
 
 
 class Trade(Base):
-    """Aggregated trade row matching static/index.html schema."""
+    """Aggregated trade row matching static/index.html schema with lifecycle, finalization & archival fields."""
     __tablename__ = "trades"
 
-    id = Column(String(120), primary_key=True)  # Z-account-oid or I-rand
+    id = Column(String(120), primary_key=True)  # Z-account-oid or Z-account-oid-X-exitoid or I-rand
     origin = Column(String(50), nullable=False, default="zebu")  # zebu / import
     account_id = Column(String(100), ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True)
-    trader_id = Column(String(100), ForeignKey("traders.id", ondelete="CASCADE"), nullable=True, index=True)
+    trader_id = Column(String(100), nullable=True, index=True)
     trade_date = Column(String(20), nullable=False, index=True)  # YYYY-MM-DD
     trade_time = Column(String(20), nullable=False)  # HH:MM
     symbol = Column(String(50), nullable=False, index=True)  # Underlying symbol e.g. BANKNIFTY
@@ -112,10 +112,14 @@ class Trade(Base):
     lot_size = Column(Integer, nullable=False, default=1)
     qty = Column(Numeric(12, 2), nullable=False)
     entry_price = Column(Numeric(12, 4), nullable=False)
-    exit_price = Column(Numeric(12, 4), nullable=False)
-    pnl = Column(Numeric(14, 2), nullable=True)
+    exit_price = Column(Numeric(12, 4), nullable=True)
+    pnl = Column(Numeric(14, 2), nullable=True)  # Realized P&L (if closed) or Unrealized P&L (if open)
+    realized_pnl = Column(Numeric(14, 2), nullable=True)
+    unrealized_pnl = Column(Numeric(14, 2), nullable=True)
+    net_pnl = Column(Numeric(14, 2), nullable=True)
+    pnl_source = Column(String(30), nullable=True, default="calculated")  # broker / calculated
     is_open = Column(Boolean, nullable=False, default=False, index=True)
-    exit_date = Column(String(20), nullable=True)
+    exit_date = Column(String(20), nullable=True, index=True)
     exit_time = Column(String(20), nullable=True)
     spot = Column(Numeric(12, 2), nullable=True)
     product = Column(String(20), nullable=False, default="MIS")  # MIS / NRML
@@ -123,6 +127,13 @@ class Trade(Base):
     charges = Column(Numeric(12, 2), nullable=False, default=0.0)
     charges_estimated = Column(Boolean, nullable=False, default=True)
     hedged = Column(Boolean, nullable=False, default=False)
+    parent_trade_id = Column(String(120), nullable=True, index=True)
+    entry_order_id = Column(String(100), nullable=True)
+    exit_order_id = Column(String(100), nullable=True)
+    is_finalized = Column(Boolean, nullable=False, default=False, index=True)
+    finalized_at = Column(DateTime(timezone=True), nullable=True)
+    is_archived = Column(Boolean, nullable=False, default=False, index=True)
+    archived_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
@@ -132,6 +143,7 @@ class Trade(Base):
         Index("ix_trades_acc_date", "account_id", "trade_date"),
         Index("ix_trades_trader_date", "trader_id", "trade_date"),
         Index("ix_trades_date_sym", "trade_date", "symbol"),
+        Index("ix_trades_acc_exit_date", "account_id", "exit_date"),
     )
 
 
@@ -149,9 +161,10 @@ class Position(Base):
     sell_qty = Column(Numeric(12, 2), nullable=False, default=0)
     buy_avg = Column(Numeric(12, 4), nullable=False, default=0)
     sell_avg = Column(Numeric(12, 4), nullable=False, default=0)
-    ltp = Column(Numeric(12, 4), nullable=True, default=0)
+    ltp = Column(Numeric(12, 4), nullable=True)
     realized_pnl = Column(Numeric(14, 2), nullable=False, default=0)
     unrealized_pnl = Column(Numeric(14, 2), nullable=False, default=0)
+    raw_payload = Column(JSON, nullable=True)
     updated_at = Column(DateTime(timezone=True), default=utc_now)
 
     account_rel = relationship("Account", back_populates="positions")

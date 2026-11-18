@@ -62,13 +62,27 @@ def test_fifo_carry_forward_and_partial_fills():
 
     trades = build_trades(acc, fills, cfg, pmap, lambda o: False, now, ltp={"BANKNIFTY24NOV26C51700": 350.0})
 
-    assert len(trades) == 1
-    t = trades[0]
-    assert t["lots"] == 2.0  # Total 60 qty / 30 ls
-    assert t["open"] is True  # 30 still open
-    assert t["entry"] == 300.0
-    assert t["product"] == "NRML"
-    assert t["date"] == (now - timedelta(days=25)).date().isoformat()
+    # Partial close decomposes into 1 closed realized leg (30 qty @ 340) + 1 remaining open leg (30 qty @ 300 entry, 350 LTP)
+    assert len(trades) == 2
+    closed_leg = next(x for x in trades if not x["open"])
+    open_leg = next(x for x in trades if x["open"])
+
+    assert closed_leg["qty"] == 30.0
+    assert closed_leg["lots"] == 1.0
+    assert closed_leg["entry"] == 300.0
+    assert closed_leg["exit"] == 340.0
+    assert closed_leg["realized_pnl"] == 1200.0
+    assert closed_leg["exitDate"] == now.date().isoformat()
+
+    assert open_leg["qty"] == 30.0
+    assert open_leg["lots"] == 1.0
+    assert open_leg["open"] is True  # 30 still open
+    assert open_leg["entry"] == 300.0
+    assert open_leg["exit"] == 350.0
+    assert open_leg["unrealized_pnl"] == 1500.0
+    assert open_leg["product"] == "NRML"
+    assert open_leg["date"] == (now - timedelta(days=25)).date().isoformat()
+    assert open_leg["parent_trade_id"] == closed_leg["parent_trade_id"]
 
 
 def test_risk_rules_evaluation():

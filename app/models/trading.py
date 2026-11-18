@@ -35,7 +35,6 @@ class Trader(Base):
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     accounts = relationship("Account", back_populates="trader_rel")
-    rules = relationship("TradingRule", back_populates="trader_rel", uselist=False)
 
 
 class Account(Base):

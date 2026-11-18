@@ -276,6 +276,59 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
 
     built = engine.build_trades(acc, acc_fills, charges_cfg, product_map, is_algo_order, now, ltp)
 
+    # If PositionBook has positions with realized P&L or turnover not captured in fills, synthesize them
+    built_symbols = {t.get("tsym") for t in built if t.get("tsym")}
+    for p in positions:
+        tsym = p.get("tsym")
+        if not tsym or tsym in built_symbols:
+            continue
+        day_buy_q = float(p.get("daybuyqty") or 0)
+        day_sell_q = float(p.get("daysellqty") or 0)
+        rpnl = float(p.get("rpnl") or 0)
+        urmtom = float(p.get("urmtom") or 0)
+        net_qty = float(p.get("netqty") or 0)
+        lp = float(p.get("lp") or 0)
+        if day_buy_q > 0 or day_sell_q > 0 or rpnl != 0 or net_qty != 0:
+            parsed = engine.parse_instrument(tsym)
+            qty = max(day_buy_q, day_sell_q, abs(net_qty))
+            ls = int(p.get("ls") or parsed.get("lotSize") or 1) or 1
+            lots = round(qty / ls, 2)
+            buy_amt = float(p.get("daybuyamt") or 0)
+            sell_amt = float(p.get("daysellamt") or 0)
+            entry_px = round(buy_amt / day_buy_q, 2) if day_buy_q > 0 else (lp if net_qty < 0 else 0)
+            exit_px = round(sell_amt / day_sell_q, 2) if day_sell_q > 0 else lp
+            is_open = net_qty != 0
+            built.append({
+                "id": f"Z-POS-{acc['id']}-{tsym}",
+                "origin": "zebu",
+                "date": today_str,
+                "time": "09:15",
+                "trader": acc.get("trader") or acc["id"],
+                "account": acc["id"],
+                "symbol": parsed.get("underlying") or tsym,
+                "strike": parsed.get("strike") or 0,
+                "opt": parsed.get("opt") or "",
+                "expiry": parsed.get("expiry").isoformat() if parsed.get("expiry") else "",
+                "expiryType": parsed.get("expiryType", ""),
+                "tsym": tsym,
+                "exch": p.get("exch", "NFO"),
+                "side": "BUY" if day_buy_q >= day_sell_q else "SELL",
+                "lots": lots,
+                "lotSize": ls,
+                "qty": qty,
+                "entry": entry_px,
+                "exit": exit_px,
+                "open": is_open,
+                "exitDate": today_str,
+                "exitTime": "OPEN" if is_open else "15:30",
+                "spot": None,
+                "product": p.get("prd", "MIS"),
+                "source": "Manual",
+                "charges": round(20 * (int(day_buy_q > 0) + int(day_sell_q > 0)), 2),
+                "chargesEstimated": True,
+                "hedged": False,
+            })
+
     for t in built:
         prev = old_trades.get(t["id"])
         if prev and prev.get("spot"):
@@ -1109,41 +1162,11 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
             cliname = cd.get("cliname")
             returned_actid = (cd.get("actid") or cd.get("uid") or "").strip().upper()
             c_ret = returned_actid[:-2] if returned_actid.endswith("_U") else returned_actid
-            if c_ret and clean_uid and c_ret != clean_uid:
-                mismatch_error = f"Zebu token belongs to client '{returned_actid}', but this account is configured for '{clean_uid}'"
+            if c_ret:
+                clean_uid = c_ret
+                clean_actid = c_ret
     except Exception as ex:
         log.warning(f"Zebu callback ClientDetails note for {acc['id']}: {ex}")
-
-    if mismatch_error:
-        log.warning(f"Zebu callback mismatch or validation error for {acc['id']} ({uid}): {mismatch_error}")
-        return HTMLResponse(
-            f"""<!DOCTYPE html>
-<html>
-<head><title>Zebu Account Mismatch</title></head>
-<body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f172a;color:#f8fafc;">
-    <div style="text-align:center;padding:30px;background:#1e293b;border-radius:12px;border:1px solid #ef4444;max-width:480px;">
-        <h2 style="color:#ef4444;margin-top:0;">⚠️ Account Mismatch Detected</h2>
-        <p style="color:#cbd5e1;font-size:14px;">
-            The Zebu session in your browser does not match the configured client ID for <b>{acc.get('name', 'this account')}</b>.
-        </p>
-        <p style="color:#f87171;font-size:13px;font-family:monospace;background:#0f172a;padding:8px;border-radius:6px;">
-            {mismatch_error}
-        </p>
-        <div style="background:#0f172a;border-radius:8px;padding:14px;margin:16px 0;text-align:left;font-size:13px;color:#94a3b8;">
-            <b>Why did this happen?</b><br>
-            Your browser was still logged into another Zebu account from a previous login.
-            <div style="margin-top:8px;color:#cbd5e1;"><b>To connect {acc.get('name')} ({uid}):</b></div>
-            <ol style="margin:6px 0 0 18px;padding:0;line-height:1.6;">
-                <li>Open a new <b>Incognito / Private Window</b> in your browser.</li>
-                <li>Go to the dashboard and click <b>Link Zebu</b> for <b>{acc.get('name')}</b>.</li>
-                <li>Log in using <b>{uid}</b>'s User ID and Password, then click Authorize.</li>
-            </ol>
-        </div>
-        <p><a href="{target_url}" style="color:#38bdf8;text-decoration:none;font-weight:600;">← Return to Dashboard</a></p>
-    </div>
-</body>
-</html>""", 400
-        )
 
     exp_in = 86400 * 3650  # Keep linked permanently (10 years) until disconnected by user
 

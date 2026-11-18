@@ -236,6 +236,14 @@ class Store:
             stmt = select(BrokerSession).where(BrokerSession.account_id == aid)
             bs = (await session.execute(stmt)).scalar_one_or_none()
             if not bs:
+                acc_stmt = select(Account).where((Account.id == aid) | (Account.zebu_uid == aid))
+                cur_acc = (await session.execute(acc_stmt)).scalars().first()
+                if cur_acc and cur_acc.zebu_uid:
+                    other_stmt = select(BrokerSession).join(Account, Account.id == BrokerSession.account_id).where(
+                        (Account.zebu_uid == cur_acc.zebu_uid) | (Account.id == cur_acc.id)
+                    )
+                    bs = (await session.execute(other_stmt)).scalars().first()
+            if not bs:
                 return None
             exp_dt = bs.expires_at
             if exp_dt and exp_dt.tzinfo is None:

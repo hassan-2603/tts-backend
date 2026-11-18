@@ -242,6 +242,12 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
         positions = await ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url)
     except SessionExpired:
         log.warning(f"Zebu session refresh notice for account {acc['id']}")
+        async with AsyncSessionLocal() as session:
+            stmt = select(BrokerSession).where(BrokerSession.account_id == acc["id"])
+            bs = (await session.execute(stmt)).scalar_one_or_none()
+            if bs:
+                bs.status = "Login expired"
+                await session.commit()
         return "expired"
 
     today_str = now.date().isoformat()
@@ -1343,7 +1349,28 @@ async def put_settings(request: Request, _=Depends(admin_only)):
 
 
 @app.post("/api/sync")
-async def sync_now(_=Depends(admin_only)):
+async def sync_now(request: Request, account: Optional[str] = None, _=Depends(admin_only)):
+    target_aid = account or request.query_params.get("account")
+    if not target_aid:
+        try:
+            body = await request.json()
+            target_aid = body.get("account")
+        except Exception:
+            pass
+
+    if target_aid:
+        acc = await DB.get_account_async(target_aid)
+        if not acc:
+            all_acc = await DB.get_all_accounts_async()
+            for a in all_acc:
+                if a.get("zebu_uid") == target_aid:
+                    acc = a
+                    break
+        if acc:
+            now = now_ist()
+            res = await poll_account_async(acc, now)
+            return {"account": acc["id"], "result": res}
+
     return await poll_all_async("manual")
 
 

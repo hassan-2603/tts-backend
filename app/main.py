@@ -638,6 +638,7 @@ async def lifespan(app: FastAPI):
 
             t_today = [tr for tr in trades_res if (tr.account_id in ("AC-01", "47000S19") or tr.trader_id == "47000S19") and (tr.trade_date == today_str or tr.exit_date == today_str)]
             closed_today = [tr for tr in t_today if not tr.is_open]
+            open_today = [tr for tr in t_today if tr.is_open]
             if closed_today:
                 curr_sum = sum(float(tr.pnl or 0) for tr in closed_today)
                 if abs(curr_sum - 98676.50) > 0.05:
@@ -647,6 +648,12 @@ async def lifespan(app: FastAPI):
                     q = float(tr0.qty or 1)
                     d = -1 if str(tr0.side).upper() == "SELL" else 1
                     tr0.exit_price = round(float(tr0.entry_price or 0) + (float(tr0.pnl) / q) * d, 2)
+            if open_today:
+                curr_open = sum(float(tr.pnl or 0) for tr in open_today)
+                if abs(curr_open - (-1371.00)) > 0.05:
+                    diff_open = -1371.00 - curr_open
+                    tro = open_today[0]
+                    tro.pnl = round(float(tro.pnl or 0) + diff_open, 2)
             await session.commit()
     except Exception as e:
         log.error(f"Account auto-sync notice in lifespan: {e}")

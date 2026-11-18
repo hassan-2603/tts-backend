@@ -675,6 +675,11 @@ class Store:
         t.qty = float(qty)
         t.entry_price = float(doc.get("entry") if doc.get("entry") is not None else (t.entry_price if t.entry_price is not None else 0.0))
         t.exit_price = float(doc.get("exit") if doc.get("exit") is not None else (t.exit_price if t.exit_price is not None else 0.0))
+        if doc.get("pnl") is not None:
+            try:
+                t.pnl = float(doc["pnl"])
+            except (ValueError, TypeError):
+                pass
         t.is_open = bool(doc.get("open", False))
         t.exit_date = doc.get("exitDate", t.exit_date or t.trade_date)
         t.exit_time = doc.get("exitTime", t.exit_time or t.trade_time)
@@ -709,6 +714,7 @@ class Store:
             "qty": qty,
             "entry": float(t.entry_price) if t.entry_price is not None else 0.0,
             "exit": float(t.exit_price) if t.exit_price is not None else 0.0,
+            "pnl": float(t.pnl) if getattr(t, "pnl", None) is not None else None,
             "open": t.is_open,
             "exitDate": t.exit_date,
             "exitTime": t.exit_time,

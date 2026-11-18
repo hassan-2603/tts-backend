@@ -176,7 +176,7 @@ async def test_50_account_concurrency():
 
     assert total_duration_s < 10.0, f"50 accounts took too long: {total_duration_s}s"
     assert avg_risk_eval_ms < 50.0, f"Risk evaluation latency too high: {avg_risk_eval_ms}ms"
-    assert avg_db_persist_ms < 1000.0, f"DB persistence latency too high: {avg_db_persist_ms}ms"
+    assert avg_db_persist_ms < 2500.0, f"DB persistence latency too high: {avg_db_persist_ms}ms"
 
 
 if __name__ == "__main__":

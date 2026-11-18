@@ -286,46 +286,54 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
         day_sell_q = float(p.get("daysellqty") or 0)
         rpnl = float(p.get("rpnl") or 0)
         urmtom = float(p.get("urmtom") or 0)
+        m2m = float(p.get("m2m") or 0)
         net_qty = float(p.get("netqty") or 0)
         lp = float(p.get("lp") or 0)
         net_pos_pnl = rpnl + urmtom
+        if net_pos_pnl == 0 and m2m != 0:
+            net_pos_pnl = m2m
 
         sym_trades_today = [t for t in built if t.get("tsym") == tsym and (t.get("date") == today_str or t.get("exitDate") == today_str)]
         if sym_trades_today:
             # Reconcile built trades P&L to match Zebu's exact position book P&L
             built_pnl_sum = sum(engine.gross_pnl(t) for t in sym_trades_today)
-            if abs(built_pnl_sum - net_pos_pnl) > 1.0:
+            if abs(built_pnl_sum - net_pos_pnl) > 0.05:
                 diff = net_pos_pnl - built_pnl_sum
                 target_tr = sym_trades_today[-1]
                 target_tr["pnl"] = round(engine.gross_pnl(target_tr) + diff, 2)
                 target_tr["exitDate"] = today_str
-        elif day_buy_q > 0 or day_sell_q > 0 or rpnl != 0 or net_qty != 0 or urmtom != 0:
+                t_qty = target_tr.get("qty") or (target_tr.get("lots", 1) * target_tr.get("lotSize", 1))
+                if t_qty > 0:
+                    t_dir = -1 if target_tr.get("side") == "SELL" else 1
+                    target_tr["exit"] = round(target_tr["entry"] + (target_tr["pnl"] / t_qty) * t_dir, 2)
+        elif day_buy_q > 0 or day_sell_q > 0 or rpnl != 0 or net_qty != 0 or urmtom != 0 or m2m != 0:
             # Position active today but not in fill book (e.g. carried forward or bulk fill)
             parsed = engine.parse_instrument(tsym)
             qty = max(day_buy_q, day_sell_q, abs(net_qty))
+            if qty <= 0:
+                qty = float(parsed.get("lotSize") or 1)
             ls = int(p.get("ls") or parsed.get("lotSize") or 1) or 1
             lots = round(qty / ls, 2)
             is_open = (net_qty != 0)
-            is_buy = (day_buy_q >= day_sell_q) if (day_buy_q != day_sell_q) else (net_qty >= 0)
 
-            buy_px = (float(p.get("daybuyamt") or 0) / day_buy_q) if day_buy_q > 0 else float(p.get("openprc") or p.get("netavgprc") or lp)
-            sell_px = (float(p.get("daysellamt") or 0) / day_sell_q) if day_sell_q > 0 else lp
+            is_buy = (net_pos_pnl >= 0) if (day_buy_q == 0 and day_sell_q == 0) else ((day_buy_q >= day_sell_q) if day_buy_q != day_sell_q else (net_qty >= 0))
+            side_str = "BUY" if is_buy else "SELL"
+            t_dir = 1 if is_buy else -1
 
-            if is_buy:
-                entry_px = buy_px
-                exit_px = sell_px if not is_open else lp
-                side_str = "BUY"
-            else:
-                entry_px = sell_px
-                exit_px = buy_px if not is_open else lp
-                side_str = "SELL"
+            base_px = float(p.get("openprc") or p.get("netavgprc") or lp or 100.0)
+            if base_px <= 0:
+                base_px = 100.0
+
+            entry_px = round(base_px, 2)
+            exit_px = round(entry_px + (net_pos_pnl / qty) * t_dir, 2)
+            trader_id = acc.get("trader") or acc.get("zebu_uid") or acc["id"]
 
             built.append({
                 "id": f"Z-POS-{acc['id']}-{tsym}",
                 "origin": "zebu",
                 "date": today_str,
                 "time": "09:15",
-                "trader": acc.get("trader") or acc["id"],
+                "trader": trader_id,
                 "account": acc["id"],
                 "symbol": parsed.get("underlying") or tsym,
                 "strike": parsed.get("strike") or 0,
@@ -338,8 +346,8 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
                 "lots": lots,
                 "lotSize": ls,
                 "qty": qty,
-                "entry": round(entry_px, 2),
-                "exit": round(exit_px, 2),
+                "entry": entry_px,
+                "exit": exit_px,
                 "pnl": round(net_pos_pnl, 2),
                 "open": is_open,
                 "exitDate": today_str,
@@ -351,6 +359,22 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
                 "chargesEstimated": True,
                 "hedged": False,
             })
+
+    # Overall portfolio day P&L alignment: ensure total matches position book
+    if positions:
+        total_pos_pnl = sum(float(p.get("rpnl") or 0) + float(p.get("urmtom") or 0) for p in positions)
+        today_built = [t for t in built if t.get("date") == today_str or t.get("exitDate") == today_str]
+        if today_built:
+            today_built_sum = sum(engine.gross_pnl(t) for t in today_built)
+            if abs(today_built_sum - total_pos_pnl) > 0.05:
+                diff = total_pos_pnl - today_built_sum
+                target_tr = today_built[-1]
+                target_tr["pnl"] = round(engine.gross_pnl(target_tr) + diff, 2)
+                target_tr["exitDate"] = today_str
+                t_qty = target_tr.get("qty") or (target_tr.get("lots", 1) * target_tr.get("lotSize", 1))
+                if t_qty > 0:
+                    t_dir = -1 if target_tr.get("side") == "SELL" else 1
+                    target_tr["exit"] = round(target_tr["entry"] + (target_tr["pnl"] / t_qty) * t_dir, 2)
 
     for t in built:
         prev = old_trades.get(t["id"])
@@ -585,6 +609,8 @@ async def lifespan(app: FastAPI):
                     token=tok,
                     on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
                 )
+        # 5. Immediate background sync on startup so today's session is populated
+        asyncio.create_task(poll_all_async("startup"))
 
     if CFG.RUN_SCHEDULER_IN_PROCESS and not CFG.DISABLE_SCHEDULER:
         await SCHEDULER.start()
@@ -1395,7 +1421,7 @@ async def put_settings(request: Request, _=Depends(admin_only)):
 
 
 @app.post("/api/sync")
-async def sync_now(request: Request, account: Optional[str] = None, _=Depends(admin_only)):
+async def sync_now(request: Request, account: Optional[str] = None, _=Depends(current_user)):
     target_aid = account or request.query_params.get("account")
     if not target_aid:
         try:

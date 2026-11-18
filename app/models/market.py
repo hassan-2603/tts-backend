@@ -113,6 +113,7 @@ class Trade(Base):
     qty = Column(Numeric(12, 2), nullable=False)
     entry_price = Column(Numeric(12, 4), nullable=False)
     exit_price = Column(Numeric(12, 4), nullable=False)
+    pnl = Column(Numeric(14, 2), nullable=True)
     is_open = Column(Boolean, nullable=False, default=False, index=True)
     exit_date = Column(String(20), nullable=True)
     exit_time = Column(String(20), nullable=True)

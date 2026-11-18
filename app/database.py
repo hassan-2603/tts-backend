@@ -70,13 +70,18 @@ async def init_models(engine: AsyncEngine = None):
     eng = engine or async_engine
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Graceful column migration for accounts table (PostgreSQL & SQLite)
-        for col, col_type in [("zebu_client_id", "VARCHAR(100)"), ("zebu_secret_key", "VARCHAR(200)"), ("proxy_url", "VARCHAR(300)")]:
+        # Graceful column migration for accounts and trades tables (PostgreSQL & SQLite)
+        for tbl, col, col_type in [
+            ("accounts", "zebu_client_id", "VARCHAR(100)"),
+            ("accounts", "zebu_secret_key", "VARCHAR(200)"),
+            ("accounts", "proxy_url", "VARCHAR(300)"),
+            ("trades", "pnl", "NUMERIC(14, 2)"),
+        ]:
             try:
-                await conn.execute(text(f"ALTER TABLE accounts ADD COLUMN IF NOT EXISTS {col} {col_type}"))
+                await conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {col_type}"))
             except Exception:
                 try:
-                    await conn.execute(text(f"ALTER TABLE accounts ADD COLUMN {col} {col_type}"))
+                    await conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_type}"))
                 except Exception:
                     pass
     log.info("Database tables verified/initialized.")

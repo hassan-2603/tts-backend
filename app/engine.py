@@ -383,7 +383,7 @@ def gross_pnl(t: dict) -> float:
 
 
 def net_pnl(t: dict) -> float:
-    return gross_pnl(t) - (t.get("charges") or 0.0)
+    return gross_pnl(t)
 
 
 def moneyness(t: dict, step: int) -> Tuple[float, int]:

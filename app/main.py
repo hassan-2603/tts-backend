@@ -192,14 +192,27 @@ async def token_for_account_async(acc_id: str) -> Optional[str]:
     async with AsyncSessionLocal() as session:
         stmt = select(BrokerSession).where(BrokerSession.account_id == acc_id)
         bs = (await session.execute(stmt)).scalar_one_or_none()
-        if not bs:
-            return None
-        if bs.status == "Linked" and bs.access_token_enc:
-            return decrypt_token(bs.access_token_enc)
-        exp = ensure_utc(bs.expires_at)
-        if exp and exp < datetime.now(timezone.utc):
-            return None
-        return decrypt_token(bs.access_token_enc)
+        if bs:
+            if bs.status == "Linked" and bs.access_token_enc:
+                return decrypt_token(bs.access_token_enc)
+            exp = ensure_utc(bs.expires_at)
+            if not exp or exp >= datetime.now(timezone.utc):
+                return decrypt_token(bs.access_token_enc)
+
+        # Fallback by zebu_uid if another linked account shares credentials
+        acc_stmt = select(Account).where(Account.id == acc_id)
+        cur_acc = (await session.execute(acc_stmt)).scalar_one_or_none()
+        if cur_acc and cur_acc.zebu_uid:
+            match_stmt = (
+                select(BrokerSession)
+                .join(Account, Account.id == BrokerSession.account_id)
+                .where(Account.zebu_uid == cur_acc.zebu_uid, BrokerSession.access_token_enc.isnot(None))
+            )
+            matched_bs = (await session.execute(match_stmt)).scalars().first()
+            if matched_bs and matched_bs.access_token_enc:
+                return decrypt_token(matched_bs.access_token_enc)
+
+        return None
 
 
 async def any_token_async() -> Tuple[Optional[str], Optional[str]]:
@@ -427,6 +440,54 @@ async def lifespan(app: FastAPI):
     if not settings_existing:
         await DB._put_setting("main", DEFAULT_SETTINGS)
 
+    # 2b. Auto-sync accounts to traders table and ensure sessions & rules exist
+    try:
+        all_acc = await DB.get_all_accounts_async()
+        existing_traders = {t["id"]: t for t in (await DB._all_traders())}
+        for acc in all_acc:
+            aid = acc["id"]
+            uid = acc.get("zebu_uid")
+            if uid and uid == "47000S19":
+                tok_ac01 = await DB.get_token_async("AC-01")
+                tok_19 = await DB.get_token_async("47000S19")
+                if tok_ac01 and not tok_19:
+                    await DB.put_token_async("47000S19", tok_ac01)
+
+            for target_id in filter(None, [aid, uid]):
+                if target_id not in existing_traders:
+                    name = acc.get("name") or target_id
+                    if uid and uid not in name and uid != target_id:
+                        name = f"{name} ({uid})"
+                    t_doc = {
+                        "id": target_id,
+                        "name": name,
+                        "ra": "Arshiyan",
+                        "style": "Manual",
+                        "holding": "Intraday",
+                        "segment": "Nifty options",
+                        "testCapital": 300000.0,
+                        "status": "Live" if (await link_state(acc)) == "Linked" else "Testing",
+                        "start": "2026-11-14",
+                    }
+                    await DB._put_trader(target_id, t_doc)
+                    existing_traders[target_id] = t_doc
+
+                if not await DB._get_rule(target_id):
+                    await DB._put_rule(target_id, {"trader": target_id, "rules": engine.DEFAULT_RULES})
+
+        async with AsyncSessionLocal() as session:
+            stmt = select(Trade)
+            trades_res = (await session.execute(stmt)).scalars().all()
+            for tr in trades_res:
+                if tr.account_id:
+                    if tr.account_id in ("AC-01", "47000S19"):
+                        tr.trader_id = "47000S19"
+                    else:
+                        tr.trader_id = tr.account_id
+            await session.commit()
+    except Exception as e:
+        log.error(f"Account auto-sync notice in lifespan: {e}")
+
     # 3. Start Connection Manager & Scheduler if configured for in-process execution
     if CFG.RUN_WORKER_IN_PROCESS:
         await CONN_MGR.start()
@@ -514,6 +575,16 @@ def admin_only(user=Depends(current_user)):
 
 async def link_state(acc: dict) -> str:
     t = await DB.get_token_async(acc["id"])
+    if not t and acc.get("zebu_uid"):
+        async with AsyncSessionLocal() as session:
+            match_stmt = (
+                select(BrokerSession)
+                .join(Account, Account.id == BrokerSession.account_id)
+                .where(Account.zebu_uid == acc["zebu_uid"], BrokerSession.access_token_enc.isnot(None))
+            )
+            matched_bs = (await session.execute(match_stmt)).scalars().first()
+            if matched_bs:
+                return "Linked"
     if not t:
         return "Not linked"
     return "Linked"
@@ -640,6 +711,44 @@ async def put_user(name: str, request: Request, _=Depends(admin_only)):
 @app.get("/api/traders")
 async def get_traders(user=Depends(current_user)):
     all_traders = await DB._all_traders()
+    existing_ids = {t["id"] for t in all_traders}
+
+    # Automatically make all accounts connected or added in the website selectable in the trader/account list
+    accounts = await DB.get_all_accounts_async()
+    for acc in accounts:
+        aid = acc["id"]
+        uid = acc.get("zebu_uid") or aid
+        target_id = aid
+        if target_id not in existing_ids:
+            name = acc.get("name") or target_id
+            if uid and uid not in name and uid != target_id:
+                name = f"{name} ({uid})"
+            all_traders.append({
+                "id": target_id,
+                "name": name,
+                "ra": acc.get("trader") or "Arshiyan",
+                "style": "Manual",
+                "holding": "Intraday",
+                "segment": "Nifty options",
+                "testCapital": 300000.0,
+                "status": "Live" if (await link_state(acc)) == "Linked" else "Testing",
+                "start": "2026-11-14",
+            })
+            existing_ids.add(target_id)
+        if uid and uid not in existing_ids:
+            all_traders.append({
+                "id": uid,
+                "name": f"Account {uid}",
+                "ra": acc.get("trader") or "Arshiyan",
+                "style": "Manual",
+                "holding": "Intraday",
+                "segment": "Nifty options",
+                "testCapital": 300000.0,
+                "status": "Live" if (await link_state(acc)) == "Linked" else "Testing",
+                "start": "2026-11-14",
+            })
+            existing_ids.add(uid)
+
     if user["role"] == "admin":
         return all_traders
     elif user["role"] == "trader":
@@ -1097,7 +1206,16 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
 @app.get("/api/rules")
 async def get_rules(_=Depends(current_user)):
     all_rules = await DB._all_rules()
-    return {r["trader"]: {**engine.DEFAULT_RULES, **r["rules"]} for r in all_rules}
+    res = {r["trader"]: {**engine.DEFAULT_RULES, **r["rules"]} for r in all_rules}
+    accounts = await DB.get_all_accounts_async()
+    for acc in accounts:
+        aid = acc["id"]
+        uid = acc.get("zebu_uid")
+        if aid not in res:
+            res[aid] = engine.DEFAULT_RULES
+        if uid and uid not in res:
+            res[uid] = engine.DEFAULT_RULES
+    return res
 
 
 @app.put("/api/rules/{tid}")

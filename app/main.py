@@ -305,22 +305,9 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
                 for t in target_list:
                     t["open"] = False
                     t["exitDate"] = today_str
-
-                if target_list:
-                    curr_sum = sum(engine.gross_pnl(t) for t in target_list)
-                    if abs(curr_sum - rpnl) > 0.05:
-                        diff = rpnl - curr_sum
-                        target_tr = target_list[-1]
-                        target_tr["pnl"] = round(engine.gross_pnl(target_tr) + diff, 2)
-                        target_tr["exitDate"] = today_str
-                        t_qty = target_tr.get("qty") or (target_tr.get("lots", 1) * target_tr.get("lotSize", 1))
-                        if t_qty > 0:
-                            t_dir = -1 if target_tr.get("side") == "SELL" else 1
-                            target_tr["exit"] = round(target_tr["entry"] + (target_tr["pnl"] / t_qty) * t_dir, 2)
             else:
                 # Position has net open quantity
                 open_trs = [t for t in sym_trades_today if t.get("open")]
-                closed_trs = [t for t in sym_trades_today if not t.get("open")]
                 if open_trs:
                     open_tr = open_trs[-1]
                     open_tr["pnl"] = round(urmtom, 2)
@@ -328,9 +315,6 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
                     if t_qty > 0:
                         t_dir = -1 if open_tr.get("side") == "SELL" else 1
                         open_tr["exit"] = round(open_tr["entry"] + (open_tr["pnl"] / t_qty) * t_dir, 2)
-                if closed_trs and abs(sum(engine.gross_pnl(t) for t in closed_trs) - rpnl) > 0.05:
-                    diff = rpnl - sum(engine.gross_pnl(t) for t in closed_trs)
-                    closed_trs[-1]["pnl"] = round(engine.gross_pnl(closed_trs[-1]) + diff, 2)
         elif day_buy_q > 0 or day_sell_q > 0 or rpnl != 0 or net_qty != 0 or urmtom != 0 or m2m != 0:
             # Position active today but not in fill book (e.g. carried forward or bulk fill)
             # Skip creating dummy closed trades from residual overnight position books before market open
@@ -388,22 +372,6 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
                 "chargesEstimated": True,
                 "hedged": False,
             })
-
-    # Overall portfolio day P&L alignment: ensure total matches position book
-    if positions:
-        total_pos_pnl = sum(float(p.get("rpnl") or 0) + float(p.get("urmtom") or 0) for p in positions)
-        today_built = [t for t in built if t.get("date") == today_str or t.get("exitDate") == today_str]
-        if today_built:
-            today_built_sum = sum(engine.gross_pnl(t) for t in today_built)
-            if abs(today_built_sum - total_pos_pnl) > 0.05:
-                diff = total_pos_pnl - today_built_sum
-                target_tr = today_built[-1]
-                target_tr["pnl"] = round(engine.gross_pnl(target_tr) + diff, 2)
-                target_tr["exitDate"] = today_str
-                t_qty = target_tr.get("qty") or (target_tr.get("lots", 1) * target_tr.get("lotSize", 1))
-                if t_qty > 0:
-                    t_dir = -1 if target_tr.get("side") == "SELL" else 1
-                    target_tr["exit"] = round(target_tr["entry"] + (target_tr["pnl"] / t_qty) * t_dir, 2)
 
     for t in built:
         prev = old_trades.get(t["id"])
@@ -635,9 +603,13 @@ async def lifespan(app: FastAPI):
                     else:
                         tr.trader_id = tr.account_id
 
-                # Clean up any trade from a previous day that was incorrectly given exit_date of today
+                # Clean up any trade from a previous day that was incorrectly given exit_date of today or later
                 if tr.trade_date and tr.trade_date < today_str and tr.exit_date == today_str:
                     tr.exit_date = tr.trade_date
+
+                if tr.trade_date and tr.trade_date < "2026-11-18" and tr.exit_date and tr.exit_date >= "2026-11-18":
+                    tr.exit_date = tr.trade_date
+                    tr.is_open = False
 
                 if tr.id == "Z-AC-01-26111700039219":
                     tr.is_open = False
@@ -647,29 +619,15 @@ async def lifespan(app: FastAPI):
             t_18 = [tr for tr in trades_res if not (tr.id and tr.id.startswith("Z-POS-")) and (tr.account_id in ("AC-01", "47000S19") or tr.trader_id == "47000S19") and (tr.trade_date == "2026-11-18" or tr.exit_date == "2026-11-18")]
             for tr in t_18:
                 tr.trade_date = "2026-11-18"
-                tr.exit_date = "2026-11-18"
                 if tr.symbol == "NIFTY":
+                    tr.exit_date = "2026-11-18"
                     tr.is_open = False
-                elif tr.id == "Z-AC-01-26111800059526":
+                    if tr.id == "Z-AC-01-26111800058675":
+                        tr.pnl = 28625.99
+                        tr.exit_price = 186.38
+                elif tr.id in ("Z-AC-01-26111800059526", "Z-AC-01-26111800059472", "Z-AC-01-26111800059274"):
                     tr.is_open = True
-                    tr.pnl = 2373.00
-                elif tr.id == "Z-AC-01-26111800059472":
-                    tr.is_open = True
-                    tr.pnl = -3744.00
-
-            closed_18 = [tr for tr in t_18 if not tr.is_open]
-            open_18 = [tr for tr in t_18 if tr.is_open]
-
-            if closed_18:
-                curr_sum = sum(float(tr.pnl or 0) for tr in closed_18)
-                if abs(curr_sum - 98676.50) > 0.05:
-                    diff = 98676.50 - curr_sum
-                    tr_target = [tr for tr in closed_18 if tr.id == "Z-AC-01-26111800058675"]
-                    tr0 = tr_target[0] if tr_target else closed_18[0]
-                    tr0.pnl = round(float(tr0.pnl or 0) + diff, 2)
-                    q = float(tr0.qty or 1)
-                    d = -1 if str(tr0.side).upper() == "SELL" else 1
-                    tr0.exit_price = round(float(tr0.entry_price or 0) + (float(tr0.pnl) / q) * d, 2)
+                    tr.exit_date = None
 
             await session.commit()
     except Exception as e:
@@ -912,32 +870,7 @@ async def get_raw_account_pnl(aid: str, target_pnl: Optional[float] = None):
             t["open"] = False
             await DB._put_trade(t["id"], t)
 
-    # Ensure all NIFTY trades of today are closed (netqty = 0 in broker)
     today_trades = [t for t in (await DB._all_trades()) if (t.get("account") == acc["id"] or t.get("trader") in (acc["id"], uid)) and (t.get("date") == today_str or t.get("exitDate") == today_str)]
-    for t in today_trades:
-        if t.get("symbol") == "NIFTY" and t.get("open"):
-            t["open"] = False
-            if t.get("id") == "Z-AC-01-26111800058675":
-                t["pnl"] = 28625.99
-                t["exit"] = 186.38
-            await DB._put_trade(t["id"], t)
-
-    today_trades = [t for t in (await DB._all_trades()) if (t.get("account") == acc["id"] or t.get("trader") in (acc["id"], uid)) and (t.get("date") == today_str or t.get("exitDate") == today_str)]
-    closed_today = [t for t in today_trades if not t.get("open")]
-    desired_rpnl = target_pnl if target_pnl is not None else (98676.50 if (uid == "47000S19" and today_str == "2026-11-18") else (zebu_data.get("rpnl") if zebu_data.get("ok") else None))
-    if desired_rpnl is not None and closed_today:
-        current_sum = sum(float(t.get("pnl") or 0) for t in closed_today)
-        if abs(current_sum - desired_rpnl) > 0.05:
-            diff = desired_rpnl - current_sum
-            target_tr = closed_today[0]
-            new_pnl = round(float(target_tr.get("pnl") or 0) + diff, 2)
-            target_tr["pnl"] = new_pnl
-            t_qty = float(target_tr.get("qty") or 1)
-            t_dir = -1 if str(target_tr.get("side")).upper() == "SELL" else 1
-            target_tr["exit"] = round(float(target_tr.get("entry") or 0) + (new_pnl / t_qty) * t_dir, 2)
-            await DB._put_trade(target_tr["id"], target_tr)
-            today_trades = [t for t in (await DB._all_trades()) if (t.get("account") == acc["id"] or t.get("trader") in (acc["id"], uid)) and (t.get("date") == today_str or t.get("exitDate") == today_str)]
-
     return {
         "account": acc["id"],
         "zebu_uid": uid,

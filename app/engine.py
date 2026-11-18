@@ -240,7 +240,7 @@ def build_trades(
                 "oid": oid,
                 "tsym": f.get("tsym"),
                 "exch": f.get("exch", "NFO"),
-                "side": f.get("trantype"),
+                "side": "BUY" if str(f.get("trantype", "")).upper() in ("B", "BUY") else "SELL",
                 "prd": f.get("prd"),
                 "ls": int(_f(f.get("ls"), 1)) or 1,
                 "token": f.get("token"),
@@ -311,8 +311,10 @@ def build_trades(
             else:
                 exit_date, exit_time = last_ts.date(), last_ts.strftime("%H:%M")
 
-            buy_val = e["px"] * qty if o["side"] == "B" else exit_val
-            sell_val = exit_val if o["side"] == "B" else e["px"] * qty
+            is_buy = o["side"] == "BUY"
+            buy_val = e["px"] * qty if is_buy else exit_val
+            sell_val = exit_val if is_buy else e["px"] * qty
+            calc_pnl = (exit_px - e["px"]) * qty if is_buy else (e["px"] - exit_px) * qty
             n_orders = 1 + len({x[3] for x in e["exits"]})
             product = product_map.get(o["prd"], o["prd"] or "MIS")
 
@@ -330,12 +332,13 @@ def build_trades(
                 "expiryType": info.get("expiryType", ""),
                 "tsym": tsym,
                 "exch": o["exch"],
-                "side": "BUY" if o["side"] == "B" else "SELL",
+                "side": "BUY" if is_buy else "SELL",
                 "lots": round(qty / o["ls"], 2),
                 "lotSize": o["ls"],
                 "qty": qty,
                 "entry": round(e["px"], 2),
                 "exit": round(exit_px, 2),
+                "pnl": round(calc_pnl, 2),
                 "open": is_open,
                 "exitDate": exit_date.isoformat(),
                 "exitTime": exit_time,
@@ -369,8 +372,14 @@ def to_min(t: Any) -> int:
 
 
 def gross_pnl(t: dict) -> float:
-    d = -1 if t["side"] == "SELL" else 1
-    return (t["exit"] - t["entry"]) * t["lots"] * t["lotSize"] * d
+    if t.get("pnl") is not None:
+        try:
+            return float(t["pnl"])
+        except (ValueError, TypeError):
+            pass
+    d = -1 if t.get("side") == "SELL" else 1
+    q = t.get("qty") or (t.get("lots", 1) * t.get("lotSize", 1))
+    return (t.get("exit", 0.0) - t.get("entry", 0.0)) * q * d
 
 
 def net_pnl(t: dict) -> float:

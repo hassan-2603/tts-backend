@@ -276,11 +276,11 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
 
     built = engine.build_trades(acc, acc_fills, charges_cfg, product_map, is_algo_order, now, ltp)
 
-    # If PositionBook has positions with realized P&L or turnover not captured in fills, synthesize them
+    # Reconcile PositionBook data (authoritative broker P&L) with built trades
     built_symbols = {t.get("tsym") for t in built if t.get("tsym")}
     for p in positions:
         tsym = p.get("tsym")
-        if not tsym or tsym in built_symbols:
+        if not tsym:
             continue
         day_buy_q = float(p.get("daybuyqty") or 0)
         day_sell_q = float(p.get("daysellqty") or 0)
@@ -288,16 +288,38 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
         urmtom = float(p.get("urmtom") or 0)
         net_qty = float(p.get("netqty") or 0)
         lp = float(p.get("lp") or 0)
-        if day_buy_q > 0 or day_sell_q > 0 or rpnl != 0 or net_qty != 0:
+        net_pos_pnl = rpnl + urmtom
+
+        sym_trades_today = [t for t in built if t.get("tsym") == tsym and (t.get("date") == today_str or t.get("exitDate") == today_str)]
+        if sym_trades_today:
+            # Reconcile built trades P&L to match Zebu's exact position book P&L
+            built_pnl_sum = sum(engine.gross_pnl(t) for t in sym_trades_today)
+            if abs(built_pnl_sum - net_pos_pnl) > 1.0:
+                diff = net_pos_pnl - built_pnl_sum
+                target_tr = sym_trades_today[-1]
+                target_tr["pnl"] = round(engine.gross_pnl(target_tr) + diff, 2)
+                target_tr["exitDate"] = today_str
+        elif day_buy_q > 0 or day_sell_q > 0 or rpnl != 0 or net_qty != 0 or urmtom != 0:
+            # Position active today but not in fill book (e.g. carried forward or bulk fill)
             parsed = engine.parse_instrument(tsym)
             qty = max(day_buy_q, day_sell_q, abs(net_qty))
             ls = int(p.get("ls") or parsed.get("lotSize") or 1) or 1
             lots = round(qty / ls, 2)
-            buy_amt = float(p.get("daybuyamt") or 0)
-            sell_amt = float(p.get("daysellamt") or 0)
-            entry_px = round(buy_amt / day_buy_q, 2) if day_buy_q > 0 else (lp if net_qty < 0 else 0)
-            exit_px = round(sell_amt / day_sell_q, 2) if day_sell_q > 0 else lp
-            is_open = net_qty != 0
+            is_open = (net_qty != 0)
+            is_buy = (day_buy_q >= day_sell_q) if (day_buy_q != day_sell_q) else (net_qty >= 0)
+
+            buy_px = (float(p.get("daybuyamt") or 0) / day_buy_q) if day_buy_q > 0 else float(p.get("openprc") or p.get("netavgprc") or lp)
+            sell_px = (float(p.get("daysellamt") or 0) / day_sell_q) if day_sell_q > 0 else lp
+
+            if is_buy:
+                entry_px = buy_px
+                exit_px = sell_px if not is_open else lp
+                side_str = "BUY"
+            else:
+                entry_px = sell_px
+                exit_px = buy_px if not is_open else lp
+                side_str = "SELL"
+
             built.append({
                 "id": f"Z-POS-{acc['id']}-{tsym}",
                 "origin": "zebu",
@@ -312,12 +334,13 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
                 "expiryType": parsed.get("expiryType", ""),
                 "tsym": tsym,
                 "exch": p.get("exch", "NFO"),
-                "side": "BUY" if day_buy_q >= day_sell_q else "SELL",
+                "side": side_str,
                 "lots": lots,
                 "lotSize": ls,
                 "qty": qty,
-                "entry": entry_px,
-                "exit": exit_px,
+                "entry": round(entry_px, 2),
+                "exit": round(exit_px, 2),
+                "pnl": round(net_pos_pnl, 2),
                 "open": is_open,
                 "exitDate": today_str,
                 "exitTime": "OPEN" if is_open else "15:30",
@@ -339,7 +362,7 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
         t.pop("_ts", None)
 
     for tid, t in old_trades.items():
-        if t["date"] >= cutoff:
+        if t["date"] >= cutoff or (t.get("exitDate") and t.get("exitDate") >= cutoff):
             await DB._delete_trade(tid)
 
     await DB._put_many_trades([(t["id"], t) for t in built])

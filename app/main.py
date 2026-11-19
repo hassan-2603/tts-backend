@@ -239,7 +239,7 @@ async def any_token_async() -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-async def poll_account_async(acc: dict, now: datetime) -> str:
+async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = False) -> str:
     """Fetches OrderBook, TradeBook, and PositionBook for an account, reconciles open/closed trades, and evaluates rules."""
     aid = acc["id"]
     now_utc = datetime.now(timezone.utc)
@@ -384,49 +384,16 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
         if open_scrips:
             await CONN_MGR.subscribe_account_touchline(aid, open_scrips)
 
-    # 3. Synthesize fills from partially executed orders in OrderBook if not yet in TradeBook
+    # 3. Persist genuine TradeBook fills only (purge any legacy PARTIAL-* synthetic fills or -PB- trades that double-counted qty)
+    await DB.purge_synthetic_fills_and_pb_trades_async(aid, today_str, unlock_today=reconcile_today)
+
     fill_items = []
-    seen_order_fill_qty: Dict[str, Decimal] = {}
     for f in fills:
         ord_no = str(f.get("norenordno") or "")
         fid = f"{aid}|{ord_no}|{f.get('flid') or f.get('fltm')}"
         ft = engine.parse_ts(f.get("fltm"), f.get("exch_tm"), f.get("norentm"))
         f_day = ft.date().isoformat() if ft else today_str
         fill_items.append((fid, {**f, "_acc": aid, "_day": f_day}))
-        if ord_no:
-            q_dec = engine._dec(f.get("flqty") or f.get("fillshares"), Decimal("0"))
-            seen_order_fill_qty[ord_no] = seen_order_fill_qty.get(ord_no, Decimal("0")) + q_dec
-
-    for o in orders:
-        ord_no = str(o.get("norenordno") or "")
-        if not ord_no:
-            continue
-        filled_q = engine._dec(o.get("fillshares") or o.get("flqty"), Decimal("0"))
-        avg_p = engine._dec(o.get("avgprc") or o.get("flprc") or o.get("prc"), Decimal("0"))
-        already_q = seen_order_fill_qty.get(ord_no, Decimal("0"))
-        if filled_q > already_q and avg_p > Decimal("0"):
-            diff_q = filled_q - already_q
-            ot = engine.parse_ts(o.get("norentm"), o.get("exch_tm"), o.get("ordenttm")) or now
-            o_day = ot.date().isoformat()
-            synth_fid = f"{aid}|{ord_no}|PARTIAL-{filled_q}"
-            synth_fill = {
-                "norenordno": ord_no,
-                "flid": f"PARTIAL-{filled_q}",
-                "tsym": o.get("tsym"),
-                "exch": o.get("exch", "NFO"),
-                "trantype": o.get("trantype"),
-                "prd": o.get("prd", "I"),
-                "flqty": str(diff_q),
-                "flprc": str(avg_p),
-                "ls": o.get("ls", "1"),
-                "fltm": ot.strftime("%d-%m-%Y %H:%M:%S"),
-                "ordersource": o.get("ordersource", ""),
-                "remarks": o.get("remarks", ""),
-                "token": o.get("token"),
-                "_acc": aid,
-                "_day": o_day,
-            }
-            fill_items.append((synth_fid, synth_fill))
 
     if fill_items:
         await DB._put_many_fills(fill_items)
@@ -670,7 +637,7 @@ async def poll_all_async(reason: str = "schedule") -> dict:
 
     async def _sync_one(acc_dict):
         async def _sync_single(a=acc_dict):
-            return await poll_account_async(a, now)
+            return await poll_account_async(a, now, reconcile_today=(reason == "manual"))
         res = await CONN_MGR.sync_account_bounded(acc_dict, _sync_single)
         return acc_dict["id"], res
 
@@ -1367,7 +1334,7 @@ async def get_raw_account_pnl(aid: str, _=Depends(current_user)):
                 "positions_count": len(positions),
                 "positions": positions,
             }
-            poll_result = await poll_account_async(acc, now_ist())
+            poll_result = await poll_account_async(acc, now_ist(), reconcile_today=True)
         except Exception as e:
             zebu_data = {"ok": False, "error": str(e), "error_type": type(e).__name__}
             poll_result = f"error: {e}"
@@ -2238,7 +2205,7 @@ async def sync_now(request: Request, account: Optional[str] = None, _=Depends(cu
         if acc:
             now = now_ist()
             try:
-                res = await poll_account_async(acc, now)
+                res = await poll_account_async(acc, now, reconcile_today=True)
             except SessionExpired:
                 res = "expired"
             except Exception as e:

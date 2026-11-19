@@ -1338,6 +1338,33 @@ class Store:
             "archived_at": t.archived_at.isoformat() if getattr(t, "archived_at", None) else None,
         }
 
+    async def purge_synthetic_fills_and_pb_trades_async(self, aid: str, today_str: str, unlock_today: bool = False) -> int:
+        """Remove any legacy PARTIAL-* synthetic fills and -PB- synthetic trades that could double-count quantities."""
+        removed = 0
+        async with AsyncSessionLocal() as session:
+            r1 = await session.execute(
+                sa_delete(Fill).where(Fill.account_id == aid, Fill.flid.like("PARTIAL-%"))
+            )
+            r2 = await session.execute(
+                sa_delete(Trade).where(Trade.account_id == aid, Trade.id.like("%-PB-%"))
+            )
+            removed = (r1.rowcount or 0) + (r2.rowcount or 0)
+            if removed > 0 or unlock_today:
+                # Unlock today's trades and today's daily report for this account so they rebuild cleanly from real fills
+                await session.execute(
+                    sa_update(Trade)
+                    .where(Trade.account_id == aid, (Trade.trade_date == today_str) | (Trade.exit_date == today_str))
+                    .values(is_finalized=False)
+                )
+                await session.execute(
+                    sa_delete(DailyAccountReport).where(
+                        DailyAccountReport.account_id == aid,
+                        DailyAccountReport.trade_date == today_str,
+                    )
+                )
+            await session.commit()
+        return removed
+
     async def _all_fills(self, account_id: Optional[str] = None) -> List[Dict[str, Any]]:
         async with AsyncSessionLocal() as session:
             stmt = select(Fill)

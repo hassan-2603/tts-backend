@@ -1336,18 +1336,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/api/test-proxy")
 async def test_proxy(proxy: str = ""):
-    import socket
-    p = proxy
     t0 = time.time()
     tcp_results = {}
     http_res = None
-    if p:
-        try:
-            async with httpx.AsyncClient(proxy=p, timeout=12.0) as cl:
-                r = await cl.get("https://api.ipify.org?format=json")
-                http_res = {"ok": True, "ip": r.json().get("ip")}
-        except Exception as e:
-            http_res = {"ok": False, "error": str(e), "type": type(e).__name__}
+    try:
+        p = ZEBU._clean_proxy(proxy)
+        async with httpx.AsyncClient(proxy=p, timeout=12.0) as cl:
+            r = await cl.get("https://api.ipify.org?format=json")
+            http_res = {"ok": True, "ip": r.json().get("ip"), "via_proxy": bool(p)}
+    except Exception as e:
+        http_res = {"ok": False, "error": str(e), "type": type(e).__name__}
 
     sec_preview = (CFG.ZEBU_SECRET_KEY[:4] + "..." + CFG.ZEBU_SECRET_KEY[-4:]) if len(CFG.ZEBU_SECRET_KEY) >= 8 else "NOT_SET"
     cid_cfg = CFG.ZEBU_CLIENT_ID or "NOT_SET"

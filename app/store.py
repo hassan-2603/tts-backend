@@ -863,10 +863,15 @@ class Store:
             acc = (await session.execute(stmt)).scalar_one_or_none()
             z_uid = acc.zebu_uid if acc else None
 
+            # Delete child delivery logs for any alerts belonging to this account first
+            alert_ids = (await session.execute(select(Alert.id).where(Alert.account_id == aid))).scalars().all()
+            if alert_ids:
+                await session.execute(sa_delete(AlertDeliveryLog).where(AlertDeliveryLog.alert_id.in_(alert_ids)))
+
             await session.execute(sa_delete(BrokerSession).where(BrokerSession.account_id == aid))
             await session.execute(sa_delete(AccountSyncState).where(AccountSyncState.account_id == aid))
+            await session.execute(sa_delete(ProcessedBrokerEvent).where(ProcessedBrokerEvent.account_id == aid))
             await session.execute(sa_delete(DailyAccountReport).where(DailyAccountReport.account_id == aid))
-            await session.execute(sa_delete(DailySyncRecord).where(DailySyncRecord.account_id == aid))
             await session.execute(sa_delete(Order).where(Order.account_id == aid))
             await session.execute(sa_delete(Position).where(Position.account_id == aid))
             await session.execute(sa_delete(PositionLot).where(PositionLot.account_id == aid))
@@ -878,7 +883,8 @@ class Store:
             await session.execute(sa_delete(LinkNonce).where(LinkNonce.account_id == aid))
             await session.execute(sa_delete(Account).where(Account.id == aid))
 
-            # If a Trader profile was auto-created with the exact same ID as this account ID (or its zebu_uid if unused), remove it too
+            # Unassign any other accounts pointing to aid as trader_id before removing auto-created Trader row
+            await session.execute(sa_update(Account).where(Account.trader_id == aid).values(trader_id=None))
             await session.execute(sa_delete(Trader).where(Trader.id == aid))
             if z_uid and z_uid != aid:
                 rem_acc = (await session.execute(select(Account).where((Account.zebu_uid == z_uid) | (Account.trader_id == z_uid)))).scalars().first()
@@ -905,19 +911,18 @@ class Store:
             ).scalars().all()
             matching_aids = [a.id for a in matching_accs]
 
-            await session.execute(sa_delete(Trader).where(Trader.id == tid))
-            await session.execute(sa_delete(TradingRule).where((TradingRule.trader_id == tid) | (TradingRule.account_id == tid)))
-            await session.execute(sa_delete(RuleLog).where(RuleLog.trader_id == tid))
-            await session.execute(sa_delete(Trade).where((Trade.trader_id == tid) | (Trade.account_id == tid)))
-            await session.execute(sa_delete(DailyAccountReport).where((DailyAccountReport.trader_id == tid) | (DailyAccountReport.account_id == tid)))
-            await session.execute(sa_delete(Alert).where((Alert.trader_id == tid) | (Alert.account_id == tid)))
+            # 1. Unassign any other broker accounts that pointed to this trader BEFORE deleting Trader
+            await session.execute(sa_update(Account).where(Account.trader_id == tid).values(trader_id=None))
 
-            # Clean up any broker accounts whose id or zebu_uid was tid so get_traders() does not re-create them
+            # 2. Clean up matching broker accounts and their child records
             for aid in matching_aids:
+                a_alert_ids = (await session.execute(select(Alert.id).where(Alert.account_id == aid))).scalars().all()
+                if a_alert_ids:
+                    await session.execute(sa_delete(AlertDeliveryLog).where(AlertDeliveryLog.alert_id.in_(a_alert_ids)))
                 await session.execute(sa_delete(BrokerSession).where(BrokerSession.account_id == aid))
                 await session.execute(sa_delete(AccountSyncState).where(AccountSyncState.account_id == aid))
+                await session.execute(sa_delete(ProcessedBrokerEvent).where(ProcessedBrokerEvent.account_id == aid))
                 await session.execute(sa_delete(DailyAccountReport).where(DailyAccountReport.account_id == aid))
-                await session.execute(sa_delete(DailySyncRecord).where(DailySyncRecord.account_id == aid))
                 await session.execute(sa_delete(Order).where(Order.account_id == aid))
                 await session.execute(sa_delete(Position).where(Position.account_id == aid))
                 await session.execute(sa_delete(PositionLot).where(PositionLot.account_id == aid))
@@ -928,10 +933,16 @@ class Store:
                 await session.execute(sa_delete(LinkNonce).where(LinkNonce.account_id == aid))
                 await session.execute(sa_delete(Account).where(Account.id == aid))
 
-            # Unassign any other broker accounts that pointed to this trader
-            assigned_accs = (await session.execute(select(Account).where(Account.trader_id == tid))).scalars().all()
-            for a in assigned_accs:
-                a.trader_id = None
+            # 3. Delete trader's child records and finally the Trader row itself
+            t_alert_ids = (await session.execute(select(Alert.id).where((Alert.trader_id == tid) | (Alert.account_id == tid)))).scalars().all()
+            if t_alert_ids:
+                await session.execute(sa_delete(AlertDeliveryLog).where(AlertDeliveryLog.alert_id.in_(t_alert_ids)))
+            await session.execute(sa_delete(TradingRule).where((TradingRule.trader_id == tid) | (TradingRule.account_id == tid)))
+            await session.execute(sa_delete(RuleLog).where(RuleLog.trader_id == tid))
+            await session.execute(sa_delete(Trade).where((Trade.trader_id == tid) | (Trade.account_id == tid)))
+            await session.execute(sa_delete(DailyAccountReport).where((DailyAccountReport.trader_id == tid) | (DailyAccountReport.account_id == tid)))
+            await session.execute(sa_delete(Alert).where((Alert.trader_id == tid) | (Alert.account_id == tid)))
+            await session.execute(sa_delete(Trader).where(Trader.id == tid))
 
             await session.commit()
 

@@ -272,7 +272,7 @@ class ZebuClient:
         if endpoint not in READ_ONLY_ENDPOINTS:
             raise PermissionError(f"{endpoint} is not allowed — tracking software is strictly read-only")
 
-        headers = {"Content-Type": "text/plain"}
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         body = "jData=" + json.dumps(payload, separators=(",", ":"))
@@ -319,7 +319,7 @@ class ZebuClient:
         if endpoint not in READ_ONLY_ENDPOINTS:
             raise PermissionError(f"{endpoint} is not allowed — tracking software is strictly read-only")
 
-        headers = {"Content-Type": "text/plain"}
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         body = "jData=" + json.dumps(payload, separators=(",", ":"))

@@ -196,10 +196,23 @@ def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
 
 
 async def token_for_account_async(acc_id: str) -> Optional[str]:
-    """Returns valid access token strictly for the specified account ID."""
+    """Returns valid access token for the account (checking both account.id and zebu_uid)."""
     async with AsyncSessionLocal() as session:
         stmt = select(BrokerSession).where(BrokerSession.account_id == acc_id)
         bs = (await session.execute(stmt)).scalar_one_or_none()
+        if not bs or not bs.access_token_enc:
+            acc_stmt = select(Account).where((Account.id == acc_id) | (Account.zebu_uid == acc_id))
+            cur_acc = (await session.execute(acc_stmt)).scalars().first()
+            if cur_acc and cur_acc.zebu_uid:
+                match_stmt = (
+                    select(BrokerSession)
+                    .join(Account, Account.id == BrokerSession.account_id)
+                    .where(
+                        (Account.zebu_uid == cur_acc.zebu_uid) | (BrokerSession.account_id == cur_acc.zebu_uid),
+                        BrokerSession.access_token_enc.isnot(None),
+                    )
+                )
+                bs = (await session.execute(match_stmt)).scalars().first()
         if not bs or not bs.access_token_enc:
             return None
         if bs.status in ("Not linked", "Disconnected", "Login expired", "REAUTH_REQUIRED"):
@@ -256,8 +269,8 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
             ZEBU.order_book_async(tok, uid, proxy=proxy_url),
             return_exceptions=True,
         )
-        # Check if primary endpoints raised SessionExpired
-        for r in (fills_res, positions_res, orders_res):
+        # Check if primary endpoints (TradeBook or PositionBook) raised SessionExpired
+        for r in (fills_res, positions_res):
             if isinstance(r, SessionExpired):
                 raise r
 
@@ -1531,9 +1544,26 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
         "expires_at": time.time() + exp_in,
         "linked_at": now_ist().isoformat(timespec="seconds"),
         "status": "Linked",
+        "ws_status": "REAL-TIME",
         "cliname": cliname,
+        "sync_message": "Connected to Zebu",
     }
     await DB.put_token_async(aid, doc)
+    # Also update any other account row sharing the same zebu_uid (e.g. AC-01 and 47000S19) and clear any old expired/stale flags
+    all_acc = await DB.get_all_accounts_async()
+    for a_row in all_acc:
+        if a_row["id"] == aid or (clean_uid and (a_row.get("zebu_uid") or "").upper() == clean_uid):
+            await DB.put_token_async(a_row["id"], doc)
+            await DB.put_sync_state_async(a_row["id"], {
+                "status": "LIVE",
+                "is_stale": False,
+                "last_error": None,
+                "consecutive_failures": 0,
+                "circuit_open": False,
+            })
+            st_obj = CONN_MGR.get_account_state(a_row["id"])
+            st_obj.record_success()
+            st_obj.status = "REAL-TIME"
     acc["zebu_uid"] = clean_uid
     acc["zebu_actid"] = clean_actid
     await DB.put_account_async(aid, acc)
@@ -1587,9 +1617,9 @@ async def zebu_start(request: Request, n: str = "", account: str = "", fe: str =
     if not d or d.get("exp", 0) < time.time():
         return HTMLResponse("<h3>Link expired. Go back to the dashboard and click Connect Zebu again.</h3>", 400)
 
-    cb_url = f"{CFG.PUBLIC_URL.rstrip('/')}/auth/zebu/callback"
-    if "localhost" in CFG.PUBLIC_URL and "onrender.com" in str(request.base_url):
-        cb_url = "https://tts-backend-ezm3.onrender.com/auth/zebu/callback"
+    cb_url = "https://tts-backend-ezm3.onrender.com/auth/zebu/callback"
+    if "localhost" in str(request.base_url) or "127.0.0.1" in str(request.base_url):
+        cb_url = f"{CFG.PUBLIC_URL.rstrip('/')}/auth/zebu/callback"
     client_id = d.get("client_id") or CFG.ZEBU_CLIENT_ID
     clean_cid = client_id.strip() if client_id else ""
     if clean_cid and not clean_cid.endswith("_U") and "_" not in clean_cid:
@@ -1709,9 +1739,26 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
         "expires_at": time.time() + exp_in,
         "linked_at": now_ist().isoformat(timespec="seconds"),
         "status": "Linked",
+        "ws_status": "REAL-TIME",
         "cliname": cliname,
+        "sync_message": "Connected to Zebu",
     }
     await DB.put_token_async(d["account"], doc)
+    # Also update any other account row sharing the same zebu_uid (e.g. AC-01 and 47000S19) and clear any old expired/stale flags
+    all_acc = await DB.get_all_accounts_async()
+    for a_row in all_acc:
+        if a_row["id"] == acc["id"] or (clean_uid and (a_row.get("zebu_uid") or "").upper() == clean_uid):
+            await DB.put_token_async(a_row["id"], doc)
+            await DB.put_sync_state_async(a_row["id"], {
+                "status": "LIVE",
+                "is_stale": False,
+                "last_error": None,
+                "consecutive_failures": 0,
+                "circuit_open": False,
+            })
+            st_obj = CONN_MGR.get_account_state(a_row["id"])
+            st_obj.record_success()
+            st_obj.status = "REAL-TIME"
     acc["zebu_uid"] = clean_uid
     acc["zebu_actid"] = clean_actid
     await DB.put_account_async(acc["id"], acc)

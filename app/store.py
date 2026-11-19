@@ -241,6 +241,15 @@ class Store:
         async with AsyncSessionLocal() as session:
             stmt = select(BrokerSession).where(BrokerSession.account_id == aid)
             bs = (await session.execute(stmt)).scalar_one_or_none()
+            if not bs or not bs.access_token_enc:
+                acc_stmt = select(Account).where((Account.id == aid) | (Account.zebu_uid == aid))
+                cur_acc = (await session.execute(acc_stmt)).scalars().first()
+                if cur_acc and cur_acc.zebu_uid:
+                    other_stmt = select(BrokerSession).join(Account, Account.id == BrokerSession.account_id).where(
+                        (Account.zebu_uid == cur_acc.zebu_uid) | (Account.id == cur_acc.id) | (BrokerSession.account_id == cur_acc.zebu_uid),
+                        BrokerSession.access_token_enc.isnot(None),
+                    )
+                    bs = (await session.execute(other_stmt)).scalars().first()
             if not bs:
                 return None
             exp_dt = bs.expires_at
@@ -326,7 +335,17 @@ class Store:
 
     async def delete_token_async(self, aid: str):
         async with AsyncSessionLocal() as session:
-            await session.execute(sa_delete(BrokerSession).where(BrokerSession.account_id == aid))
+            acc_stmt = select(Account).where((Account.id == aid) | (Account.zebu_uid == aid))
+            cur_acc = (await session.execute(acc_stmt)).scalars().first()
+            target_ids = {aid}
+            if cur_acc:
+                target_ids.add(cur_acc.id)
+                if cur_acc.zebu_uid:
+                    target_ids.add(cur_acc.zebu_uid)
+                    same_uid_stmt = select(Account.id).where(Account.zebu_uid == cur_acc.zebu_uid)
+                    for row_id in (await session.execute(same_uid_stmt)).scalars().all():
+                        target_ids.add(row_id)
+            await session.execute(sa_delete(BrokerSession).where(BrokerSession.account_id.in_(list(target_ids))))
             await session.commit()
 
     # ---------------- Account Sync State & Daily Reports ----------------

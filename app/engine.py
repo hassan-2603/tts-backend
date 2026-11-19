@@ -301,10 +301,14 @@ def build_trades(
         if lp_val is not None and lp_val > Decimal("0") and tsym not in ltp:
             ltp[tsym] = float(lp_val)
 
-    # 1. Group fills by order ID
+    # 1. Group fills by order ID (deduplicating identical fills by order_no + flid)
     orders = {}
+    seen_fill_keys = set()
     for idx_f, f in enumerate(fills):
         oid = str(f.get("norenordno") or f.get("flid") or f"O-{idx_f}-{f.get('fltm', '')}")
+        flid_raw = str(f.get("flid") or "").strip()
+        if flid_raw.startswith("PARTIAL-"):
+            continue
         ts = parse_ts(f.get("fltm"), f.get("exch_tm"), f.get("norentm"), f.get("ordenttm"))
         if not ts and f.get("_day"):
             ts = parse_ts(f"{f['_day']} 09:15:00")
@@ -314,6 +318,11 @@ def build_trades(
         p = _dec(f.get("flprc") or f.get("avgprc") or f.get("prc"), Decimal("0"))
         if q <= Decimal("0"):
             continue
+        if flid_raw:
+            dedup_f = (oid, flid_raw)
+            if dedup_f in seen_fill_keys:
+                continue
+            seen_fill_keys.add(dedup_f)
         o = orders.setdefault(
             oid,
             {

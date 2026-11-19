@@ -384,19 +384,28 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
         if open_scrips:
             await CONN_MGR.subscribe_account_touchline(aid, open_scrips)
 
-    # 3. Persist genuine TradeBook fills only (purge any legacy PARTIAL-* synthetic fills or -PB- trades that double-counted qty)
+    # 3. Persist genuine TradeBook fills only (atomically replace today's fills when TradeBook is non-empty so duplicates can never accumulate)
     await DB.purge_synthetic_fills_and_pb_trades_async(aid, today_str, unlock_today=reconcile_today)
 
     fill_items = []
+    seen_fids = set()
     for f in fills:
         ord_no = str(f.get("norenordno") or "")
         fid = f"{aid}|{ord_no}|{f.get('flid') or f.get('fltm')}"
+        if fid in seen_fids:
+            continue
+        seen_fids.add(fid)
         ft = engine.parse_ts(f.get("fltm"), f.get("exch_tm"), f.get("norentm"))
         f_day = ft.date().isoformat() if ft else today_str
         fill_items.append((fid, {**f, "_acc": aid, "_day": f_day}))
 
     if fill_items:
-        await DB._put_many_fills(fill_items)
+        today_fill_items = [it for it in fill_items if it[1].get("_day") == today_str]
+        other_fill_items = [it for it in fill_items if it[1].get("_day") != today_str]
+        if today_fill_items:
+            await DB.replace_day_fills_async(aid, today_str, today_fill_items)
+        if other_fill_items:
+            await DB._put_many_fills(other_fill_items)
 
     # 4. Build trades from account fills while strictly preserving finalized historical trades
     ltp = {}
@@ -567,6 +576,23 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
                 "chargesEstimated": True,
                 "hedged": False,
             })
+
+    # Remove ghost open positions for contracts that have already expired (< today_str) or have netqty == 0 in PositionBook
+    pos_net_by_sym = {}
+    for p in positions:
+        tsym_p = p.get("tsym")
+        if tsym_p:
+            pos_net_by_sym[tsym_p] = pos_net_by_sym.get(tsym_p, 0.0) + float(p.get("netqty") or 0)
+    built = [
+        t for t in built
+        if not (
+            t.get("open")
+            and (
+                (t.get("expiry") and str(t["expiry"]) < today_str)
+                or (t.get("tsym") in pos_net_by_sym and pos_net_by_sym[t["tsym"]] == 0.0)
+            )
+        )
+    ]
 
     # Resolve spot price at entry (bounded timeout so slow candle API never blocks trade sync)
     for t in built:

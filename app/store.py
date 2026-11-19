@@ -1338,6 +1338,16 @@ class Store:
             "archived_at": t.archived_at.isoformat() if getattr(t, "archived_at", None) else None,
         }
 
+    async def replace_day_fills_async(self, aid: str, today_str: str, items: List[Tuple[str, Dict[str, Any]]]):
+        """Atomically replace today's fills for an account with the authoritative live TradeBook snapshot to prevent any duplicate fills."""
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                sa_delete(Fill).where(Fill.account_id == aid, Fill.trade_day == today_str)
+            )
+            await session.commit()
+        if items:
+            await self._put_many_fills(items)
+
     async def purge_synthetic_fills_and_pb_trades_async(self, aid: str, today_str: str, unlock_today: bool = False) -> int:
         """Remove any legacy PARTIAL-* synthetic fills and -PB- synthetic trades that could double-count quantities."""
         removed = 0

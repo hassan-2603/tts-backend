@@ -1469,6 +1469,7 @@ async def put_trader(tid: str, request: Request, _=Depends(admin_only)):
     await DB._put_trader(tid, d)
     if not await DB._get_rule(tid):
         await DB._put_rule(tid, {"trader": tid, "rules": engine.DEFAULT_RULES})
+    asyncio.create_task(WS_HUB.broadcast({"type": "state_updated", "entity": "traders"}))
     return d
 
 
@@ -1476,6 +1477,7 @@ async def put_trader(tid: str, request: Request, _=Depends(admin_only)):
 async def delete_trader(tid: str, _=Depends(admin_only)):
     await CONN_MGR.unregister_account(tid)
     await DB.delete_trader_permanent_async(tid)
+    asyncio.create_task(WS_HUB.broadcast({"type": "state_updated", "entity": "traders"}))
     return {"ok": True}
 
 
@@ -1488,6 +1490,7 @@ async def delete_traders_bulk(request: Request, _=Depends(admin_only)):
         await CONN_MGR.unregister_account(tid)
         await DB.delete_trader_permanent_async(tid)
         count += 1
+    asyncio.create_task(WS_HUB.broadcast({"type": "state_updated", "entity": "traders"}))
     return {"ok": True, "deleted": count}
 
 
@@ -1563,6 +1566,7 @@ async def put_account(aid: str, request: Request, _=Depends(admin_only)):
     if not await DB._get_rule(aid):
         base_rule = (await DB._get_rule(doc.get("trader") or "")) if doc.get("trader") else None
         await DB._put_rule(aid, {"trader": aid, "account": aid, "rules": (base_rule or {}).get("rules") or engine.DEFAULT_RULES})
+    asyncio.create_task(WS_HUB.broadcast({"type": "state_updated", "entity": "accounts"}))
     safe_ret = {k: v for k, v in doc.items() if k != "zebu_secret_key"}
     return safe_ret
 
@@ -1571,6 +1575,7 @@ async def put_account(aid: str, request: Request, _=Depends(admin_only)):
 async def delete_account(aid: str, _=Depends(admin_only)):
     await CONN_MGR.unregister_account(aid)
     await DB.delete_account_permanent_async(aid)
+    asyncio.create_task(WS_HUB.broadcast({"type": "state_updated", "entity": "accounts"}))
     return {"ok": True}
 
 
@@ -1583,6 +1588,7 @@ async def delete_accounts_bulk(request: Request, _=Depends(admin_only)):
         await CONN_MGR.unregister_account(aid)
         await DB.delete_account_permanent_async(aid)
         count += 1
+    asyncio.create_task(WS_HUB.broadcast({"type": "state_updated", "entity": "accounts"}))
     return {"ok": True, "deleted": count}
 
 

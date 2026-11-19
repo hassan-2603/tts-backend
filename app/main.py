@@ -1162,36 +1162,8 @@ async def lifespan(app: FastAPI):
     if not settings_existing:
         await DB._put_setting("main", DEFAULT_SETTINGS)
 
-    # 3. Ensure every configured account has a corresponding trader profile and rule book entry (zero hardcoded trade tampering)
+    # 3. Run startup recovery for midnight archiving and past unfinalized trading days (Req 3.8, 3.9, 9.6)
     try:
-        all_acc = await DB.get_all_accounts_async()
-        existing_traders = {t["id"]: t for t in (await DB._all_traders())}
-        for acc in all_acc:
-            aid = acc["id"]
-            uid = acc.get("zebu_uid")
-            for target_id in filter(None, [aid, uid, acc.get("trader")]):
-                if target_id not in existing_traders:
-                    name = acc.get("name") or target_id
-                    if uid and uid not in name and uid != target_id:
-                        name = f"{name} ({uid})"
-                    t_doc = {
-                        "id": target_id,
-                        "name": name,
-                        "ra": acc.get("trader") or "",
-                        "style": "Manual",
-                        "holding": "Intraday",
-                        "segment": "Nifty options",
-                        "testCapital": 0.0,
-                        "status": "Live" if (await link_state(acc)) == "Linked" else "Testing",
-                        "start": now_ist().date().isoformat(),
-                    }
-                    await DB._put_trader(target_id, t_doc)
-                    existing_traders[target_id] = t_doc
-
-                if not await DB._get_rule(target_id):
-                    await DB._put_rule(target_id, {"trader": target_id, "account": aid, "rules": engine.DEFAULT_RULES})
-
-        # Run startup recovery for midnight archiving and past unfinalized trading days (Req 3.8, 3.9, 9.6)
         await midnight_archive_async(now_ist())
     except Exception as e:
         log.error(f"Startup recovery notice in lifespan: {e}")
@@ -1479,42 +1451,7 @@ def _resolve_token_doc_fast(acc: dict, tokens_by_id: Dict[str, dict], tokens_by_
 
 @app.get("/api/traders")
 async def get_traders(user=Depends(current_user)):
-    all_traders, accounts, tokens_list = await asyncio.gather(
-        DB._all_traders(),
-        DB.get_all_accounts_async(),
-        DB._all_tokens(),
-    )
-    existing_ids = {t["id"] for t in all_traders}
-    tokens_by_id = {t["account"]: t for t in tokens_list}
-    uid_by_aid = {a["id"]: (a.get("zebu_uid") or "").strip().upper() for a in accounts}
-    tokens_by_uid = {}
-    for t in tokens_list:
-        if t.get("access_token"):
-            u = uid_by_aid.get(t["account"]) or t["account"].upper()
-            if u:
-                tokens_by_uid[u] = t
-
-    for acc in accounts:
-        aid = acc["id"]
-        uid = acc.get("zebu_uid") or aid
-        t_doc = _resolve_token_doc_fast(acc, tokens_by_id, tokens_by_uid)
-        l_state = _link_state_from_doc(t_doc)
-        if aid not in existing_ids:
-            name = acc.get("name") or aid
-            if uid and uid not in name and uid != aid:
-                name = f"{name} ({uid})"
-            all_traders.append({
-                "id": aid,
-                "name": name,
-                "ra": acc.get("trader") or "",
-                "style": "Manual",
-                "holding": "Intraday",
-                "segment": "Nifty options",
-                "testCapital": 0.0,
-                "status": "Live" if l_state == "Linked" else "Testing",
-                "start": now_ist().date().isoformat(),
-            })
-            existing_ids.add(aid)
+    all_traders = await DB._all_traders()
 
     if user["role"] == "admin":
         return all_traders

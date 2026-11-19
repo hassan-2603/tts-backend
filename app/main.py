@@ -241,6 +241,10 @@ async def any_token_async() -> Tuple[Optional[str], Optional[str]]:
 
 async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = False) -> str:
     """Fetches OrderBook, TradeBook, and PositionBook for an account, reconciles open/closed trades, and evaluates rules."""
+    # Hard 9:00 PM IST cutoff: never fetch or modify P&L/trade data from Zebu between 21:00 IST and 00:00 IST
+    if now.hour >= 21:
+        return "locked · 9:00 PM IST cutoff (final data locked until 12:00 AM IST)"
+
     aid = acc["id"]
     now_utc = datetime.now(timezone.utc)
     await DB.put_sync_state_async(aid, {"last_sync_start": now_utc})
@@ -684,6 +688,8 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
 async def poll_all_async(reason: str = "schedule") -> dict:
     """Executes asynchronous concurrent polling across all connected accounts using ConnectionManager."""
     now = now_ist()
+    if now.hour >= 21:
+        return {"status": "locked · 9:00 PM IST cutoff (no Zebu fetch until 12:00 AM IST)"}
     accounts = await DB.get_all_accounts_async()
     results = {}
 
@@ -741,11 +747,11 @@ async def finalize_eod_async(now: Optional[datetime] = None, target_date: Option
             finalized_count += 1
             continue
 
-        # 1. Perform final synchronization if account is a linked Zebu account and target_date is today
+        # 1. Perform final synchronization if account is a linked Zebu account, target_date is today, and before 9:00 PM IST cutoff
         sync_ok = True
         sync_note = "verified_from_database"
         tok = await token_for_account_async(aid)
-        if acc.get("broker", "Zebu") == "Zebu" and acc.get("zebu_uid") and tok and day_str == now.date().isoformat():
+        if acc.get("broker", "Zebu") == "Zebu" and acc.get("zebu_uid") and tok and day_str == now.date().isoformat() and now.hour < 21:
             try:
                 sync_res = await poll_account_async(acc, now)
                 sync_note = f"zebu_eod_sync: {sync_res}"
@@ -1371,7 +1377,11 @@ async def get_raw_account_pnl(aid: str, _=Depends(current_user)):
     token_info = {"present": bool(tok), "uid": uid, "actid": actid, "link": await link_state(acc)}
     zebu_data = {}
     poll_result = None
-    if tok and uid:
+    now_cur = now_ist()
+    if now_cur.hour >= 21:
+        zebu_data = {"ok": True, "locked": True, "message": "9:00 PM IST cutoff — final data locked until 12:00 AM IST"}
+        poll_result = "locked · 9:00 PM IST cutoff (final data locked until 12:00 AM IST)"
+    elif tok and uid:
         try:
             positions = await ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url)
             total_rpnl = sum(float(p.get("rpnl") or 0) for p in positions)

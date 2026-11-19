@@ -180,7 +180,7 @@ class MarketScheduler:
                     has_pending = (await session.execute(pending_stmt)).scalars().first() is not None
 
                 if weekday and hm >= market_close:
-                    # Trigger EOD finalization if not yet finalized or if any account is pending reconciliation
+                    # Trigger EOD finalization (also locks final snapshot at 21:00 IST with zero Zebu calls after 21:00 IST)
                     should_finalize = (not rec or not getattr(rec, "finalized", False) or has_pending)
                     if should_finalize and self.finalize_eod_fn and (time.time() - self.last_eod_retry_time >= 60):
                         log.info(f"Triggering EOD reconciliation and finalization for {today_str} at {hm} IST")

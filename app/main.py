@@ -343,6 +343,20 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
 
     today_str = now.date().isoformat()
 
+    # Safety guard: outside market hours (before 09:15 or after 15:45 IST), if Zebu's nightly reset
+    # returns empty TradeBook and empty PositionBook, NEVER overwrite or delete today's stored trades.
+    in_market_window = (9, 15) <= (now.hour, now.minute) <= (15, 45)
+    if not fills and not positions and not in_market_window:
+        await DB.put_sync_state_async(aid, {
+            "status": "LIVE",
+            "is_stale": False,
+            "last_sync_success": now_utc,
+            "last_error": None,
+            "consecutive_failures": 0,
+            "circuit_open": False,
+        })
+        return "ok · after hours (retained existing trades)"
+
     # 1. Enrich orders with SingleOrdHist for modified/rejected/partially-filled orders & persist Orders
     if orders:
         hist_candidates = [
@@ -385,7 +399,8 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
             await CONN_MGR.subscribe_account_touchline(aid, open_scrips)
 
     # 3. Persist genuine TradeBook fills only (atomically replace today's fills when TradeBook is non-empty so duplicates can never accumulate)
-    await DB.purge_synthetic_fills_and_pb_trades_async(aid, today_str, unlock_today=reconcile_today)
+    should_unlock = reconcile_today and bool(fills or positions)
+    await DB.purge_synthetic_fills_and_pb_trades_async(aid, today_str, unlock_today=should_unlock)
 
     fill_items = []
     seen_fids = set()
@@ -593,6 +608,17 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
             )
         )
     ]
+
+    # Preserve last known exit/LTP/P&L on open trades if broker PositionBook temporarily omits lp
+    for t in built:
+        if t.get("open") and t.get("pnl") is None:
+            prev = old_trades.get(t["id"])
+            if prev and prev.get("pnl") is not None:
+                t["exit"] = prev.get("exit", t.get("exit"))
+                t["pnl"] = prev.get("pnl")
+                t["unrealized_pnl"] = prev.get("unrealized_pnl", prev.get("pnl"))
+                t["net_pnl"] = prev.get("net_pnl")
+                t["pnl_source"] = prev.get("pnl_source", "retained_ltp")
 
     # Resolve spot price at entry (bounded timeout so slow candle API never blocks trade sync)
     for t in built:
@@ -1175,7 +1201,9 @@ async def lifespan(app: FastAPI):
                     token=tok,
                     on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
                 )
-        asyncio.create_task(poll_all_async("startup"))
+        now_s = now_ist()
+        if (9, 15) <= (now_s.hour, now_s.minute) <= (15, 45):
+            asyncio.create_task(poll_all_async("startup"))
 
     if CFG.RUN_SCHEDULER_IN_PROCESS and not CFG.DISABLE_SCHEDULER:
         await SCHEDULER.start()

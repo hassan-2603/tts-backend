@@ -417,40 +417,146 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
         "txn_pct": CFG.CHG_TXN_PCT,
         "stamp_buy_pct": CFG.CHG_STAMP_BUY_PCT,
     }
+    # Reconcile open and active positions with PositionBook (authoritative broker LTP, rpnl, and urmtom)
     product_map = json.loads(CFG.PRODUCT_MAP)
-
     built = engine.build_trades(acc, recent_fills, charges_cfg, product_map, is_algo_order, now, ltp)
 
-    # Reconcile open positions with PositionBook LTP and broker unrealized P&L without mutating closed historical trades
     for p in positions:
         tsym = p.get("tsym")
         if not tsym:
             continue
-        net_qty = float(p.get("netqty") or 0)
+        day_buy_q = float(p.get("daybuyqty") or 0)
+        day_sell_q = float(p.get("daysellqty") or 0)
+        cf_buy_q = float(p.get("cfbuyqty") or 0)
+        cf_sell_q = float(p.get("cfsellqty") or 0)
+        rpnl = float(p.get("rpnl") or 0)
         urmtom_raw = p.get("urmtom")
+        urmtom = float(urmtom_raw or 0)
+        m2m = float(p.get("m2m") or 0)
+        net_qty = float(p.get("netqty") or 0)
         lp_raw = p.get("lp")
+        lp = float(lp_raw or 0) if (lp_raw is not None and lp_raw != "") else None
+        net_pos_pnl = rpnl + urmtom
+        if net_pos_pnl == 0 and m2m != 0:
+            net_pos_pnl = m2m
 
-        if net_qty != 0:
-            open_trs = [t for t in built if t.get("tsym") == tsym and t.get("open") and t["id"] not in finalized_ids]
-            if open_trs:
-                if lp_raw is not None and lp_raw != "":
-                    lp_val = float(lp_raw)
-                    for otr in open_trs:
-                        otr["exit"] = round(lp_val, 2)
-                        t_dir = -1 if otr.get("side") == "SELL" else 1
-                        t_qty = float(otr.get("qty") or (otr.get("lots", 1) * otr.get("lotSize", 1)))
-                        calc_unrl = round((lp_val - float(otr["entry"])) * t_qty * t_dir, 2)
-                        otr["pnl"] = calc_unrl
-                        otr["unrealized_pnl"] = calc_unrl
-                        otr["net_pnl"] = round(calc_unrl - float(otr.get("charges") or 0), 2)
-                        otr["pnl_source"] = "broker_ltp"
-                elif urmtom_raw is not None and urmtom_raw != "" and len(open_trs) == 1:
-                    ur_val = round(float(urmtom_raw), 2)
-                    otr = open_trs[0]
-                    otr["pnl"] = ur_val
-                    otr["unrealized_pnl"] = ur_val
-                    otr["net_pnl"] = round(ur_val - float(otr.get("charges") or 0), 2)
-                    otr["pnl_source"] = "broker_urmtom"
+        sym_trades_today = [
+            t for t in built
+            if t.get("tsym") == tsym and t["id"] not in finalized_ids and (t.get("open") or t.get("date") == today_str or t.get("exitDate") == today_str)
+        ]
+
+        if sym_trades_today:
+            if net_qty != 0:
+                open_trs = [t for t in sym_trades_today if t.get("open")]
+                if open_trs:
+                    if urmtom_raw is not None and urmtom_raw != "" and len(open_trs) == 1:
+                        otr = open_trs[0]
+                        ur_val = round(float(urmtom_raw), 2)
+                        otr["pnl"] = ur_val
+                        otr["unrealized_pnl"] = ur_val
+                        otr["net_pnl"] = round(ur_val - float(otr.get("charges") or 0), 2)
+                        otr["pnl_source"] = "broker_urmtom"
+                        if lp is not None and lp > 0:
+                            otr["exit"] = round(lp, 2)
+                    elif lp is not None and lp > 0:
+                        for otr in open_trs:
+                            otr["exit"] = round(lp, 2)
+                            t_dir = -1 if otr.get("side") == "SELL" else 1
+                            t_qty = float(otr.get("qty") or (otr.get("lots", 1) * otr.get("lotSize", 1)))
+                            calc_unrl = round((lp - float(otr["entry"])) * t_qty * t_dir, 2)
+                            otr["pnl"] = calc_unrl
+                            otr["unrealized_pnl"] = calc_unrl
+                            otr["net_pnl"] = round(calc_unrl - float(otr.get("charges") or 0), 2)
+                            otr["pnl_source"] = "broker_ltp"
+        elif day_buy_q > 0 or day_sell_q > 0 or cf_buy_q > 0 or cf_sell_q > 0 or rpnl != 0 or net_qty != 0 or urmtom != 0 or m2m != 0:
+            # Position exists in Zebu PositionBook (e.g. carry-forward position or position whose entry fill wasn't in local fills)
+            is_pos_closed = (net_qty == 0)
+            if is_pos_closed and (now.hour < 9 or (now.hour == 9 and now.minute < 15)):
+                continue
+
+            pos_tid = f"Z-POS-{aid}-{tsym}"
+            if pos_tid in finalized_ids:
+                continue
+
+            parsed = engine.parse_instrument(tsym) or {}
+            ls = int(float(p.get("ls") or 1)) or 1
+            qty = abs(net_qty) if net_qty != 0 else max(day_buy_q, day_sell_q, cf_buy_q, cf_sell_q)
+            if qty <= 0:
+                continue
+            lots = round(qty / ls, 2)
+            is_open = (net_qty != 0)
+
+            if is_open:
+                is_buy = net_qty > 0
+            elif (day_buy_q + cf_buy_q) != (day_sell_q + cf_sell_q):
+                is_buy = (day_buy_q + cf_buy_q) >= (day_sell_q + cf_sell_q)
+            else:
+                is_buy = net_pos_pnl >= 0
+            side_str = "BUY" if is_buy else "SELL"
+            t_dir = 1 if is_buy else -1
+
+            raw_entry = (
+                p.get("netavgprc")
+                or p.get("totbuyavgprc" if is_buy else "totsellavgprc")
+                or p.get("daybuyavgprc" if is_buy else "daysellavgprc")
+                or p.get("cfbuyavgprc" if is_buy else "cfsellavgprc")
+                or p.get("openprc")
+                or lp
+            )
+            if raw_entry is None or str(raw_entry).strip() == "" or float(raw_entry or 0) <= 0:
+                continue
+            entry_px = round(float(raw_entry), 2)
+            if is_open and lp is not None and lp > 0:
+                exit_px = round(lp, 2)
+            else:
+                exit_px = round(entry_px + (net_pos_pnl / qty) * t_dir, 2)
+
+            prd_code = p.get("prd", "MIS")
+            norm_prd = product_map.get(prd_code, prd_code or "MIS")
+            norm_prd = "NRML" if norm_prd in ("NRML", "CNC") else "MIS"
+            est_chg = round(CFG.CHG_BROKERAGE_PER_ORDER * (int((day_buy_q + cf_buy_q) > 0) + int((day_sell_q + cf_sell_q) > 0)), 2)
+            pnl_val = round(urmtom if is_open else net_pos_pnl, 2)
+
+            prev_pos = old_trades.get(pos_tid)
+            entry_date_str = prev_pos["date"] if (prev_pos and prev_pos.get("date")) else today_str
+            entry_time_str = prev_pos["time"] if (prev_pos and prev_pos.get("time")) else "09:15"
+
+            built.append({
+                "id": pos_tid,
+                "parent_trade_id": pos_tid,
+                "origin": "zebu",
+                "date": entry_date_str,
+                "time": entry_time_str,
+                "trader": acc.get("trader") or acc.get("zebu_uid") or aid,
+                "account": aid,
+                "symbol": parsed.get("underlying") or tsym,
+                "strike": parsed.get("strike") or 0,
+                "opt": parsed.get("opt") or "",
+                "expiry": parsed.get("expiry").isoformat() if parsed.get("expiry") else "",
+                "expiryType": parsed.get("expiryType", ""),
+                "tsym": tsym,
+                "exch": p.get("exch", "NFO"),
+                "side": side_str,
+                "lots": lots,
+                "lotSize": ls,
+                "qty": qty,
+                "entry": entry_px,
+                "exit": exit_px,
+                "pnl": pnl_val,
+                "realized_pnl": 0.0 if is_open else pnl_val,
+                "unrealized_pnl": pnl_val if is_open else 0.0,
+                "net_pnl": round(pnl_val - est_chg, 2),
+                "pnl_source": "broker_position_book",
+                "open": is_open,
+                "exitDate": None if is_open else today_str,
+                "exitTime": "OPEN" if is_open else now.strftime("%H:%M"),
+                "spot": prev_pos.get("spot") if prev_pos else None,
+                "product": norm_prd,
+                "source": "Manual",
+                "charges": est_chg,
+                "chargesEstimated": True,
+                "hedged": False,
+            })
 
     # Resolve spot price at entry
     for t in built:
@@ -1038,14 +1144,6 @@ async def lifespan(app: FastAPI):
 
                 if not await DB._get_rule(target_id):
                     await DB._put_rule(target_id, {"trader": target_id, "account": aid, "rules": engine.DEFAULT_RULES})
-
-        # Remove any legacy synthetic Z-POS dummy rows if present
-        async with AsyncSessionLocal() as session:
-            stmt = select(Trade).where(Trade.id.like("Z-POS-%"))
-            dummy_rows = (await session.execute(stmt)).scalars().all()
-            for dr in dummy_rows:
-                await session.delete(dr)
-            await session.commit()
 
         # Run startup recovery for midnight archiving and past unfinalized trading days (Req 3.8, 3.9, 9.6)
         await midnight_archive_async(now_ist())

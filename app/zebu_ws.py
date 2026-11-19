@@ -48,6 +48,7 @@ class ZebuWebSocketClient:
         self._task: Optional[asyncio.Task] = None
         self._status = "DISCONNECTED"
         self._last_event_time: Optional[datetime] = None
+        self._subscribed_scrips: set[str] = set()
 
     @property
     def status(self) -> str:
@@ -56,6 +57,19 @@ class ZebuWebSocketClient:
     @property
     def last_event_time(self) -> Optional[datetime]:
         return self._last_event_time
+
+    async def subscribe_touchline(self, scriplist: list[str]):
+        """Subscribe to real-time Touchline LTP ticks (e.g. ['NFO|41003', 'NSE|26000'])."""
+        clean = [s.strip() for s in (scriplist or []) if s and "|" in str(s)]
+        if not clean:
+            return
+        new_scrips = [s for s in clean if s not in self._subscribed_scrips]
+        self._subscribed_scrips.update(clean)
+        if self._ws and self._status == "REAL-TIME" and new_scrips:
+            try:
+                await self._ws.send(json.dumps({"t": "t", "k": "#".join(new_scrips)}))
+            except Exception as e:
+                log.debug(f"Touchline subscribe error for {self.account_id}: {e}")
 
     async def start(self):
         """Start the persistent WebSocket connection in a background task."""
@@ -103,20 +117,34 @@ class ZebuWebSocketClient:
                 ) as ws:
                     self._ws = ws
 
-                    # 1. Handshake
-                    handshake = {
-                        "t": "c",
+                    # 1. Handshake (Official OAuth task 'a' with fallback to Noren task 'c')
+                    handshake_a = {
+                        "t": "a",
                         "uid": self.uid,
                         "actid": self.actid or self.uid,
-                        "susertoken": self.token,
                         "accesstoken": self.token,
+                        "susertoken": self.token,
                         "source": "API",
                     }
-                    await ws.send(json.dumps(handshake))
+                    await ws.send(json.dumps(handshake_a))
 
                     # 2. Receive Handshake Ack
                     ack_raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
                     ack = json.loads(ack_raw) if isinstance(ack_raw, str) else json.loads(ack_raw.decode("utf-8"))
+
+                    if ack.get("t") not in ("ck", "ak") or str(ack.get("s", "")).upper() != "OK":
+                        # Try legacy Noren 'c' handshake before giving up
+                        handshake_c = {
+                            "t": "c",
+                            "uid": self.uid,
+                            "actid": self.actid or self.uid,
+                            "susertoken": self.token,
+                            "accesstoken": self.token,
+                            "source": "API",
+                        }
+                        await ws.send(json.dumps(handshake_c))
+                        ack_raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                        ack = json.loads(ack_raw) if isinstance(ack_raw, str) else json.loads(ack_raw.decode("utf-8"))
 
                     if ack.get("t") not in ("ck", "ak") or str(ack.get("s", "")).upper() != "OK":
                         log.warning(f"Handshake failed for {self.account_id}: {ack}")
@@ -128,9 +156,11 @@ class ZebuWebSocketClient:
                     await self._set_status("REAL-TIME")
                     retry_delay = 1.0  # Reset backoff on success
 
-                    # 4. Subscribe to Order Updates
+                    # 4. Subscribe to Order Updates & Active Touchline Scrips
                     order_sub = {"t": "o", "actid": self.actid}
                     await ws.send(json.dumps(order_sub))
+                    if self._subscribed_scrips:
+                        await ws.send(json.dumps({"t": "t", "k": "#".join(sorted(self._subscribed_scrips))}))
 
                     # 5. Heartbeat & Message Processing
                     heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))

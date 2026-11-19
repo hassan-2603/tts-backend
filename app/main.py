@@ -87,9 +87,10 @@ DEFAULT_SETTINGS = {
 }
 
 
-# ---------------- Spot Price Cache ----------------
+# ---------------- Spot Price & Order History Cache ----------------
 _spot_cache = {}
 _index_tokens = {}
+_order_hist_cache: Dict[str, List[dict]] = {}
 
 
 async def index_token_async(underlying: str) -> Optional[Tuple[str, str]]:
@@ -342,13 +343,46 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
 
     today_str = now.date().isoformat()
 
-    # 1. Persist Orders (including partially executed, open, complete, rejected)
+    # 1. Enrich orders with SingleOrdHist for modified/rejected/partially-filled orders & persist Orders
     if orders:
+        hist_candidates = [
+            o for o in orders
+            if o.get("norenordno")
+            and f"{aid}|{o.get('norenordno')}" not in _order_hist_cache
+            and (
+                str(o.get("status", "")).upper() in ("REJECTED", "CANCELED", "REJECT", "OPEN")
+                or (float(o.get("fillshares") or 0) > 0 and float(o.get("fillshares") or 0) < float(o.get("qty") or 0))
+            )
+        ][:5]
+        for ho in hist_candidates:
+            ord_no = str(ho.get("norenordno"))
+            cache_k = f"{aid}|{ord_no}"
+            try:
+                hist = await asyncio.wait_for(
+                    ZEBU.single_order_history_async(tok, uid, ord_no, proxy=proxy_url),
+                    timeout=3.0,
+                )
+                if isinstance(hist, list) and hist:
+                    _order_hist_cache[cache_k] = hist
+                    ho["order_history"] = hist
+            except Exception as e:
+                log.debug(f"SingleOrdHist lookup skipped for {ord_no}: {e}")
+        for o in orders:
+            ord_no = str(o.get("norenordno") or "")
+            if ord_no and f"{aid}|{ord_no}" in _order_hist_cache and "order_history" not in o:
+                o["order_history"] = _order_hist_cache[f"{aid}|{ord_no}"]
         await DB.put_many_orders_async(aid, orders)
 
-    # 2. Persist Positions
+    # 2. Persist Positions & subscribe open position tokens to real-time WebSocket Touchline feed
     if positions:
         await DB.put_many_positions_async(aid, positions)
+        open_scrips = [
+            f"{p.get('exch', 'NFO')}|{p.get('token')}"
+            for p in positions
+            if float(p.get("netqty") or 0) != 0 and p.get("token")
+        ]
+        if open_scrips:
+            await CONN_MGR.subscribe_account_touchline(aid, open_scrips)
 
     # 3. Synthesize fills from partially executed orders in OrderBook if not yet in TradeBook
     fill_items = []
@@ -419,7 +453,16 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
     }
     # Reconcile open and active positions with PositionBook (authoritative broker LTP, rpnl, and urmtom)
     product_map = json.loads(CFG.PRODUCT_MAP)
-    built = engine.build_trades(acc, recent_fills, charges_cfg, product_map, is_algo_order, now, ltp)
+    built = engine.build_trades(
+        acc,
+        recent_fills,
+        charges_cfg,
+        product_map,
+        is_algo_order,
+        now,
+        ltp,
+        positions=positions,
+    )
 
     for p in positions:
         tsym = p.get("tsym")
@@ -558,7 +601,7 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
                 "hedged": False,
             })
 
-    # Resolve spot price at entry
+    # Resolve spot price at entry (bounded timeout so slow candle API never blocks trade sync)
     for t in built:
         if t["id"] in finalized_ids:
             continue
@@ -567,7 +610,10 @@ async def poll_account_async(acc: dict, now: datetime) -> str:
             t["spot"] = prev["spot"]
         else:
             ts_val = engine.parse_ts(t.get("_ts")) or now
-            t["spot"] = await spot_at_async(t["symbol"], ts_val)
+            try:
+                t["spot"] = await asyncio.wait_for(spot_at_async(t["symbol"], ts_val), timeout=2.5)
+            except Exception:
+                t["spot"] = None
         t.pop("_ts", None)
 
     # Delete only non-finalized trades from the current rebuild window that are no longer present in `built`
@@ -1234,9 +1280,7 @@ def admin_only(user=Depends(current_user)):
     return user
 
 
-async def link_state(acc: dict) -> str:
-    """Returns true connection status without masking expired or disconnected sessions (Req 8.6, 8.7, 8.8)."""
-    t = await DB.get_token_async(acc["id"])
+def _link_state_from_doc(t: Optional[dict]) -> str:
     if not t or not t.get("access_token"):
         return "Not linked"
     st = t.get("status") or "Linked"
@@ -1245,6 +1289,12 @@ async def link_state(acc: dict) -> str:
     if t.get("expires_at") and float(t["expires_at"]) < time.time():
         return "Login expired"
     return "Linked"
+
+
+async def link_state(acc: dict) -> str:
+    """Returns true connection status without masking expired or disconnected sessions (Req 8.6, 8.7, 8.8)."""
+    t = await DB.get_token_async(acc["id"])
+    return _link_state_from_doc(t)
 
 
 # ---------------- Health & Metrics Endpoints ----------------
@@ -1418,16 +1468,39 @@ async def put_user(name: str, request: Request, _=Depends(admin_only)):
     return {"ok": True}
 
 
+def _resolve_token_doc_fast(acc: dict, tokens_by_id: Dict[str, dict], tokens_by_uid: Dict[str, dict]) -> dict:
+    aid = acc["id"]
+    t = tokens_by_id.get(aid)
+    if t and t.get("access_token"):
+        return t
+    uid = (acc.get("zebu_uid") or "").strip().upper()
+    if uid and uid in tokens_by_uid:
+        return tokens_by_uid[uid]
+    return t or {}
+
+
 @app.get("/api/traders")
 async def get_traders(user=Depends(current_user)):
-    all_traders = await DB._all_traders()
+    all_traders, accounts, tokens_list = await asyncio.gather(
+        DB._all_traders(),
+        DB.get_all_accounts_async(),
+        DB._all_tokens(),
+    )
     existing_ids = {t["id"] for t in all_traders}
+    tokens_by_id = {t["account"]: t for t in tokens_list}
+    uid_by_aid = {a["id"]: (a.get("zebu_uid") or "").strip().upper() for a in accounts}
+    tokens_by_uid = {}
+    for t in tokens_list:
+        if t.get("access_token"):
+            u = uid_by_aid.get(t["account"]) or t["account"].upper()
+            if u:
+                tokens_by_uid[u] = t
 
-    accounts = await DB.get_all_accounts_async()
     for acc in accounts:
         aid = acc["id"]
         uid = acc.get("zebu_uid") or aid
-        l_state = await link_state(acc)
+        t_doc = _resolve_token_doc_fast(acc, tokens_by_id, tokens_by_uid)
+        l_state = _link_state_from_doc(t_doc)
         if aid not in existing_ids:
             name = acc.get("name") or aid
             if uid and uid not in name and uid != aid:
@@ -1467,7 +1540,19 @@ async def put_trader(tid: str, request: Request, _=Depends(admin_only)):
 @app.get("/api/accounts")
 async def get_accounts(user=Depends(current_user)):
     out = []
-    all_acc = await DB.get_all_accounts_async()
+    all_acc, tokens_list, sync_states_map = await asyncio.gather(
+        DB.get_all_accounts_async(),
+        DB._all_tokens(),
+        DB.get_all_sync_states_async(),
+    )
+    tokens_by_id = {t["account"]: t for t in tokens_list}
+    uid_by_aid = {a["id"]: (a.get("zebu_uid") or "").strip().upper() for a in all_acc}
+    tokens_by_uid = {}
+    for t in tokens_list:
+        if t.get("access_token"):
+            u = uid_by_aid.get(t["account"]) or t["account"].upper()
+            if u:
+                tokens_by_uid[u] = t
 
     if user["role"] == "trader":
         u = await DB.get_user_async(user["user"])
@@ -1481,10 +1566,10 @@ async def get_accounts(user=Depends(current_user)):
             all_acc = [a for a in all_acc if a.get("id") in allowed]
 
     for a in all_acc:
-        t = (await DB.get_token_async(a["id"])) or {}
-        sync_st = (await DB.get_sync_state_async(a["id"])) or {}
+        t = _resolve_token_doc_fast(a, tokens_by_id, tokens_by_uid)
+        sync_st = sync_states_map.get(a["id"]) or {}
         conn_state = CONN_MGR.get_account_state(a["id"])
-        l_state = await link_state(a)
+        l_state = _link_state_from_doc(t)
         # Never expose sensitive secret keys to frontend (Req 8.10)
         safe_acc = {k: v for k, v in a.items() if k != "zebu_secret_key"}
         safe_acc["has_secret_key"] = bool(a.get("zebu_secret_key"))
@@ -2146,15 +2231,12 @@ async def test_alert(_=Depends(admin_only)):
 
 @app.get("/api/status")
 async def status(_=Depends(current_user)):
-    poll_stat = (await DB._get_status("poll")) or {}
-    all_acc = await DB.get_all_accounts_async()
-    acc_sync_states = {}
-    for a in all_acc:
-        st = await DB.get_sync_state_async(a["id"])
-        if st:
-            acc_sync_states[a["id"]] = st
+    poll_stat, acc_sync_states = await asyncio.gather(
+        DB._get_status("poll"),
+        DB.get_all_sync_states_async(),
+    )
     return {
-        "poll": poll_stat,
+        "poll": poll_stat or {},
         "account_sync": acc_sync_states,
         "zebu_configured": bool(CFG.ZEBU_CLIENT_ID and CFG.ZEBU_SECRET_KEY),
         "redirect_url": CFG.PUBLIC_URL + "/auth/zebu/callback",
@@ -2162,6 +2244,82 @@ async def status(_=Depends(current_user)):
         "market": f"{CFG.MARKET_OPEN}–{CFG.MARKET_CLOSE} IST",
         "max_concurrent_accounts": CFG.MAX_CONCURRENT_ACCOUNTS,
         "active_streams": len([a for a, s in CONN_MGR.accounts.items() if s.status == "REAL-TIME"]),
+    }
+
+
+@app.get("/api/orders")
+async def get_orders_endpoint(account: Optional[str] = None, _=Depends(current_user)):
+    return await DB.get_orders_async(account_id=account)
+
+
+@app.get("/api/orders/{norenordno}/history")
+async def get_single_order_history(norenordno: str, account: Optional[str] = None, _=Depends(current_user)):
+    """Official Zebu SingleOrdHist endpoint proxy with local cache fallback."""
+    all_acc = await DB.get_all_accounts_async()
+    target_acc = None
+    if account:
+        target_acc = next((a for a in all_acc if a["id"] == account or a.get("zebu_uid") == account), None)
+    if not target_acc and all_acc:
+        target_acc = all_acc[0]
+    if not target_acc:
+        return []
+    aid = target_acc["id"]
+    cache_k = f"{aid}|{norenordno}"
+    if cache_k in _order_hist_cache:
+        return _order_hist_cache[cache_k]
+    tok = await token_for_account_async(aid)
+    uid = target_acc.get("zebu_uid")
+    if tok and uid:
+        try:
+            hist = await ZEBU.single_order_history_async(tok, uid, norenordno, proxy=target_acc.get("proxy_url"))
+            if isinstance(hist, list) and hist:
+                _order_hist_cache[cache_k] = hist
+                return hist
+        except Exception as e:
+            log.warning(f"SingleOrdHist live fetch error for {norenordno}: {e}")
+    return _order_hist_cache.get(cache_k, [])
+
+
+@app.get("/api/bootstrap")
+async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
+    """Ultra-fast single-request bootstrap endpoint returning all dashboard state concurrently."""
+    t0 = time.perf_counter()
+    (
+        traders_res,
+        accounts_res,
+        rules_res,
+        trades_res,
+        groups_res,
+        settings_res,
+        rulelog_res,
+        status_res,
+        daily_reports_res,
+        violations_res,
+    ) = await asyncio.gather(
+        get_traders(user=user),
+        get_accounts(user=user),
+        get_rules(_=user),
+        get_trades(request=request, user=user),
+        get_groups(_=user),
+        get_settings(_=user),
+        get_rulelog(_=user),
+        status(_=user),
+        get_daily_reports(user=user),
+        get_violations(user=user),
+    )
+    METRICS.record_api_latency((time.perf_counter() - t0) * 1000)
+    return {
+        "user": {"user": user["user"], "role": user["role"]},
+        "traders": traders_res,
+        "accounts": accounts_res,
+        "rules": rules_res,
+        "trades": trades_res,
+        "groups": groups_res,
+        "settings": settings_res,
+        "ruleLog": rulelog_res,
+        "status": status_res,
+        "dailyReports": daily_reports_res,
+        "violations": violations_res,
     }
 
 

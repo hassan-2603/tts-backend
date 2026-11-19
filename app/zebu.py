@@ -23,7 +23,9 @@ READ_ONLY_ENDPOINTS = {
     "ClientDetails",  # verify the linked account
     "TradeBook",      # every fill of the day
     "OrderBook",      # order list (status, remarks, ordersource)
+    "SingleOrdHist",  # complete order history lifecycle (modifications, fills, rejections)
     "PositionBook",   # open positions + LTP (for open / carried trades)
+    "Holdings",       # demat holdings
     "TPSeries",       # 1-min candles -> index spot at entry time
     "GetIndexList",   # find index tokens (Nifty Bank etc.)
     "GetQuotes",      # last price of a contract
@@ -367,6 +369,14 @@ class ZebuClient:
         r = await self._post_async("OrderBook", {"uid": u}, token, proxy=proxy)
         return r if isinstance(r, list) else []
 
+    async def single_order_history_async(self, token: str, uid: str, norenordno: str, proxy: Optional[str] = None) -> List[dict]:
+        """Official Zebu SingleOrdHist endpoint: returns complete lifecycle transitions of an order."""
+        u = self._clean_uid(uid)
+        if not norenordno:
+            return []
+        r = await self._post_async("SingleOrdHist", {"uid": u, "norenordno": str(norenordno)}, token, proxy=proxy)
+        return r if isinstance(r, list) else []
+
     async def position_book_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None) -> List[dict]:
         u = self._clean_uid(uid)
         a = self._clean_uid(actid) or u
@@ -407,6 +417,13 @@ class ZebuClient:
     def order_book(self, token: str, uid: str):
         u = self._clean_uid(uid)
         r = self._post_sync("OrderBook", {"uid": u}, token)
+        return r if isinstance(r, list) else []
+
+    def single_order_history(self, token: str, uid: str, norenordno: str):
+        u = self._clean_uid(uid)
+        if not norenordno:
+            return []
+        r = self._post_sync("SingleOrdHist", {"uid": u, "norenordno": str(norenordno)}, token)
         return r if isinstance(r, list) else []
 
     def position_book(self, token: str, uid: str, actid: str):

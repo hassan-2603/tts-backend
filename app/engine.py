@@ -189,6 +189,9 @@ _TFMTS = [
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%d %H:%M:%S%z",
+    "%d-%b-%Y %H:%M:%S",
+    "%H:%M:%S %d-%b-%Y",
+    "%d-%b-%y %H:%M:%S",
 ]
 
 
@@ -199,13 +202,29 @@ def parse_ts(*vals) -> Optional[datetime]:
         if isinstance(v, datetime):
             return v.replace(tzinfo=None)
         v_str = str(v).strip()
+        if not v_str or v_str.startswith("01-01-1980"):
+            continue
+        # Handle epoch seconds (e.g. ordenttm "1607706811")
+        if v_str.isdigit() and len(v_str) in (10, 13):
+            try:
+                epoch = int(v_str) / (1000.0 if len(v_str) == 13 else 1.0)
+                d = datetime.fromtimestamp(epoch)
+                if d.year > 2000:
+                    return d.replace(tzinfo=None)
+            except (ValueError, OSError):
+                pass
         for f in _TFMTS:
             try:
-                d = datetime.strptime(v_str[:19], f[:19])
+                d = datetime.strptime(v_str[:len(f) + 2].strip(), f)
                 if d.year > 2000:
                     return d.replace(tzinfo=None)
             except ValueError:
-                pass
+                try:
+                    d = datetime.strptime(v_str[:19], f[:19])
+                    if d.year > 2000:
+                        return d.replace(tzinfo=None)
+                except ValueError:
+                    pass
     return None
 
 
@@ -247,10 +266,12 @@ def build_trades(
     ltp: Optional[dict] = None,
     master: Optional[dict] = None,
     split_partial_closures: bool = True,
+    positions: Optional[list] = None,
 ) -> list:
     """FIFO-match fills per contract with Decimal precision.
 
-    Supports partial fills, multi-leg entries/exits, carry-forward positions,
+    Supports partial fills, multi-leg entries/exits, position reversals,
+    carry-forward positions (including PositionBook cfbuyqty/cfsellqty seed reconciliation),
     and all instrument classes.
     When split_partial_closures is True and a position has both closed exits and remaining open quantity
     (or exits across multiple trading days):
@@ -258,15 +279,33 @@ def build_trades(
     - Any remaining open quantity is emitted as an active open position preserving the original entry date,
       entry time, entry price, and order identity.
     """
-    ltp = ltp or {}
+    ltp = dict(ltp or {})
     if now and getattr(now, "tzinfo", None) is not None:
         now = now.replace(tzinfo=None)
+    today_d = now.date() if now else date.today()
+
+    # Map PositionBook metadata (prcftr, lotsize, ltp, carry-forward & day quantities)
+    pos_by_sym: Dict[str, List[dict]] = defaultdict(list)
+    prcftr_by_sym: Dict[str, Decimal] = {}
+    for p in (positions or []):
+        tsym = p.get("tsym")
+        if not tsym:
+            continue
+        pos_by_sym[tsym].append(p)
+        pf = _dec(p.get("prcftr"), Decimal("1"))
+        if pf and pf > Decimal("0"):
+            prcftr_by_sym[tsym] = pf
+        lp_val = _dec(p.get("lp"), None)
+        if lp_val is not None and lp_val > Decimal("0") and tsym not in ltp:
+            ltp[tsym] = float(lp_val)
 
     # 1. Group fills by order ID
     orders = {}
-    for f in fills:
-        oid = str(f.get("norenordno") or f.get("flid") or "O-" + str(f.get("fltm", "")))
-        ts = parse_ts(f.get("fltm"), f.get("exch_tm"), f.get("norentm"))
+    for idx_f, f in enumerate(fills):
+        oid = str(f.get("norenordno") or f.get("flid") or f"O-{idx_f}-{f.get('fltm', '')}")
+        ts = parse_ts(f.get("fltm"), f.get("exch_tm"), f.get("norentm"), f.get("ordenttm"))
+        if not ts and f.get("_day"):
+            ts = parse_ts(f"{f['_day']} 09:15:00")
         if not ts:
             continue
         q = _dec(f.get("flqty") or f.get("fillshares"), Decimal("0"))
@@ -300,6 +339,107 @@ def build_trades(
     for o in orders.values():
         if o["qty"] > Decimal("0"):
             by_sym[o["tsym"]].append(o)
+
+    # 2. Reconcile carry-forward (cfbuyqty/cfsellqty) and missing intraday PositionBook entries
+    for tsym, plist in pos_by_sym.items():
+        existing_orders = by_sym.get(tsym, [])
+        prior_buy = sum((o["qty"] for o in existing_orders if o["ts"].date() < today_d and o["side"] == "BUY"), Decimal("0"))
+        prior_sell = sum((o["qty"] for o in existing_orders if o["ts"].date() < today_d and o["side"] == "SELL"), Decimal("0"))
+        prior_net = prior_buy - prior_sell
+
+        today_buy = sum((o["qty"] for o in existing_orders if o["ts"].date() == today_d and o["side"] == "BUY"), Decimal("0"))
+        today_sell = sum((o["qty"] for o in existing_orders if o["ts"].date() == today_d and o["side"] == "SELL"), Decimal("0"))
+
+        cf_buy_total = sum((_dec(p.get("cfbuyqty"), Decimal("0")) for p in plist), Decimal("0"))
+        cf_sell_total = sum((_dec(p.get("cfsellqty"), Decimal("0")) for p in plist), Decimal("0"))
+        day_buy_total = sum((_dec(p.get("daybuyqty"), Decimal("0")) for p in plist), Decimal("0"))
+        day_sell_total = sum((_dec(p.get("daysellqty"), Decimal("0")) for p in plist), Decimal("0"))
+
+        p0 = plist[0]
+        ls_p = int(_f(p0.get("ls"), 1)) or 1
+        prd_p = p0.get("prd", "M")
+        exch_p = p0.get("exch", "NFO")
+        prev_day_ts = datetime.combine(today_d - timedelta(days=1), datetime.min.time()).replace(hour=9, minute=15)
+        today_open_ts = datetime.combine(today_d, datetime.min.time()).replace(hour=9, minute=20)
+
+        # Inject carry-forward seed lot if Zebu PositionBook reports carry-forward qty not in prior fills
+        if cf_buy_total > Decimal("0") and prior_net < cf_buy_total:
+            missing_cf_b = cf_buy_total - max(prior_net, Decimal("0"))
+            cf_px = _dec(p0.get("cforgavgprc") or p0.get("cfbuyavgprc") or p0.get("netavgprc"), Decimal("0"))
+            if missing_cf_b > Decimal("0") and cf_px > Decimal("0"):
+                by_sym[tsym].append({
+                    "oid": f"CF-{tsym}-B",
+                    "tsym": tsym,
+                    "exch": exch_p,
+                    "side": "BUY",
+                    "prd": prd_p,
+                    "ls": ls_p,
+                    "token": p0.get("token"),
+                    "ordersource": "CarryForward",
+                    "remarks": "Carry-forward position from PositionBook",
+                    "qty": missing_cf_b,
+                    "val": missing_cf_b * cf_px,
+                    "ts": prev_day_ts,
+                    "last": prev_day_ts,
+                })
+        if cf_sell_total > Decimal("0") and (-prior_net) < cf_sell_total:
+            missing_cf_s = cf_sell_total - max(-prior_net, Decimal("0"))
+            cf_px = _dec(p0.get("cforgavgprc") or p0.get("cfsellavgprc") or p0.get("netavgprc"), Decimal("0"))
+            if missing_cf_s > Decimal("0") and cf_px > Decimal("0"):
+                by_sym[tsym].append({
+                    "oid": f"CF-{tsym}-S",
+                    "tsym": tsym,
+                    "exch": exch_p,
+                    "side": "SELL",
+                    "prd": prd_p,
+                    "ls": ls_p,
+                    "token": p0.get("token"),
+                    "ordersource": "CarryForward",
+                    "remarks": "Carry-forward position from PositionBook",
+                    "qty": missing_cf_s,
+                    "val": missing_cf_s * cf_px,
+                    "ts": prev_day_ts,
+                    "last": prev_day_ts,
+                })
+
+        # Fallback if PositionBook has intraday buy/sell quantities that were absent from TradeBook
+        if day_buy_total > Decimal("0") and today_buy == Decimal("0"):
+            db_px = _dec(p0.get("daybuyavgprc") or p0.get("totbuyavgprc") or p0.get("netavgprc"), Decimal("0"))
+            if db_px > Decimal("0"):
+                by_sym[tsym].append({
+                    "oid": f"PB-{today_d.isoformat()}-{tsym}-B",
+                    "tsym": tsym,
+                    "exch": exch_p,
+                    "side": "BUY",
+                    "prd": prd_p,
+                    "ls": ls_p,
+                    "token": p0.get("token"),
+                    "ordersource": "PositionBook",
+                    "remarks": "Reconciled from PositionBook",
+                    "qty": day_buy_total,
+                    "val": day_buy_total * db_px,
+                    "ts": today_open_ts,
+                    "last": today_open_ts,
+                })
+        if day_sell_total > Decimal("0") and today_sell == Decimal("0"):
+            ds_px = _dec(p0.get("daysellavgprc") or p0.get("totsellavgprc") or p0.get("netavgprc"), Decimal("0"))
+            if ds_px > Decimal("0"):
+                sell_ts = today_open_ts + timedelta(minutes=5)
+                by_sym[tsym].append({
+                    "oid": f"PB-{today_d.isoformat()}-{tsym}-S",
+                    "tsym": tsym,
+                    "exch": exch_p,
+                    "side": "SELL",
+                    "prd": prd_p,
+                    "ls": ls_p,
+                    "token": p0.get("token"),
+                    "ordersource": "PositionBook",
+                    "remarks": "Reconciled from PositionBook",
+                    "qty": day_sell_total,
+                    "val": day_sell_total * ds_px,
+                    "ts": sell_ts,
+                    "last": sell_ts,
+                })
 
     trades = []
     for tsym, olist in by_sym.items():
@@ -353,6 +493,7 @@ def build_trades(
             src_label = "Algo" if is_algo(o) else "Manual"
             base_trade_id = f"Z-{account['id']}-{o['oid']}"
             ls_dec = Decimal(str(o["ls"]))
+            prcftr = prcftr_by_sym.get(tsym, Decimal("1"))
 
             # Group closed exits by exit date so multi-day partial exits attribute P&L to the exact exit date
             exits_by_day = defaultdict(list)
@@ -373,9 +514,9 @@ def build_trades(
                     exit_oids = sorted({str(x["oid"]) for x in day_exits})
                     first_exit_oid = exit_oids[0] if exit_oids else f"EX{idx+1}"
 
-                    leg_buy_val = e["px"] * leg_qty if is_buy else leg_exit_val
-                    leg_sell_val = leg_exit_val if is_buy else e["px"] * leg_qty
-                    leg_realized_pnl = _q2((leg_exit_px - e["px"]) * leg_qty if is_buy else (e["px"] - leg_exit_px) * leg_qty)
+                    leg_buy_val = (e["px"] * leg_qty if is_buy else leg_exit_val) * prcftr
+                    leg_sell_val = (leg_exit_val if is_buy else e["px"] * leg_qty) * prcftr
+                    leg_realized_pnl = _q2(((leg_exit_px - e["px"]) if is_buy else (e["px"] - leg_exit_px)) * leg_qty * prcftr)
                     # Proportional entry order count (1 on first leg, 0 on subsequent partial legs) + exit orders
                     n_orders = (1 if idx == 0 else 0) + len(exit_oids)
                     leg_charges = _dec(estimate_charges(float(leg_buy_val), float(leg_sell_val), n_orders, cfg))
@@ -429,7 +570,7 @@ def build_trades(
                     if has_ltp:
                         cur_ltp = _q4(_dec(raw_ltp))
                         open_exit_val = rem_qty * cur_ltp
-                        open_unrl_pnl = _q2((cur_ltp - e["px"]) * rem_qty if is_buy else (e["px"] - cur_ltp) * rem_qty)
+                        open_unrl_pnl = _q2(((cur_ltp - e["px"]) if is_buy else (e["px"] - cur_ltp)) * rem_qty * prcftr)
                         disp_exit = float(_q2(cur_ltp))
                         disp_pnl = float(open_unrl_pnl)
                     else:
@@ -495,7 +636,7 @@ def build_trades(
                         last_px = _dec(raw_ltp)
                         exit_val += rem_qty * last_px
                         exit_px = _q4(exit_val / total_qty) if total_qty > Decimal("0") else e["px"]
-                        calc_pnl = _q2((exit_px - e["px"]) * total_qty if is_buy else (e["px"] - exit_px) * total_qty)
+                        calc_pnl = _q2(((exit_px - e["px"]) if is_buy else (e["px"] - exit_px)) * total_qty * prcftr)
                         disp_pnl = float(calc_pnl)
                         disp_exit = float(_q2(exit_px))
                         pnl_src = "calculated"
@@ -503,13 +644,13 @@ def build_trades(
                         last_px = exits[-1]["price"] if exits else e["px"]
                         exit_val += rem_qty * last_px
                         exit_px = _q4(exit_val / total_qty) if total_qty > Decimal("0") else e["px"]
-                        calc_pnl = _q2((exit_px - e["px"]) * total_qty if is_buy else (e["px"] - exit_px) * total_qty) if exits else None
+                        calc_pnl = _q2(((exit_px - e["px"]) if is_buy else (e["px"] - exit_px)) * total_qty * prcftr) if exits else None
                         disp_pnl = float(calc_pnl) if calc_pnl is not None else None
                         disp_exit = float(_q2(exit_px))
                         pnl_src = "calculated" if exits else "unavailable"
                     exit_date_str = None
                     exit_time_str = "OPEN"
-                    realized_val = float(_q2(sum(((x["price"] - e["px"]) * x["qty"] if is_buy else (e["px"] - x["price"]) * x["qty"]) for x in exits))) if exits else 0.0
+                    realized_val = float(_q2(sum((((x["price"] - e["px"]) if is_buy else (e["px"] - x["price"])) * x["qty"] * prcftr) for x in exits))) if exits else 0.0
                     unrealized_val = disp_pnl
                     exit_oids_str = ",".join(sorted({str(x["oid"]) for x in exits})) if exits else None
                 else:
@@ -517,7 +658,7 @@ def build_trades(
                     last_ts = max(x["ts"] for x in exits)
                     exit_date_str = last_ts.date().isoformat()
                     exit_time_str = last_ts.strftime("%H:%M")
-                    calc_pnl = _q2((exit_px - e["px"]) * total_qty if is_buy else (e["px"] - exit_px) * total_qty)
+                    calc_pnl = _q2(((exit_px - e["px"]) if is_buy else (e["px"] - exit_px)) * total_qty * prcftr)
                     disp_pnl = float(calc_pnl)
                     disp_exit = float(_q2(exit_px))
                     realized_val = disp_pnl

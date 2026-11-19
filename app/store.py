@@ -350,6 +350,27 @@ class Store:
 
     # ---------------- Account Sync State & Daily Reports ----------------
 
+    async def get_all_sync_states_async(self) -> Dict[str, Dict[str, Any]]:
+        async with AsyncSessionLocal() as session:
+            stmt = select(AccountSyncState)
+            rows = (await session.execute(stmt)).scalars().all()
+            return {
+                st.account_id: {
+                    "account_id": st.account_id,
+                    "status": st.status,
+                    "is_stale": bool(getattr(st, "is_stale", False)),
+                    "last_sync_start": st.last_sync_start.isoformat() if st.last_sync_start else None,
+                    "last_sync_success": st.last_sync_success.isoformat() if st.last_sync_success else None,
+                    "last_error": st.last_error,
+                    "error_count": st.error_count,
+                    "consecutive_failures": st.consecutive_failures,
+                    "circuit_open": st.circuit_open,
+                    "total_fills_today": st.total_fills_today,
+                    "total_trades_today": st.total_trades_today,
+                }
+                for st in rows
+            }
+
     async def get_sync_state_async(self, aid: str) -> Optional[Dict[str, Any]]:
         async with AsyncSessionLocal() as session:
             stmt = select(AccountSyncState).where(AccountSyncState.account_id == aid)
@@ -494,6 +515,10 @@ class Store:
                 avg_prc = float(o.get("avgprc") or o.get("prc") or 0)
                 status = str(o.get("status") or "OPEN").upper()
 
+                remarks_str = o.get("remarks") or o.get("rejreason") or ""
+                if o.get("rejreason") and o.get("remarks") and o["rejreason"] not in o["remarks"]:
+                    remarks_str = f"{o['remarks']} ({o['rejreason']})"
+
                 if not row:
                     row = Order(
                         id=oid,
@@ -509,7 +534,7 @@ class Store:
                         filled_qty=filled_qty,
                         avg_price=avg_prc,
                         order_source=o.get("ordersource", ""),
-                        remarks=o.get("remarks", ""),
+                        remarks=remarks_str,
                         order_time=ot,
                         raw_payload=o,
                     )
@@ -519,6 +544,8 @@ class Store:
                     row.qty = qty
                     row.filled_qty = filled_qty
                     row.avg_price = avg_prc
+                    if remarks_str:
+                        row.remarks = remarks_str
                     row.raw_payload = o
             await session.commit()
 
@@ -1351,8 +1378,11 @@ class Store:
                     "refresh_token": decrypt_token(bs.refresh_token_enc),
                     "expires_at": bs.expires_at.timestamp() if bs.expires_at else None,
                     "linked_at": bs.linked_at.isoformat() if bs.linked_at else None,
+                    "last_sync_at": bs.last_sync_at.isoformat() if getattr(bs, "last_sync_at", None) else None,
                     "cliname": bs.cliname,
                     "status": bs.status,
+                    "ws_status": getattr(bs, "ws_status", None),
+                    "sync_message": getattr(bs, "sync_message", None),
                 }
                 for bs in res
             ]

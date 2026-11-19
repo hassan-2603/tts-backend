@@ -91,6 +91,7 @@ class ConnectionManager:
         actid: str,
         token: str,
         on_fill: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
+        on_touchline: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
     ):
         """Attaches and starts a real-time WebSocket connection for an account."""
         state = self.get_account_state(account_id)
@@ -101,11 +102,10 @@ class ConnectionManager:
 
         async def _on_order_update(msg: Dict[str, Any]):
             state.last_event_time = datetime.now(timezone.utc)
-            # Check if this order update is a fill
             status = str(msg.get("status", "")).upper()
-            flqty = float(msg.get("flqty") or 0)
-            if status == "COMPLETE" or flqty > 0 or msg.get("flprc"):
-                # Put in bounded queue with backpressure
+            rpt = str(msg.get("reporttype") or msg.get("rpt") or "").upper()
+            flqty = float(msg.get("flqty") or msg.get("fillshares") or 0)
+            if status in ("COMPLETE", "REJECTED", "CANCELED") or rpt in ("FILL", "REPLACED", "REJECTED", "CANCELED") or flqty > 0 or msg.get("flprc"):
                 try:
                     state.event_queue.put_nowait(msg)
                 except asyncio.QueueFull:
@@ -119,6 +119,14 @@ class ConnectionManager:
                     except Exception as e:
                         log.error(f"Error executing on_fill callback for {account_id}: {e}")
 
+        async def _on_touchline_update(msg: Dict[str, Any]):
+            state.last_event_time = datetime.now(timezone.utc)
+            if on_touchline:
+                try:
+                    await on_touchline(msg)
+                except Exception as e:
+                    log.debug(f"Touchline callback error for {account_id}: {e}")
+
         async def _on_status_change(new_status: str, msg: str):
             state.status = new_status
             log.info(f"Account {account_id} WS status changed to {new_status}: {msg}")
@@ -130,10 +138,16 @@ class ConnectionManager:
             actid=actid,
             token=token,
             on_order_update=_on_order_update,
+            on_touchline_update=_on_touchline_update,
             on_status_change=_on_status_change,
         )
         state.ws_client = ws_client
         await ws_client.start()
+
+    async def subscribe_account_touchline(self, account_id: str, scriplist: list[str]):
+        state = self.accounts.get(account_id)
+        if state and state.ws_client and scriplist:
+            await state.ws_client.subscribe_touchline(scriplist)
 
     async def unregister_account(self, account_id: str):
         if account_id in self.accounts:

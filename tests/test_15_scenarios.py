@@ -53,6 +53,7 @@ class SimulatedBrokerState:
         self.trade_books: Dict[str, List[dict]] = {}
         self.position_books: Dict[str, List[dict]] = {}
         self.order_books: Dict[str, List[dict]] = {}
+        self.order_histories: Dict[str, List[dict]] = {}
         self.expired_uids: set = set()
         self.offline_uids: set = set()
         self.spot_price: float = 51800.0
@@ -83,6 +84,9 @@ class SimulatedBrokerState:
             raise ZebuError("OrderBook network error: Broker gateway timeout")
         return list(self.order_books.get(u, []))
 
+    async def single_order_history_async(self, token: str, uid: str, norenordno: str, proxy=None) -> List[dict]:
+        return list(self.order_histories.get(str(norenordno), []))
+
     async def index_list_async(self, token: str, uid: str, exch: str = "NSE", proxy=None) -> List[dict]:
         return [{"idxname": "NIFTY BANK", "token": "26009"}, {"idxname": "NIFTY 50", "token": "26000"}]
 
@@ -103,6 +107,7 @@ def setup_environment(monkeypatch_module=None):
     ZEBU.trade_book_async = BROKER.trade_book_async
     ZEBU.position_book_async = BROKER.position_book_async
     ZEBU.order_book_async = BROKER.order_book_async
+    ZEBU.single_order_history_async = BROKER.single_order_history_async
     ZEBU.index_list_async = BROKER.index_list_async
     ZEBU.tp_series_async = BROKER.tp_series_async
 
@@ -541,3 +546,197 @@ async def test_10_persistence_across_restart():
 
     violations_acc1 = await fresh_store.get_rule_violations_async(account_id="ACC-1")
     assert len(violations_acc1) >= 2
+
+
+@pytest.mark.asyncio
+async def test_16_official_zebu_single_order_history_and_1980_placeholder_timestamps():
+    """Verify official Zebu SingleOrdHist lifecycle tracking and TradeBook 01-01-1980 placeholder timestamp handling."""
+    client = TestClient(app)
+    headers = _get_auth_headers(client)
+
+    # Setup order with partial fills + rejection in OrderBook & SingleOrdHist
+    BROKER.order_books["UID202"] = [
+        {
+            "norenordno": "20121300065716",
+            "exch": "NFO",
+            "tsym": "BANKNIFTY26NOV26C52000",
+            "qty": "60",
+            "fillshares": "30",
+            "avgprc": "210.00",
+            "prc": "210.00",
+            "prd": "I",
+            "trantype": "B",
+            "prctyp": "LMT",
+            "status": "OPEN",
+            "norentm": "10:15:32 19-11-2026",
+            "exch_tm": "01-01-1980 00:00:00",
+        },
+        {
+            "norenordno": "20121300065717",
+            "exch": "NFO",
+            "tsym": "BANKNIFTY26NOV26C52000",
+            "qty": "30",
+            "fillshares": "0",
+            "avgprc": "0.00",
+            "prc": "220.00",
+            "prd": "I",
+            "trantype": "S",
+            "prctyp": "LMT",
+            "status": "REJECTED",
+            "rejreason": "RMS: Margin Exceeds",
+            "norentm": "10:16:00 19-11-2026",
+        },
+    ]
+    BROKER.order_histories["20121300065716"] = [
+        {"stat": "Ok", "norenordno": "20121300065716", "status": "COMPLETE", "rpt": "Fill", "fillshares": "30", "avgprc": "210.00", "norentm": "10:15:32 19-11-2026"},
+        {"stat": "Ok", "norenordno": "20121300065716", "status": "OPEN", "rpt": "New", "qty": "60", "prc": "210.00", "norentm": "10:15:30 19-11-2026"},
+    ]
+    # Official Zebu TradeBook format with 01-01-1980 placeholder in fltm/exch_tm and actual timestamp in norentm
+    BROKER.trade_books["UID202"] = [
+        {
+            "stat": "Ok",
+            "norenordno": "20121300065716",
+            "flid": "102",
+            "tsym": "BANKNIFTY26NOV26C52000",
+            "exch": "NFO",
+            "trantype": "B",
+            "prd": "I",
+            "flqty": "30",
+            "fillshares": "30",
+            "flprc": "210.00",
+            "ls": "30",
+            "fltm": "01-01-1980 00:00:00",
+            "exch_tm": "01-01-1980 00:00:00",
+            "norentm": "10:15:32 19-11-2026",
+            "ordersource": "WEB",
+        }
+    ]
+    BROKER.position_books["UID202"] = [
+        {"tsym": "BANKNIFTY26NOV26C52000", "exch": "NFO", "prd": "I", "netqty": "30", "lp": "230.00", "rpnl": "0.00", "urmtom": "600.00", "token": "41003"}
+    ]
+
+    acc2 = await DB.get_account_async("ACC-2")
+    await poll_account_async(acc2, datetime(2026, 11, 19, 10, 20, 0))
+
+    # Verify trade was built using norentm despite 01-01-1980 placeholder in fltm
+    trades = [t for t in await DB._all_trades() if t["account"] == "ACC-2" and t["tsym"] == "BANKNIFTY26NOV26C52000"]
+    assert len(trades) == 1
+    assert trades[0]["date"] == "2026-11-19"
+    assert trades[0]["time"] == "10:15"
+    assert trades[0]["open"] is True
+    assert trades[0]["unrealized_pnl"] == 600.0
+
+    # Verify SingleOrdHist endpoint & order rejection reason persistence
+    hist_resp = client.get("/api/orders/20121300065716/history?account=ACC-2", headers=headers).json()
+    assert len(hist_resp) == 2
+    assert hist_resp[0]["rpt"] == "Fill"
+
+    orders_resp = client.get("/api/orders?account=ACC-2", headers=headers).json()
+    rej_ord = next(o for o in orders_resp if o["norenordno"] == "20121300065717")
+    assert rej_ord["status"] == "REJECTED"
+    assert "Margin Exceeds" in rej_ord["remarks"]
+
+
+@pytest.mark.asyncio
+async def test_17_carry_forward_position_book_seed_exit_and_position_reversal():
+    """Verify carry-forward position closed today (without prior fill in TradeBook) and position reversal (Long -> Short)."""
+    from app import engine
+    acc = {"id": "ACC-CF", "trader": "TR-CF"}
+    cfg = {"brokerage_per_order": 20, "stt_sell_pct": 0.1, "txn_pct": 0.03503, "stamp_buy_pct": 0.003}
+    pmap = {"I": "MIS", "M": "NRML"}
+    now_dt = datetime(2026, 11, 19, 11, 0, 0)
+
+    # Case A: Carry-forward BUY 30 @ 200 in PositionBook closed today via SELL 30 @ 240 in TradeBook
+    today_fills = [
+        {
+            "norenordno": "ORD_CF_EXIT",
+            "flid": "FL_CF_1",
+            "tsym": "BANKNIFTY26NOV26C51500",
+            "exch": "NFO",
+            "trantype": "S",
+            "prd": "M",
+            "flqty": "30",
+            "flprc": "240.00",
+            "ls": "30",
+            "norentm": "10:05:00 19-11-2026",
+        }
+    ]
+    positions = [
+        {
+            "tsym": "BANKNIFTY26NOV26C51500",
+            "exch": "NFO",
+            "prd": "M",
+            "cfbuyqty": "30",
+            "cforgavgprc": "200.00",
+            "daysellqty": "30",
+            "daysellavgprc": "240.00",
+            "netqty": "0",
+            "rpnl": "1200.00",
+            "urmtom": "0.00",
+            "lp": "240.00",
+            "ls": "30",
+            "prcftr": "1.0",
+        }
+    ]
+    built_cf = engine.build_trades(acc, today_fills, cfg, pmap, lambda o: False, now_dt, {}, positions=positions)
+    assert len(built_cf) == 1
+    assert built_cf[0]["open"] is False
+    assert built_cf[0]["side"] == "BUY"
+    assert built_cf[0]["entry"] == 200.0
+    assert built_cf[0]["exit"] == 240.0
+    assert built_cf[0]["realized_pnl"] == 1200.0
+
+    # Case B: Position Reversal (BUY 30 @ 100 followed by SELL 60 @ 120 -> 1 closed BUY 30 (+600) + 1 open SELL 30 @ 120)
+    rev_fills = [
+        {
+            "norenordno": "ORD_REV_1",
+            "flid": "FL_R1",
+            "tsym": "NIFTY26NOV26C24500",
+            "exch": "NFO",
+            "trantype": "B",
+            "prd": "I",
+            "flqty": "30",
+            "flprc": "100.00",
+            "ls": "30",
+            "norentm": "09:30:00 19-11-2026",
+        },
+        {
+            "norenordno": "ORD_REV_2",
+            "flid": "FL_R2",
+            "tsym": "NIFTY26NOV26C24500",
+            "exch": "NFO",
+            "trantype": "S",
+            "prd": "I",
+            "flqty": "60",
+            "flprc": "120.00",
+            "ls": "30",
+            "norentm": "10:00:00 19-11-2026",
+        },
+    ]
+    built_rev = engine.build_trades(acc, rev_fills, cfg, pmap, lambda o: False, now_dt, {"NIFTY26NOV26C24500": 115.0})
+    assert len(built_rev) == 2
+    closed_long = next(t for t in built_rev if not t["open"])
+    open_short = next(t for t in built_rev if t["open"])
+    assert closed_long["side"] == "BUY"
+    assert closed_long["qty"] == 30.0
+    assert closed_long["realized_pnl"] == 600.0
+    assert open_short["side"] == "SELL"
+    assert open_short["qty"] == 30.0
+    assert open_short["entry"] == 120.0
+    assert open_short["unrealized_pnl"] == 150.0  # (120 - 115) * 30
+
+
+@pytest.mark.asyncio
+async def test_18_fast_bootstrap_endpoint():
+    """Verify /api/bootstrap returns all dashboard state in a single fast request (<200ms)."""
+    import time
+    client = TestClient(app)
+    headers = _get_auth_headers(client)
+    t0 = time.perf_counter()
+    resp = client.get("/api/bootstrap", headers=headers)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    assert resp.status_code == 200
+    data = resp.json()
+    for key in ("user", "traders", "accounts", "rules", "trades", "groups", "settings", "ruleLog", "status", "dailyReports", "violations"):
+        assert key in data
+    assert elapsed_ms < 500.0

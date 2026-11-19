@@ -1535,6 +1535,25 @@ async def put_trader(tid: str, request: Request, _=Depends(admin_only)):
     return d
 
 
+@app.delete("/api/traders/{tid}")
+async def delete_trader(tid: str, _=Depends(admin_only)):
+    await CONN_MGR.unregister_account(tid)
+    await DB.delete_trader_permanent_async(tid)
+    return {"ok": True}
+
+
+@app.post("/api/traders/delete-bulk")
+async def delete_traders_bulk(request: Request, _=Depends(admin_only)):
+    d = await request.json()
+    ids = d.get("ids", [])
+    count = 0
+    for tid in ids:
+        await CONN_MGR.unregister_account(tid)
+        await DB.delete_trader_permanent_async(tid)
+        count += 1
+    return {"ok": True, "deleted": count}
+
+
 @app.get("/api/accounts")
 async def get_accounts(user=Depends(current_user)):
     out = []
@@ -1609,6 +1628,25 @@ async def put_account(aid: str, request: Request, _=Depends(admin_only)):
         await DB._put_rule(aid, {"trader": aid, "account": aid, "rules": (base_rule or {}).get("rules") or engine.DEFAULT_RULES})
     safe_ret = {k: v for k, v in doc.items() if k != "zebu_secret_key"}
     return safe_ret
+
+
+@app.delete("/api/accounts/{aid}")
+async def delete_account(aid: str, _=Depends(admin_only)):
+    await CONN_MGR.unregister_account(aid)
+    await DB.delete_account_permanent_async(aid)
+    return {"ok": True}
+
+
+@app.post("/api/accounts/delete-bulk")
+async def delete_accounts_bulk(request: Request, _=Depends(admin_only)):
+    d = await request.json()
+    ids = d.get("ids", [])
+    count = 0
+    for aid in ids:
+        await CONN_MGR.unregister_account(aid)
+        await DB.delete_account_permanent_async(aid)
+        count += 1
+    return {"ok": True, "deleted": count}
 
 
 LINK_NONCE_MAP: Dict[str, Dict[str, Any]] = {}

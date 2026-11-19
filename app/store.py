@@ -840,6 +840,89 @@ class Store:
             return await self._delete_link_nonce(item_id)
         elif collection == "sessions":
             return await self._delete_session(item_id)
+        elif collection == "accounts":
+            return await self.delete_account_permanent_async(item_id)
+        elif collection == "traders":
+            return await self.delete_trader_permanent_async(item_id)
+
+    async def delete_account_permanent_async(self, aid: str):
+        """Permanently delete a broker account and all its associated sessions, sync states, orders, fills, positions, and trades."""
+        async with AsyncSessionLocal() as session:
+            stmt = select(Account).where(Account.id == aid)
+            acc = (await session.execute(stmt)).scalar_one_or_none()
+            z_uid = acc.zebu_uid if acc else None
+
+            await session.execute(sa_delete(BrokerSession).where(BrokerSession.account_id == aid))
+            await session.execute(sa_delete(AccountSyncState).where(AccountSyncState.account_id == aid))
+            await session.execute(sa_delete(DailyAccountReport).where(DailyAccountReport.account_id == aid))
+            await session.execute(sa_delete(DailySyncRecord).where(DailySyncRecord.account_id == aid))
+            await session.execute(sa_delete(Order).where(Order.account_id == aid))
+            await session.execute(sa_delete(Position).where(Position.account_id == aid))
+            await session.execute(sa_delete(PositionLot).where(PositionLot.account_id == aid))
+            await session.execute(sa_delete(Fill).where(Fill.account_id == aid))
+            await session.execute(sa_delete(Trade).where(Trade.account_id == aid))
+            await session.execute(sa_delete(TradingRule).where((TradingRule.trader_id == aid) | (TradingRule.account_id == aid)))
+            await session.execute(sa_delete(RuleLog).where(RuleLog.trader_id == aid))
+            await session.execute(sa_delete(Alert).where(Alert.account_id == aid))
+            await session.execute(sa_delete(LinkNonce).where(LinkNonce.account_id == aid))
+            await session.execute(sa_delete(Account).where(Account.id == aid))
+
+            # If a Trader profile was auto-created with the exact same ID as this account ID (or its zebu_uid if unused), remove it too
+            await session.execute(sa_delete(Trader).where(Trader.id == aid))
+            if z_uid and z_uid != aid:
+                rem_acc = (await session.execute(select(Account).where((Account.zebu_uid == z_uid) | (Account.trader_id == z_uid)))).scalars().first()
+                if not rem_acc:
+                    await session.execute(sa_delete(Trader).where(Trader.id == z_uid))
+                    await session.execute(sa_delete(TradingRule).where(TradingRule.trader_id == z_uid))
+
+            # Remove account ID from any groups
+            groups = (await session.execute(select(Group))).scalars().all()
+            for g in groups:
+                if g.traders and aid in g.traders:
+                    g.traders = [x for x in g.traders if x != aid]
+
+            await session.commit()
+
+    async def delete_trader_permanent_async(self, tid: str):
+        """Permanently delete a trader profile and any matching account/trades/rules."""
+        async with AsyncSessionLocal() as session:
+            # Find any broker accounts whose ID or zebu_uid matches this trader ID
+            matching_accs = (
+                await session.execute(
+                    select(Account).where((Account.id == tid) | (Account.zebu_uid == tid))
+                )
+            ).scalars().all()
+            matching_aids = [a.id for a in matching_accs]
+
+            await session.execute(sa_delete(Trader).where(Trader.id == tid))
+            await session.execute(sa_delete(TradingRule).where((TradingRule.trader_id == tid) | (TradingRule.account_id == tid)))
+            await session.execute(sa_delete(RuleLog).where(RuleLog.trader_id == tid))
+            await session.execute(sa_delete(Trade).where((Trade.trader_id == tid) | (Trade.account_id == tid)))
+            await session.execute(sa_delete(DailyAccountReport).where((DailyAccountReport.trader_id == tid) | (DailyAccountReport.account_id == tid)))
+            await session.execute(sa_delete(Alert).where((Alert.trader_id == tid) | (Alert.account_id == tid)))
+
+            # Clean up any broker accounts whose id or zebu_uid was tid so get_traders() does not re-create them
+            for aid in matching_aids:
+                await session.execute(sa_delete(BrokerSession).where(BrokerSession.account_id == aid))
+                await session.execute(sa_delete(AccountSyncState).where(AccountSyncState.account_id == aid))
+                await session.execute(sa_delete(DailyAccountReport).where(DailyAccountReport.account_id == aid))
+                await session.execute(sa_delete(DailySyncRecord).where(DailySyncRecord.account_id == aid))
+                await session.execute(sa_delete(Order).where(Order.account_id == aid))
+                await session.execute(sa_delete(Position).where(Position.account_id == aid))
+                await session.execute(sa_delete(PositionLot).where(PositionLot.account_id == aid))
+                await session.execute(sa_delete(Fill).where(Fill.account_id == aid))
+                await session.execute(sa_delete(Trade).where(Trade.account_id == aid))
+                await session.execute(sa_delete(TradingRule).where((TradingRule.trader_id == aid) | (TradingRule.account_id == aid)))
+                await session.execute(sa_delete(Alert).where(Alert.account_id == aid))
+                await session.execute(sa_delete(LinkNonce).where(LinkNonce.account_id == aid))
+                await session.execute(sa_delete(Account).where(Account.id == aid))
+
+            # Unassign any other broker accounts that pointed to this trader
+            assigned_accs = (await session.execute(select(Account).where(Account.trader_id == tid))).scalars().all()
+            for a in assigned_accs:
+                a.trader_id = None
+
+            await session.commit()
 
     async def delete_where_prefix_async(self, collection: str, prefix: str):
         """Delete items by prefix asynchronously."""

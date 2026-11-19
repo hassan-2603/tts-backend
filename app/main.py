@@ -538,6 +538,31 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
                             otr["unrealized_pnl"] = calc_unrl
                             otr["net_pnl"] = round(calc_unrl - float(otr.get("charges") or 0), 2)
                             otr["pnl_source"] = "broker_ltp"
+            else:
+                # Fully closed today (net_qty == 0): reconcile today's closed legs against Zebu's authoritative PositionBook rpnl
+                closed_trs = [t for t in sym_trades_today if not t.get("open")]
+                has_broker_rpnl = (p.get("rpnl") is not None and p.get("rpnl") != "") or (p.get("m2m") is not None and p.get("m2m") != "")
+                if closed_trs and has_broker_rpnl:
+                    target_rpnl = round(net_pos_pnl, 2)
+                    closed_sum = round(sum(float(t.get("realized_pnl") if t.get("realized_pnl") is not None else (t.get("pnl") or 0)) for t in closed_trs), 2)
+                    diff = round(target_rpnl - closed_sum, 2)
+                    if abs(diff) > 0.05:
+                        # Adjust proportionally by quantity across today's closed legs so sum(realized_pnl) == Zebu rpnl exactly
+                        tot_c_qty = sum(float(ct.get("qty") or (ct.get("lots", 1) * ct.get("lotSize", 1))) for ct in closed_trs) or 1.0
+                        adj_acc = 0.0
+                        for idx_c, ct in enumerate(closed_trs):
+                            cur_r = float(ct.get("realized_pnl") if ct.get("realized_pnl") is not None else (ct.get("pnl") or 0))
+                            if idx_c == len(closed_trs) - 1:
+                                delta = round(diff - adj_acc, 2)
+                            else:
+                                cq = float(ct.get("qty") or (ct.get("lots", 1) * ct.get("lotSize", 1)))
+                                delta = round(diff * (cq / tot_c_qty), 2)
+                                adj_acc = round(adj_acc + delta, 2)
+                            new_r = round(cur_r + delta, 2)
+                            ct["pnl"] = new_r
+                            ct["realized_pnl"] = new_r
+                            ct["net_pnl"] = round(new_r - float(ct.get("charges") or 0), 2)
+                            ct["pnl_source"] = "broker_rpnl"
         elif day_buy_q > 0 or day_sell_q > 0 or cf_buy_q > 0 or cf_sell_q > 0 or rpnl != 0 or net_qty != 0 or urmtom != 0 or m2m != 0:
             # Position exists in Zebu PositionBook (e.g. carry-forward position or position whose entry fill wasn't in local fills)
             is_pos_closed = (net_qty == 0)

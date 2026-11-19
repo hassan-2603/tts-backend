@@ -254,16 +254,16 @@ async def _is_day_locked_for_account_async(aid: str, now: datetime) -> bool:
     return False
 
 
-async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = False) -> str:
+async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = False, force: bool = False) -> str:
     """Fetches OrderBook, TradeBook, and PositionBook for an account, reconciles open/closed trades, and evaluates rules."""
     aid = acc["id"]
-    # Post-market hard lock: once market closes & day is finalized (or after 9:00 PM IST),
-    # never fetch or modify P&L/trade data from Zebu until 12:00 AM IST midnight rule.
-    if await _is_day_locked_for_account_async(aid, now):
+    # Post-market hard lock for automatic background polls: once market closes & day is finalized (or after 9:00 PM IST),
+    # never automatically fetch or modify P&L/trade data from Zebu until 12:00 AM IST midnight rule.
+    if not force and await _is_day_locked_for_account_async(aid, now):
         return "locked · market closed (final data locked until 12:00 AM IST)"
 
-    # Never unlock finalized trades after market close (15:30 IST)
-    if (now.hour, now.minute) > (15, 30):
+    # Never unlock finalized trades after market close (15:30 IST) unless explicitly forced by user manual sync
+    if not force and (now.hour, now.minute) > (15, 30):
         reconcile_today = False
     now_utc = datetime.now(timezone.utc)
     await DB.put_sync_state_async(aid, {"last_sync_start": now_utc})
@@ -704,17 +704,17 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
     return f"ok · {today_fills_cnt} fills today · {len(built)} trades rebuilt"
 
 
-async def poll_all_async(reason: str = "schedule") -> dict:
+async def poll_all_async(reason: str = "schedule", force: bool = False) -> dict:
     """Executes asynchronous concurrent polling across all connected accounts using ConnectionManager."""
     now = now_ist()
-    if now.hour >= 21:
+    if not force and now.hour >= 21:
         return {"status": "locked · 9:00 PM IST cutoff (no Zebu fetch until 12:00 AM IST)"}
     accounts = await DB.get_all_accounts_async()
     results = {}
 
     async def _sync_one(acc_dict):
         async def _sync_single(a=acc_dict):
-            return await poll_account_async(a, now, reconcile_today=(reason == "manual"))
+            return await poll_account_async(a, now, reconcile_today=(reason == "manual"), force=force)
         res = await CONN_MGR.sync_account_bounded(acc_dict, _sync_single)
         return acc_dict["id"], res
 
@@ -2268,12 +2268,15 @@ async def put_settings(request: Request, _=Depends(admin_only)):
 
 
 @app.post("/api/sync")
-async def sync_now(request: Request, account: Optional[str] = None, _=Depends(current_user)):
+async def sync_now(request: Request, account: Optional[str] = None, force: bool = False, _=Depends(current_user)):
     target_aid = account or request.query_params.get("account")
+    force_flag = force or str(request.query_params.get("force", "")).lower() in ("1", "true", "yes")
     if not target_aid:
         try:
             body = await request.json()
             target_aid = body.get("account")
+            if body.get("force"):
+                force_flag = True
         except Exception:
             pass
 
@@ -2288,14 +2291,14 @@ async def sync_now(request: Request, account: Optional[str] = None, _=Depends(cu
         if acc:
             now = now_ist()
             try:
-                res = await poll_account_async(acc, now, reconcile_today=True)
+                res = await poll_account_async(acc, now, reconcile_today=True, force=force_flag)
             except SessionExpired:
                 res = "expired"
             except Exception as e:
                 res = f"error: {str(e)[:200]}"
             return {"account": acc["id"], "result": res}
 
-    return await poll_all_async("manual")
+    return await poll_all_async("manual", force=force_flag)
 
 
 @app.post("/api/alerts/test")

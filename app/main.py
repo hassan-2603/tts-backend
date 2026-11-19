@@ -505,16 +505,29 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
         if sym_trades_today:
             if net_qty != 0:
                 open_trs = [t for t in sym_trades_today if t.get("open")]
+                closed_trs = [t for t in sym_trades_today if not t.get("open")]
                 if open_trs:
-                    if urmtom_raw is not None and urmtom_raw != "" and len(open_trs) == 1:
-                        otr = open_trs[0]
-                        ur_val = round(float(urmtom_raw), 2)
-                        otr["pnl"] = ur_val
-                        otr["unrealized_pnl"] = ur_val
-                        otr["net_pnl"] = round(ur_val - float(otr.get("charges") or 0), 2)
-                        otr["pnl_source"] = "broker_urmtom"
-                        if lp is not None and lp > 0:
-                            otr["exit"] = round(lp, 2)
+                    closed_sum = sum(float(t.get("realized_pnl") if t.get("realized_pnl") is not None else (t.get("pnl") or 0)) for t in closed_trs)
+                    # Zebu PositionBook authoritative total P&L for this contract = rpnl + urmtom (or m2m)
+                    has_broker_pnl = (urmtom_raw is not None and urmtom_raw != "") or (p.get("m2m") is not None and p.get("m2m") != "")
+                    if has_broker_pnl:
+                        # Target open P&L so that closed_sum + sum(open_trs) == net_pos_pnl (exact match to Zebu MTM/PNL)
+                        target_open_total = round(net_pos_pnl - closed_sum, 2)
+                        tot_open_qty = sum(float(otr.get("qty") or (otr.get("lots", 1) * otr.get("lotSize", 1))) for otr in open_trs) or 1.0
+                        assigned = 0.0
+                        for idx_o, otr in enumerate(open_trs):
+                            if idx_o == len(open_trs) - 1:
+                                share = round(target_open_total - assigned, 2)
+                            else:
+                                oq = float(otr.get("qty") or (otr.get("lots", 1) * otr.get("lotSize", 1)))
+                                share = round(target_open_total * (oq / tot_open_qty), 2)
+                                assigned = round(assigned + share, 2)
+                            otr["pnl"] = share
+                            otr["unrealized_pnl"] = share
+                            otr["net_pnl"] = round(share - float(otr.get("charges") or 0), 2)
+                            otr["pnl_source"] = "broker_urmtom"
+                            if lp is not None and lp > 0:
+                                otr["exit"] = round(lp, 2)
                     elif lp is not None and lp > 0:
                         for otr in open_trs:
                             otr["exit"] = round(lp, 2)

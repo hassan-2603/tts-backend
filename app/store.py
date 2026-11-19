@@ -694,6 +694,17 @@ class Store:
             await session.commit()
             return True
 
+    async def clear_rule_violations_async(self, account_id: str):
+        """Remove persisted rule violation alerts for an account/trader before re-evaluating updated/deleted rules."""
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                sa_delete(Alert).where(
+                    Alert.rule_name.isnot(None),
+                    (Alert.account_id == account_id) | (Alert.trader_id == account_id),
+                )
+            )
+            await session.commit()
+
     async def get_rule_violations_async(self, account_id: Optional[str] = None) -> List[Dict[str, Any]]:
         async with AsyncSessionLocal() as session:
             stmt = select(Alert).where(Alert.rule_name.isnot(None))

@@ -1984,9 +1984,42 @@ async def put_rules(tid: str, request: Request, user=Depends(admin_only)):
         "by": user["user"],
         "change": d.get("change", "Rules updated"),
     })
-    # Immediately re-evaluate rules for this account/trader
+    # Clear old violations for this account/trader and re-evaluate against the updated rules
+    await DB.clear_rule_violations_async(tid)
     await evaluate_and_record_violations_async(now_ist(), account_id=tid)
     return {"ok": True}
+
+
+@app.delete("/api/rules/{tid}")
+async def delete_rules(tid: str, user=Depends(admin_only)):
+    no_rules = {
+        "instrument": "ANY",
+        "expiry": "ANY",
+        "strikeMode": "ANY",
+        "strikeDist": 0,
+        "side": "ANY",
+        "product": "ANY",
+        "timeFrom": "",
+        "timeTo": "",
+        "maxTradesDay": 0,
+        "maxLots": 0,
+        "slPerLot": 0,
+        "dailyLoss": 0,
+        "hedge": False,
+        "source": "ANY",
+        "maxOpenPositions": 0,
+        "maxExposure": 0,
+        "requireHedgeOverLots": 0,
+    }
+    await DB._put_rule(tid, {"trader": tid, "account": tid, "rules": no_rules})
+    await DB._put_rule_log(secrets.token_hex(6), {
+        "trader": tid,
+        "at": now_ist().strftime("%Y-%m-%d %H:%M"),
+        "by": user["user"],
+        "change": "All rules deleted for account",
+    })
+    await DB.clear_rule_violations_async(tid)
+    return {"ok": True, "rules": no_rules}
 
 
 @app.get("/api/rulelog")

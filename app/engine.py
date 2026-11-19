@@ -292,9 +292,11 @@ def build_trades(
         if not tsym:
             continue
         pos_by_sym[tsym].append(p)
-        pf = _dec(p.get("prcftr"), Decimal("1"))
-        if pf and pf > Decimal("0"):
-            prcftr_by_sym[tsym] = pf
+        exch_u = str(p.get("exch") or "").upper()
+        if exch_u in ("MCX", "CDS"):
+            pf = _dec(p.get("prcftr"), Decimal("1"))
+            if pf and pf > Decimal("0"):
+                prcftr_by_sym[tsym] = pf
         lp_val = _dec(p.get("lp"), None)
         if lp_val is not None and lp_val > Decimal("0") and tsym not in ltp:
             ltp[tsym] = float(lp_val)
@@ -400,45 +402,6 @@ def build_trades(
                     "val": missing_cf_s * cf_px,
                     "ts": prev_day_ts,
                     "last": prev_day_ts,
-                })
-
-        # Fallback if PositionBook has intraday buy/sell quantities that were absent from TradeBook
-        if day_buy_total > Decimal("0") and today_buy == Decimal("0"):
-            db_px = _dec(p0.get("daybuyavgprc") or p0.get("totbuyavgprc") or p0.get("netavgprc"), Decimal("0"))
-            if db_px > Decimal("0"):
-                by_sym[tsym].append({
-                    "oid": f"PB-{today_d.isoformat()}-{tsym}-B",
-                    "tsym": tsym,
-                    "exch": exch_p,
-                    "side": "BUY",
-                    "prd": prd_p,
-                    "ls": ls_p,
-                    "token": p0.get("token"),
-                    "ordersource": "PositionBook",
-                    "remarks": "Reconciled from PositionBook",
-                    "qty": day_buy_total,
-                    "val": day_buy_total * db_px,
-                    "ts": today_open_ts,
-                    "last": today_open_ts,
-                })
-        if day_sell_total > Decimal("0") and today_sell == Decimal("0"):
-            ds_px = _dec(p0.get("daysellavgprc") or p0.get("totsellavgprc") or p0.get("netavgprc"), Decimal("0"))
-            if ds_px > Decimal("0"):
-                sell_ts = today_open_ts + timedelta(minutes=5)
-                by_sym[tsym].append({
-                    "oid": f"PB-{today_d.isoformat()}-{tsym}-S",
-                    "tsym": tsym,
-                    "exch": exch_p,
-                    "side": "SELL",
-                    "prd": prd_p,
-                    "ls": ls_p,
-                    "token": p0.get("token"),
-                    "ordersource": "PositionBook",
-                    "remarks": "Reconciled from PositionBook",
-                    "qty": day_sell_total,
-                    "val": day_sell_total * ds_px,
-                    "ts": sell_ts,
-                    "last": sell_ts,
                 })
 
     trades = []

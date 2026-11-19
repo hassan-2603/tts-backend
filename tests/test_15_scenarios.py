@@ -740,3 +740,24 @@ async def test_18_fast_bootstrap_endpoint():
     for key in ("user", "traders", "accounts", "rules", "trades", "groups", "settings", "ruleLog", "status", "dailyReports", "violations"):
         assert key in data
     assert elapsed_ms < 500.0
+
+
+@pytest.mark.asyncio
+async def test_19_post_market_hard_lock_until_midnight():
+    """Verify that once market closes & EOD finalizes (or after 9:00 PM IST), no sync can alter final P&L until 12:00 AM IST."""
+    acc2 = await DB.get_account_async("ACC-2")
+    # Finalize 2026-11-19 at 15:35 IST
+    await finalize_eod_async(now=datetime(2026, 11, 19, 15, 35, 0), target_date="2026-11-19")
+
+    # Simulate Zebu clearing PositionBook / TradeBook at 16:00 IST and 21:30 IST
+    BROKER.trade_books["UID202"] = []
+    BROKER.position_books["UID202"] = []
+    calls_before = BROKER.sync_call_counts.get("UID202", 0)
+
+    res_4pm = await poll_account_async(acc2, datetime(2026, 11, 19, 16, 0, 0), reconcile_today=True)
+    assert "locked" in res_4pm.lower()
+    res_930pm = await poll_account_async(acc2, datetime(2026, 11, 19, 21, 30, 0), reconcile_today=True)
+    assert "locked" in res_930pm.lower()
+
+    # Zero Zebu API calls were made while locked!
+    assert BROKER.sync_call_counts.get("UID202", 0) == calls_before

@@ -239,13 +239,32 @@ async def any_token_async() -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+async def _is_day_locked_for_account_async(aid: str, now: datetime) -> bool:
+    """Returns True if today's data for `aid` is locked after market close (15:30 IST) until 00:00 IST midnight."""
+    # Hard 9:00 PM IST cutoff for all accounts regardless of finalization state
+    if now.hour >= 21:
+        return True
+    # After market close (15:30 IST), once EOD finalization has locked today's report, never mutate today's data
+    if (now.hour, now.minute) > (15, 30):
+        today_str = now.date().isoformat()
+        reps = await DB.get_daily_reports_async(account_id=aid)
+        for r in reps:
+            if r.get("account") == aid and r.get("date") == today_str and r.get("status") in ("FINALIZED", "ARCHIVED"):
+                return True
+    return False
+
+
 async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = False) -> str:
     """Fetches OrderBook, TradeBook, and PositionBook for an account, reconciles open/closed trades, and evaluates rules."""
-    # Hard 9:00 PM IST cutoff: never fetch or modify P&L/trade data from Zebu between 21:00 IST and 00:00 IST
-    if now.hour >= 21:
-        return "locked · 9:00 PM IST cutoff (final data locked until 12:00 AM IST)"
-
     aid = acc["id"]
+    # Post-market hard lock: once market closes & day is finalized (or after 9:00 PM IST),
+    # never fetch or modify P&L/trade data from Zebu until 12:00 AM IST midnight rule.
+    if await _is_day_locked_for_account_async(aid, now):
+        return "locked · market closed (final data locked until 12:00 AM IST)"
+
+    # Never unlock finalized trades after market close (15:30 IST)
+    if (now.hour, now.minute) > (15, 30):
+        reconcile_today = False
     now_utc = datetime.now(timezone.utc)
     await DB.put_sync_state_async(aid, {"last_sync_start": now_utc})
 
@@ -1378,9 +1397,9 @@ async def get_raw_account_pnl(aid: str, _=Depends(current_user)):
     zebu_data = {}
     poll_result = None
     now_cur = now_ist()
-    if now_cur.hour >= 21:
-        zebu_data = {"ok": True, "locked": True, "message": "9:00 PM IST cutoff — final data locked until 12:00 AM IST"}
-        poll_result = "locked · 9:00 PM IST cutoff (final data locked until 12:00 AM IST)"
+    if await _is_day_locked_for_account_async(acc["id"], now_cur):
+        zebu_data = {"ok": True, "locked": True, "message": "Market closed — final data locked until 12:00 AM IST"}
+        poll_result = "locked · market closed (final data locked until 12:00 AM IST)"
     elif tok and uid:
         try:
             positions = await ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url)

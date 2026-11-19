@@ -1971,22 +1971,39 @@ async def get_rules(_=Depends(current_user)):
     return await get_rules_map_async()
 
 
+async def _related_rule_ids_async(tid: str) -> List[str]:
+    ids = {tid}
+    all_acc = await DB.get_all_accounts_async()
+    for a in all_acc:
+        if a.get("id") == tid or a.get("trader") == tid or a.get("zebu_uid") == tid:
+            if a.get("id"):
+                ids.add(a["id"])
+            if a.get("trader"):
+                ids.add(a["trader"])
+            if a.get("zebu_uid"):
+                ids.add(a["zebu_uid"])
+    return list(ids)
+
+
 @app.put("/api/rules/{tid}")
 async def put_rules(tid: str, request: Request, user=Depends(admin_only)):
     d = await request.json()
     rules_payload = d.get("rules", d)
-    await DB._put_rule(tid, {"trader": tid, "account": tid, "rules": rules_payload})
+    rel_ids = await _related_rule_ids_async(tid)
+    for rid in rel_ids:
+        await DB._put_rule(rid, {"trader": rid, "account": rid, "rules": rules_payload})
 
-    # If tid is an account ID or trader ID, ensure rule is associated strictly with that ID
     await DB._put_rule_log(secrets.token_hex(6), {
         "trader": tid,
         "at": now_ist().strftime("%Y-%m-%d %H:%M"),
         "by": user["user"],
         "change": d.get("change", "Rules updated"),
     })
-    # Clear old violations for this account/trader and re-evaluate against the updated rules
-    await DB.clear_rule_violations_async(tid)
-    await evaluate_and_record_violations_async(now_ist(), account_id=tid)
+    # Clear all old violations for this trader & linked accounts, then re-evaluate against the new rules
+    for rid in rel_ids:
+        await DB.clear_rule_violations_async(rid)
+    for rid in rel_ids:
+        await evaluate_and_record_violations_async(now_ist(), account_id=rid)
     return {"ok": True}
 
 
@@ -2011,14 +2028,16 @@ async def delete_rules(tid: str, user=Depends(admin_only)):
         "maxExposure": 0,
         "requireHedgeOverLots": 0,
     }
-    await DB._put_rule(tid, {"trader": tid, "account": tid, "rules": no_rules})
+    rel_ids = await _related_rule_ids_async(tid)
+    for rid in rel_ids:
+        await DB._put_rule(rid, {"trader": rid, "account": rid, "rules": no_rules})
+        await DB.clear_rule_violations_async(rid)
     await DB._put_rule_log(secrets.token_hex(6), {
         "trader": tid,
         "at": now_ist().strftime("%Y-%m-%d %H:%M"),
         "by": user["user"],
         "change": "All rules deleted for account",
     })
-    await DB.clear_rule_violations_async(tid)
     return {"ok": True, "rules": no_rules}
 
 

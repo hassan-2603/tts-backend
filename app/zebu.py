@@ -27,6 +27,7 @@ READ_ONLY_ENDPOINTS = {
     "OrderBook",      # order list (status, remarks, ordersource)
     "SingleOrdHist",  # complete order history lifecycle (modifications, fills, rejections)
     "PositionBook",   # open positions + LTP (for open / carried trades)
+    "Limits",         # funds & margin limits (read-only: marginused, span, expo, premium, pendordval)
     "Holdings",       # demat holdings
     "TPSeries",       # 1-min candles -> index spot at entry time
     "GetIndexList",   # find index tokens (Nifty Bank etc.)
@@ -461,6 +462,18 @@ class ZebuClient:
         a = self._clean_uid(actid) or u
         r = await self._post_async("PositionBook", {"uid": u, "actid": a}, token, proxy=proxy)
         return r if isinstance(r, list) else []
+
+    async def limits_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None) -> dict:
+        """Official Zebu Funds & Limits endpoint (READ-ONLY): POST /NorenWClientAPI/Limits.
+        Returns the raw dict; raises ZebuError on malformed/non-OK responses (never coerces to zero)."""
+        u = self._clean_uid(uid)
+        a = self._clean_uid(actid) or u
+        r = await self._post_async("Limits", {"uid": u, "actid": a}, token, proxy=proxy)
+        if not isinstance(r, dict):
+            raise ZebuError(f"Limits: unexpected response type {type(r).__name__}")
+        if str(r.get("stat", "")).strip().lower() != "ok":
+            raise ZebuError(f"Limits: stat={r.get('stat')!r} emsg={r.get('emsg', '')}")
+        return r
 
     async def tp_series_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], st: int, et: int, intrv: str = "1", proxy: Optional[str] = None) -> List[dict]:
         u = self._clean_uid(uid)

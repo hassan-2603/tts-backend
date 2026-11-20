@@ -1491,6 +1491,219 @@ async def get_overview_financial_summary_diagnostics(_=Depends(admin_only)):
     return FIN_SUMMARY.get_diagnostics()
 
 
+_FUNDS_CACHE: Dict[str, Dict[str, Any]] = {}
+_FUNDS_CACHE_MONO: Dict[str, float] = {}
+_FUNDS_LAST_VERIFIED: Dict[str, Dict[str, Any]] = {}
+_FUNDS_INFLIGHT: Dict[str, asyncio.Task] = {}
+_FUNDS_CACHE_TTL = 15.0
+
+
+def _parse_limits_decimal(val: Any, required: bool = False) -> Tuple[Optional[Decimal], bool]:
+    """Strictly parses a Zebu Limits numeric string into Decimal. Returns (value, is_valid)."""
+    if val is None or (isinstance(val, str) and not val.strip()):
+        return (None, False) if required else (Decimal("0"), True)
+    if isinstance(val, bool):
+        return (None, False)
+    try:
+        d = Decimal(str(val).strip())
+        if not d.is_finite():
+            return (None, False)
+        return (d, True)
+    except Exception:
+        return (None, False)
+
+
+def _compute_account_funds_from_limits(limits: Any) -> Dict[str, Any]:
+    """Computes Available Funds and Utilized Funds from official Zebu Limits API response.
+
+    Official Zebu / Noren Limits fields:
+      - cash:       baseline cash margin available in ledger (required)
+      - brkcollamt: pre-valued collateral margin (optional, 0 if omitted)
+      - payin:      same-day pay-in credited (optional, 0 if omitted)
+      - payout:     same-day payout requested (optional, 0 if omitted)
+      - marginused: total margin / funds currently utilized (optional -> 0 if omitted on OK response)
+
+    Formulas (exact Decimal):
+      utilized_funds  = marginused
+      available_funds = cash + brkcollamt + payin - payout - marginused
+    """
+    if not isinstance(limits, dict) or str(limits.get("stat", "")).strip().lower() != "ok":
+        return {"ok": False, "error": "Invalid Limits response (stat != Ok)"}
+
+    cash, ok_cash = _parse_limits_decimal(limits.get("cash"), required=True)
+    brkcollamt, ok_coll = _parse_limits_decimal(limits.get("brkcollamt"), required=False)
+    payin, ok_payin = _parse_limits_decimal(limits.get("payin"), required=False)
+    payout, ok_payout = _parse_limits_decimal(limits.get("payout"), required=False)
+    marginused, ok_mu = _parse_limits_decimal(limits.get("marginused"), required=False)
+
+    if not (ok_cash and ok_coll and ok_payin and ok_payout and ok_mu) or cash is None:
+        return {"ok": False, "error": "Missing or invalid numeric fields in Zebu Limits response"}
+
+    utilized = engine._q2(marginused)
+    available = engine._q2(cash + brkcollamt + payin - payout - marginused)
+    return {
+        "ok": True,
+        "available_funds": available,
+        "utilized_funds": utilized,
+        "fields": {
+            "cash": str(engine._q2(cash)),
+            "brkcollamt": str(engine._q2(brkcollamt)),
+            "payin": str(engine._q2(payin)),
+            "payout": str(engine._q2(payout)),
+            "marginused": str(utilized),
+        },
+    }
+
+
+async def _fetch_overview_funds_summary_async(accounts: List[dict], scope_key: str) -> Dict[str, Any]:
+    t0 = time.perf_counter()
+    # Deduplicate by unique broker account (uid, actid) so shared accounts are fetched & counted exactly once
+    unique_accounts: Dict[str, dict] = {}
+    for a in accounts:
+        if (a.get("broker") or "Zebu") != "Zebu" or not a.get("zebu_uid"):
+            continue
+        u = ZEBU._clean_uid(a.get("zebu_uid"))
+        act = ZEBU._clean_uid(a.get("zebu_actid") or u)
+        key = f"{u}|{act}"
+        if key not in unique_accounts:
+            unique_accounts[key] = a
+
+    linked: List[Tuple[str, dict, str]] = []
+    for key, a in unique_accounts.items():
+        tok = await token_for_account_async(a["id"])
+        if tok:
+            linked.append((key, a, tok))
+
+    async def _fetch_one(key: str, acc: dict, tok: str):
+        u = ZEBU._clean_uid(acc.get("zebu_uid"))
+        act = ZEBU._clean_uid(acc.get("zebu_actid") or u)
+        async with CONN_MGR.semaphore:
+            try:
+                raw = await ZEBU.limits_async(tok, u, act, proxy=acc.get("proxy_url"))
+                parsed = _compute_account_funds_from_limits(raw)
+                return key, acc, parsed
+            except SessionExpired as se:
+                return key, acc, {"ok": False, "error": f"Session expired: {se}", "error_type": "SESSION_EXPIRED"}
+            except Exception as e:
+                return key, acc, {"ok": False, "error": str(e)[:200], "error_type": "BROKER_ERROR"}
+
+    results = await asyncio.gather(*[_fetch_one(k, a, t) for k, a, t in linked])
+
+    total_avail = Decimal("0")
+    total_util = Decimal("0")
+    succeeded = 0
+    failed_accounts = []
+    per_account = []
+
+    for key, acc, res in results:
+        if res.get("ok"):
+            succeeded += 1
+            total_avail += res["available_funds"]
+            total_util += res["utilized_funds"]
+            per_account.append({
+                "account_id": acc["id"],
+                "account_name": acc.get("name") or acc["id"],
+                "broker_account": key,
+                "ok": True,
+                "available_funds": str(res["available_funds"]),
+                "utilized_funds": str(res["utilized_funds"]),
+                "fields": res.get("fields"),
+            })
+        else:
+            err_msg = res.get("error") or "Failed to fetch Limits"
+            failed_accounts.append(f"{acc.get('name') or acc['id']} ({err_msg})")
+            per_account.append({
+                "account_id": acc["id"],
+                "account_name": acc.get("name") or acc["id"],
+                "broker_account": key,
+                "ok": False,
+                "error": err_msg,
+            })
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist_str = now_utc.astimezone(IST).strftime("%d %b %Y, %H:%M:%S IST")
+    base = {
+        "accounts_linked": len(linked),
+        "accounts_succeeded": succeeded,
+        "accounts_failed": len(failed_accounts),
+        "accounts": per_account,
+        "last_updated_at": now_utc.isoformat(),
+        "last_updated_ist": now_ist_str,
+        "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+        "read_only": True,
+    }
+
+    if not linked:
+        return {**base, "status": "UNAVAILABLE", "available_funds": None, "utilized_funds": None, "error": "No linked Zebu accounts"}
+
+    if succeeded == 0:
+        prev = _FUNDS_LAST_VERIFIED.get(scope_key)
+        err_summary = "All linked accounts failed: " + "; ".join(failed_accounts[:4])
+        if prev:
+            return {
+                **base,
+                "status": "STALE",
+                "available_funds": prev["available_funds"],
+                "utilized_funds": prev["utilized_funds"],
+                "last_updated_at": prev["last_updated_at"],
+                "last_updated_ist": prev["last_updated_ist"],
+                "error": err_summary,
+            }
+        return {**base, "status": "UNAVAILABLE", "available_funds": None, "utilized_funds": None, "error": err_summary}
+
+    avail_str = str(engine._q2(total_avail))
+    util_str = str(engine._q2(total_util))
+    if len(failed_accounts) == 0:
+        _FUNDS_LAST_VERIFIED[scope_key] = {
+            "available_funds": avail_str,
+            "utilized_funds": util_str,
+            "last_updated_at": base["last_updated_at"],
+            "last_updated_ist": now_ist_str,
+        }
+        return {**base, "status": "LIVE", "available_funds": avail_str, "utilized_funds": util_str, "error": None}
+
+    return {
+        **base,
+        "status": "PARTIAL",
+        "available_funds": avail_str,
+        "utilized_funds": util_str,
+        "error": f"{len(failed_accounts)} of {len(linked)} account(s) failed: " + "; ".join(failed_accounts[:4]),
+    }
+
+
+@app.get("/api/overview/funds-summary")
+async def get_overview_funds_summary(force: int = 0, user=Depends(current_user)):
+    """READ-ONLY: Aggregates Total Available Funds and Total Utilized Funds from Zebu Limits API
+    across every unique linked broker account authorized for the current user."""
+    all_acc = await DB.get_all_accounts_async()
+    allowed = []
+    for a in all_acc:
+        try:
+            await _assert_user_can_access_account(user, a)
+            allowed.append(a)
+        except HTTPException:
+            continue
+
+    scope_key = "admin" if user.get("role") == "admin" else f"user:{user.get('user')}"
+    now_m = time.monotonic()
+    if not force and scope_key in _FUNDS_CACHE and (now_m - _FUNDS_CACHE_MONO.get(scope_key, 0.0)) < _FUNDS_CACHE_TTL:
+        return {**_FUNDS_CACHE[scope_key], "cache_hit": True}
+
+    task = _FUNDS_INFLIGHT.get(scope_key)
+    if task is None or task.done():
+        task = asyncio.create_task(_fetch_overview_funds_summary_async(allowed, scope_key))
+        _FUNDS_INFLIGHT[scope_key] = task
+    try:
+        res = await asyncio.shield(task)
+    finally:
+        if _FUNDS_INFLIGHT.get(scope_key) is task and task.done():
+            _FUNDS_INFLIGHT.pop(scope_key, None)
+
+    _FUNDS_CACHE[scope_key] = res
+    _FUNDS_CACHE_MONO[scope_key] = time.monotonic()
+    return {**res, "cache_hit": False}
+
+
 # ---------------- Health & Metrics Endpoints ----------------
 @app.get("/health")
 def health():

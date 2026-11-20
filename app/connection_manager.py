@@ -92,11 +92,24 @@ class ConnectionManager:
         token: str,
         on_fill: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
         on_touchline: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
+        on_status_change: Optional[Callable[[str, str], Coroutine[Any, Any, None]]] = None,
     ):
         """Attaches and starts a real-time WebSocket connection for an account."""
         state = self.get_account_state(account_id)
 
-        # Stop existing client if any
+        # Avoid duplicate WebSocket connection if already running with same credentials
+        if (
+            state.ws_client
+            and state.ws_client._running
+            and state.ws_client.token == token
+            and state.ws_client.uid == uid
+            and state.ws_client.actid == (actid or uid)
+        ):
+            if on_touchline is not None:
+                state.ws_client.on_touchline_update = on_touchline
+            return
+
+        # Stop existing client if credentials changed
         if state.ws_client:
             await state.ws_client.stop()
 
@@ -130,6 +143,11 @@ class ConnectionManager:
         async def _on_status_change(new_status: str, msg: str):
             state.status = new_status
             log.info(f"Account {account_id} WS status changed to {new_status}: {msg}")
+            if on_status_change:
+                try:
+                    await on_status_change(new_status, msg)
+                except Exception as e:
+                    log.debug(f"Status change callback error for {account_id}: {e}")
 
         ws_client = ZebuWebSocketClient(
             ws_url=CFG.ZEBU_WS_URL,
@@ -148,6 +166,16 @@ class ConnectionManager:
         state = self.accounts.get(account_id)
         if state and state.ws_client and scriplist:
             await state.ws_client.subscribe_touchline(scriplist)
+
+    async def unsubscribe_account_touchline(self, account_id: str, scriplist: list[str]):
+        state = self.accounts.get(account_id)
+        if state and state.ws_client and scriplist:
+            await state.ws_client.unsubscribe_touchline(scriplist)
+
+    async def set_account_touchline_subscriptions(self, account_id: str, scriplist: list[str]):
+        state = self.accounts.get(account_id)
+        if state and state.ws_client:
+            await state.ws_client.set_touchline_subscriptions(scriplist)
 
     async def unregister_account(self, account_id: str):
         if account_id in self.accounts:

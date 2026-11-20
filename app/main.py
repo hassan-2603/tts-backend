@@ -62,6 +62,7 @@ from app.store import Store
 from app.zebu import ZebuClient, SessionExpired, ZebuError
 from app.alerts import Alerter
 from app.connection_manager import ConnectionManager
+from app.financial_summary import FinancialSummaryService
 from app.scheduler import MarketScheduler, now_ist, IST
 from app.metrics import METRICS
 from app import engine
@@ -177,6 +178,54 @@ class DashboardWebSocketManager:
 
 
 WS_HUB = DashboardWebSocketManager()
+
+
+async def _ensure_account_ws_stream(acc: dict, token: str):
+    """Ensures a single Zebu WebSocket stream is active for `acc` with OrderUpdate + Touchline MTM wiring."""
+    aid = acc["id"]
+    uid = (acc.get("zebu_uid") or "").strip().upper()
+    actid = (acc.get("zebu_actid") or uid).strip().upper()
+    if not uid or not token:
+        return
+
+    async def _on_fill(msg: dict, a=acc):
+        FIN_SUMMARY.schedule_reconcile(a, reason="order_update")
+        await poll_account_async(a, now_ist())
+
+    async def _on_touchline(msg: dict, account_id=aid):
+        await FIN_SUMMARY.on_touchline_tick(account_id, msg)
+
+    async def _on_status_change(new_status: str, _msg: str, account_id=aid, a=acc):
+        await FIN_SUMMARY.on_ws_status_change(account_id, new_status, acc=a)
+
+    await CONN_MGR.register_account_stream(
+        account_id=aid,
+        uid=uid,
+        actid=actid,
+        token=token,
+        on_fill=_on_fill,
+        on_touchline=_on_touchline,
+        on_status_change=_on_status_change,
+    )
+
+
+async def _assert_user_can_access_account(user: dict, acc: dict):
+    """Strictly enforces per-user account isolation (prevents cross-account parameter tampering)."""
+    role = user.get("role")
+    if role == "admin":
+        return
+    u = await DB.get_user_async(user.get("user", ""))
+    if role == "trader":
+        tid = u.get("trader_id") if u else None
+        if not tid or (acc.get("trader") != tid and acc.get("id") != tid):
+            raise HTTPException(403, "Not authorized to access this account's financial data")
+        return
+    if role == "viewer":
+        allowed = u.get("assigned_accounts") if u else None
+        if not allowed or acc.get("id") not in allowed:
+            raise HTTPException(403, "Not authorized to access this account's financial data")
+        return
+    raise HTTPException(403, "Not authorized to access this account's financial data")
 
 
 # ---------------- Polling & Synchronization ----------------
@@ -1257,13 +1306,7 @@ async def lifespan(app: FastAPI):
         for acc in all_accounts:
             tok = await token_for_account_async(acc["id"])
             if tok and acc.get("zebu_uid"):
-                await CONN_MGR.register_account_stream(
-                    account_id=acc["id"],
-                    uid=acc["zebu_uid"],
-                    actid=acc.get("zebu_actid") or acc["zebu_uid"],
-                    token=tok,
-                    on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
-                )
+                await _ensure_account_ws_stream(acc, tok)
         now_s = now_ist()
         if (9, 15) <= (now_s.hour, now_s.minute) <= (15, 45):
             asyncio.create_task(poll_all_async("startup"))
@@ -1351,6 +1394,47 @@ async def link_state(acc: dict) -> str:
     """Returns true connection status without masking expired or disconnected sessions (Req 8.6, 8.7, 8.8)."""
     t = await DB.get_token_async(acc["id"])
     return _link_state_from_doc(t)
+
+
+FIN_SUMMARY = FinancialSummaryService(
+    zebu=ZEBU,
+    conn_mgr=CONN_MGR,
+    ws_hub=WS_HUB,
+    token_resolver=token_for_account_async,
+    link_state_resolver=link_state,
+)
+
+
+@app.get("/api/overview/financial-summary")
+async def get_overview_financial_summary(
+    account_id: str,
+    force: int = 0,
+    user=Depends(current_user),
+):
+    """Strictly read-only endpoint returning verified Realized P&L (rpnl) and Unrealized MTM (urmtom)
+    for the exact selected account from official Zebu PositionBook + live WebSocket Touchline feed.
+    """
+    aid = (account_id or "").strip()
+    if not aid:
+        raise HTTPException(400, "account_id is required")
+
+    acc = await DB.get_account_async(aid)
+    if not acc:
+        raise HTTPException(404, f"Account '{aid}' not found")
+
+    await _assert_user_can_access_account(user, acc)
+    return await FIN_SUMMARY.get_summary(
+        acc=acc,
+        user_id=user.get("user", "unknown"),
+        force=bool(force),
+        ensure_ws_cb=_ensure_account_ws_stream if CFG.RUN_WORKER_IN_PROCESS else None,
+    )
+
+
+@app.get("/api/overview/financial-summary/diagnostics")
+async def get_overview_financial_summary_diagnostics(_=Depends(admin_only)):
+    """Secure server-side diagnostics for financial summary latency, cache hit/miss, and WS status."""
+    return FIN_SUMMARY.get_diagnostics()
 
 
 # ---------------- Health & Metrics Endpoints ----------------
@@ -1722,6 +1806,7 @@ async def link_account(aid: str, request: Request, _=Depends(admin_only)):
 async def unlink_account(aid: str, _=Depends(admin_only)):
     await DB.delete_token_async(aid)
     await CONN_MGR.unregister_account(aid)
+    FIN_SUMMARY.clear_account(aid)
     await DB.put_sync_state_async(aid, {
         "status": "DISCONNECTED",
         "is_stale": False,
@@ -1818,13 +1903,7 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
     acc["zebu_actid"] = clean_actid
     await DB.put_account_async(aid, acc)
 
-    await CONN_MGR.register_account_stream(
-        account_id=acc["id"],
-        uid=clean_uid,
-        actid=clean_actid,
-        token=final_token,
-        on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
-    )
+    await _ensure_account_ws_stream(acc, final_token)
     asyncio.create_task(poll_account_async(acc, now_ist()))
     return {"ok": True, "cliname": doc.get("cliname")}
 
@@ -2015,13 +2094,7 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
     await DB._delete_link_nonce(n)
     LINK_NONCE_MAP.pop(n, None)
 
-    await CONN_MGR.register_account_stream(
-        account_id=acc["id"],
-        uid=clean_uid,
-        actid=clean_actid,
-        token=doc["access_token"],
-        on_fill=lambda msg, a=acc: poll_account_async(a, now_ist()),
-    )
+    await _ensure_account_ws_stream(acc, doc["access_token"])
 
     asyncio.create_task(poll_all_async("linked"))
 

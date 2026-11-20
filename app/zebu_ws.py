@@ -71,6 +71,30 @@ class ZebuWebSocketClient:
             except Exception as e:
                 log.debug(f"Touchline subscribe error for {self.account_id}: {e}")
 
+    async def unsubscribe_touchline(self, scriplist: list[str]):
+        """Unsubscribe from Touchline LTP ticks using official Zebu task 'u'."""
+        clean = [s.strip() for s in (scriplist or []) if s and "|" in str(s)]
+        if not clean:
+            return
+        to_remove = [s for s in clean if s in self._subscribed_scrips]
+        for s in to_remove:
+            self._subscribed_scrips.discard(s)
+        if self._ws and self._status == "REAL-TIME" and to_remove:
+            try:
+                await self._ws.send(json.dumps({"t": "u", "k": "#".join(to_remove)}))
+            except Exception as e:
+                log.debug(f"Touchline unsubscribe error for {self.account_id}: {e}")
+
+    async def set_touchline_subscriptions(self, scriplist: list[str]):
+        """Reconciles Touchline subscriptions so only the exact open-position scrips are subscribed."""
+        desired = {s.strip() for s in (scriplist or []) if s and "|" in str(s)}
+        to_unsub = sorted(self._subscribed_scrips - desired)
+        to_sub = sorted(desired - self._subscribed_scrips)
+        if to_unsub:
+            await self.unsubscribe_touchline(to_unsub)
+        if to_sub:
+            await self.subscribe_touchline(to_sub)
+
     async def start(self):
         """Start the persistent WebSocket connection in a background task."""
         if self._running:

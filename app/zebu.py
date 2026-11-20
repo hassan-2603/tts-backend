@@ -13,7 +13,9 @@ import hashlib
 import json
 import logging
 import asyncio
-from typing import Any, Dict, List, Optional, Union
+import random
+import time
+from typing import Any, Dict, List, Optional, Tuple, Union
 import httpx
 
 log = logging.getLogger("tts.zebu")
@@ -308,13 +310,90 @@ class ZebuClient:
                 if proxy and (isinstance(e, httpx.ProxyError) or "proxy" in str(e).lower() or isinstance(e, (httpx.ConnectTimeout, httpx.ConnectError))):
                     raise ZebuError(f"Proxy Connection Error: Unable to reach proxy '{proxy}'. Please verify your proxy host, port, and authentication credentials.") from e
                 if attempt < retries:
-                    backoff = (2 ** attempt) * 0.5
+                    backoff = (2 ** attempt) * 0.5 * random.uniform(0.75, 1.25)
                     await asyncio.sleep(backoff)
                 else:
                     raise ZebuError(f"{endpoint} network error: {e}") from e
 
         if last_ex:
             raise ZebuError(f"{endpoint} failed: {last_ex}")
+
+    async def position_book_snapshot_async(
+        self,
+        token: str,
+        uid: str,
+        actid: str,
+        proxy: Optional[str] = None,
+        timeout: Optional[float] = None,
+        retries: int = 2,
+    ) -> Tuple[Any, int, float]:
+        """Official Zebu OAuth PositionBook snapshot call (STRICTLY READ-ONLY).
+
+        Endpoint: POST /NorenWClientAPI/PositionBook
+        Header:   Authorization: Bearer <access_token>
+                  Content-Type: text/plain
+        Body:     jData={"uid":"...","actid":"..."}
+
+        Returns (parsed_json, http_status, elapsed_ms) without silently coercing
+        malformed or error payloads into empty lists.
+        """
+        u = self._clean_uid(uid)
+        a = self._clean_uid(actid) or u
+        payload = {"uid": u, "actid": a}
+        headers = {
+            "Content-Type": "text/plain",
+            "Authorization": f"Bearer {token}",
+        }
+        body = "jData=" + json.dumps(payload, separators=(",", ":"))
+        client = self._get_async_http(proxy=proxy)
+        req_timeout = timeout if timeout is not None else min(self.timeout, 12.0)
+
+        t0 = time.perf_counter()
+        last_ex: Optional[Exception] = None
+        for attempt in range(retries + 1):
+            try:
+                resp = await client.post(
+                    f"{self.base}/NorenWClientAPI/PositionBook",
+                    content=body,
+                    headers=headers,
+                    timeout=req_timeout,
+                )
+                elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+                if resp.status_code == 401:
+                    raise SessionExpired("PositionBook: HTTP 401 Unauthorized (token expired or invalid)")
+                if resp.status_code == 429:
+                    raise RateLimitError("PositionBook: HTTP 429 Rate limit exceeded")
+                if resp.status_code >= 500:
+                    raise ZebuError(f"PositionBook: HTTP {resp.status_code} server error")
+                if resp.status_code != 200:
+                    raise ZebuError(f"PositionBook: unexpected HTTP {resp.status_code}")
+
+                try:
+                    data = resp.json()
+                except ValueError as ve:
+                    raise ZebuError(f"PositionBook: HTTP {resp.status_code} malformed non-JSON response") from ve
+
+                return data, resp.status_code, elapsed_ms
+            except SessionExpired:
+                raise
+            except (httpx.ProxyError, httpx.ConnectError, httpx.TimeoutException, RateLimitError) as e:
+                last_ex = e
+                if proxy and (isinstance(e, httpx.ProxyError) or isinstance(e, (httpx.ConnectTimeout, httpx.ConnectError))):
+                    raise ZebuError(f"Proxy Connection Error for PositionBook: {e}") from e
+                if attempt < retries:
+                    backoff = (2 ** attempt) * 0.4 * random.uniform(0.75, 1.25)
+                    await asyncio.sleep(backoff)
+                else:
+                    raise ZebuError(f"PositionBook network/rate-limit error: {e}") from e
+            except ZebuError as e:
+                last_ex = e
+                if "HTTP 5" in str(e) and attempt < retries:
+                    backoff = (2 ** attempt) * 0.4 * random.uniform(0.75, 1.25)
+                    await asyncio.sleep(backoff)
+                else:
+                    raise
+
+        raise ZebuError(f"PositionBook failed: {last_ex}")
 
     # ---------- Low Level Sync Request (Preserved for compatibility) ----------
     def _post_sync(self, endpoint: str, payload: dict, token: Optional[str] = None, proxy: Optional[str] = None) -> Any:

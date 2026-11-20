@@ -159,18 +159,38 @@ async def spot_at_async(underlying: str, ts: datetime) -> Optional[float]:
 # ---------------- Active Dashboard WebSockets ----------------
 class DashboardWebSocketManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        # Maps WebSocket -> authenticated user scope dict {user, role, trader_id, assigned_accounts}
+        self.active_connections: Dict[WebSocket, Dict[str, Any]] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, user_scope: Dict[str, Any]):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections[websocket] = user_scope
 
     def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+        self.active_connections.pop(websocket, None)
+
+    @staticmethod
+    def _is_authorized_for_account(scope: Dict[str, Any], account_id: str, trader_id: Optional[str] = None) -> bool:
+        role = scope.get("role")
+        if role == "admin":
+            return True
+        if role == "trader":
+            u_tid = scope.get("trader_id")
+            if not u_tid:
+                return False
+            return (trader_id is not None and trader_id == u_tid) or (account_id == u_tid)
+        if role == "viewer":
+            allowed = scope.get("assigned_accounts") or []
+            return account_id in allowed
+        return False
 
     async def broadcast(self, message: dict):
-        for connection in list(self.active_connections):
+        acc_id = message.get("account_id")
+        tr_id = message.get("trader_id")
+        for connection, scope in list(self.active_connections.items()):
+            # Enforce strict per-account isolation for any account-scoped message
+            if acc_id and not self._is_authorized_for_account(scope, str(acc_id), tr_id):
+                continue
             try:
                 await connection.send_json(message)
             except Exception:
@@ -1464,7 +1484,25 @@ def api_health():
 # ---------------- Live Dashboard WebSocket ----------------
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await WS_HUB.connect(websocket)
+    # Authenticate WebSocket via TTS user session token (?token=... or Authorization header)
+    tok = (websocket.query_params.get("token") or "").strip()
+    if not tok:
+        auth_hdr = websocket.headers.get("authorization", "")
+        if auth_hdr.lower().startswith("bearer "):
+            tok = auth_hdr[7:].strip()
+    sess = (await DB.get_session_async(tok)) if tok else None
+    if not sess or sess.get("exp", 0) < time.time():
+        await websocket.close(code=1008, reason="Unauthorized WebSocket session")
+        return
+
+    u_doc = await DB.get_user_async(sess.get("user", ""))
+    user_scope = {
+        "user": sess.get("user"),
+        "role": sess.get("role"),
+        "trader_id": (u_doc or {}).get("trader_id"),
+        "assigned_accounts": (u_doc or {}).get("assigned_accounts") or [],
+    }
+    await WS_HUB.connect(websocket, user_scope)
     try:
         while True:
             data = await websocket.receive_text()

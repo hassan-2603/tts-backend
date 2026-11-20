@@ -141,38 +141,29 @@ class ZebuWebSocketClient:
                 ) as ws:
                     self._ws = ws
 
-                    # 1. Handshake (Official OAuth task 'a' with fallback to Noren task 'c')
+                    # 1. Handshake (Official Zebu OAuth WebSocket task 'a')
                     handshake_a = {
                         "t": "a",
                         "uid": self.uid,
                         "actid": self.actid or self.uid,
                         "accesstoken": self.token,
-                        "susertoken": self.token,
                         "source": "API",
                     }
                     await ws.send(json.dumps(handshake_a))
 
-                    # 2. Receive Handshake Ack
+                    # 2. Receive Handshake Ack (t='ak' or 'ck' with s='OK')
                     ack_raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
                     ack = json.loads(ack_raw) if isinstance(ack_raw, str) else json.loads(ack_raw.decode("utf-8"))
 
-                    if ack.get("t") not in ("ck", "ak") or str(ack.get("s", "")).upper() != "OK":
-                        # Try legacy Noren 'c' handshake before giving up
-                        handshake_c = {
-                            "t": "c",
-                            "uid": self.uid,
-                            "actid": self.actid or self.uid,
-                            "susertoken": self.token,
-                            "accesstoken": self.token,
-                            "source": "API",
-                        }
-                        await ws.send(json.dumps(handshake_c))
-                        ack_raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
-                        ack = json.loads(ack_raw) if isinstance(ack_raw, str) else json.loads(ack_raw.decode("utf-8"))
-
-                    if ack.get("t") not in ("ck", "ak") or str(ack.get("s", "")).upper() != "OK":
-                        log.warning(f"Handshake failed for {self.account_id}: {ack}")
-                        await self._set_status("DEGRADED", f"Handshake failed: {ack.get('emsg', 'Unknown')}")
+                    if ack.get("t") not in ("ak", "ck") or str(ack.get("s", "")).upper() != "OK":
+                        emsg = str(ack.get("emsg") or ack.get("s") or "Authentication failed")
+                        low = emsg.lower()
+                        log.warning(f"OAuth WebSocket handshake failed for {self.account_id}: {emsg}")
+                        if any(k in low for k in ("invalid", "expired", "unauth", "session", "token", "not_ok")):
+                            await self._set_status("REAUTH_REQUIRED", f"OAuth WS auth failed: {emsg}")
+                            self._running = False
+                            return
+                        await self._set_status("DEGRADED", f"Handshake failed: {emsg}")
                         await asyncio.sleep(retry_delay)
                         continue
 
@@ -226,15 +217,18 @@ class ZebuWebSocketClient:
                 break
 
     async def _handle_message(self, msg: Dict[str, Any]):
-        """Dispatches incoming Noren messages."""
+        """Dispatches incoming Noren/Zebu OAuth WebSocket messages."""
         t = msg.get("t")
         if t == "om":
             # Order update event
             if self.on_order_update:
                 await self.on_order_update(msg)
         elif t in ("tk", "tf"):
-            # Touchline / Price feed event
+            # Touchline ack ('tk') or live price feed ('tf')
             if self.on_touchline_update:
                 await self.on_touchline_update(msg)
-        elif t == "ck":
-            pass  # Heartbeat or acknowledgment
+        elif t == "uk":
+            # Touchline unsubscription acknowledgement
+            log.debug(f"Touchline unsubscribe ack for {self.account_id}: {msg.get('e')}|{msg.get('tk')}")
+        elif t in ("ak", "ck"):
+            pass  # Connection/heartbeat acknowledgement

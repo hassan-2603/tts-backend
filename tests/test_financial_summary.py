@@ -287,16 +287,23 @@ def test_22_24_network_interruption_stale_preservation_and_expired_token(env):
     expired token returns REAUTH_REQUIRED."""
     mock, client, admin = env["mock"], env["client"], env["admin"]
 
+    # Advance past the 2s force-refresh cooldown so the forced refresh actually hits the broker
+    entry_a = FIN_SUMMARY.get_entry_for_account("ACC-A")
+    assert entry_a is not None
+    entry_a.last_fetch_mono -= 5.0
+
     # Simulate network failure on ACC-A after it already has a verified snapshot
     mock.errors["ZEBU_A"] = ZebuError("PositionBook network error: Gateway timeout")
-    r_stale = client.get("/api/overview/financial-summary?account_id=ACC-A&force=1", headers=admin)
-    assert r_stale.status_code == 200
-    ds = r_stale.json()
-    assert ds["status"] == "STALE"
-    assert ds["pnl"]["value"] == "12500.50"   # Preserved last verified value, NOT zero!
-    assert ds["pnl"]["status"] == "STALE"
-    assert ds["last_updated_ist"] is not None
-    mock.errors.pop("ZEBU_A", None)
+    try:
+        r_stale = client.get("/api/overview/financial-summary?account_id=ACC-A&force=1", headers=admin)
+        assert r_stale.status_code == 200
+        ds = r_stale.json()
+        assert ds["status"] == "STALE"
+        assert ds["pnl"]["value"] == "12500.50"   # Preserved last verified value, NOT zero!
+        assert ds["pnl"]["status"] == "STALE"
+        assert ds["last_updated_ist"] is not None
+    finally:
+        mock.errors.pop("ZEBU_A", None)
 
     # Expired token account returns REAUTH_REQUIRED with null values (never fake zero)
     FIN_SUMMARY.clear_account("ACC-EXP")
@@ -364,3 +371,75 @@ def test_27_to_30_strict_read_only_no_token_leak_and_account_authorization(env):
     assert client.get("/api/overview/financial-summary?account_id=ACC-B", headers=trader_a).status_code == 403
     assert client.get("/api/overview/financial-summary?account_id=ACC-B", headers=viewer_b).status_code == 200
     assert client.get("/api/overview/financial-summary?account_id=ACC-A", headers=viewer_b).status_code == 403
+
+
+def test_31_websocket_account_isolation_and_auth_enforcement(env):
+    """CRITICAL SECURITY AUDIT TEST:
+    - Unauthenticated /api/ws connection is rejected (code 1008).
+    - If Account A and Account B belong to different authorized users, a financial_summary_updated
+      broadcast for Account A MUST NEVER reach a user authorized only for Account B.
+    """
+    client = env["client"]
+    trader_a_tok = env["trader_a"]["Authorization"].split(" ", 1)[1]
+    viewer_b_tok = env["viewer_b"]["Authorization"].split(" ", 1)[1]
+
+    # Unauthenticated WS rejected
+    with pytest.raises(Exception):
+        with client.websocket_connect("/api/ws"):
+            pass
+
+    # Verify DashboardWebSocketManager authorization logic directly for Account A broadcast
+    mgr = main_mod.WS_HUB
+    received_a: List[dict] = []
+    received_b: List[dict] = []
+
+    class _FakeWS:
+        def __init__(self, sink):
+            self.sink = sink
+        async def send_json(self, msg):
+            self.sink.append(msg)
+
+    ws_a = _FakeWS(received_a)
+    ws_b = _FakeWS(received_b)
+    mgr.active_connections[ws_a] = {"user": "trader_a", "role": "trader", "trader_id": "TR-A", "assigned_accounts": []}
+    mgr.active_connections[ws_b] = {"user": "viewer_b", "role": "viewer", "trader_id": None, "assigned_accounts": ["ACC-B"]}
+    try:
+        asyncio.run(mgr.broadcast({
+            "type": "financial_summary_updated",
+            "account_id": "ACC-A",
+            "trader_id": "TR-A",
+            "mtm": {"value": "-78000.00", "status": "LIVE"},
+        }))
+        assert len(received_a) == 1
+        assert received_a[0]["account_id"] == "ACC-A"
+        # User B (authorized ONLY for ACC-B) MUST NOT receive Account A's financial update
+        assert len(received_b) == 0
+    finally:
+        mgr.disconnect(ws_a)
+        mgr.disconnect(ws_b)
+
+    # Also verify authenticated WS endpoint accepts valid session tokens
+    with client.websocket_connect(f"/api/ws?token={trader_a_tok}") as ws1:
+        ws1.send_text("ping")
+        assert ws1.receive_text() == "pong"
+    with client.websocket_connect(f"/api/ws?token={viewer_b_tok}") as ws2:
+        ws2.send_text("ping")
+        assert ws2.receive_text() == "pong"
+
+
+def test_32_force_refresh_cooldown_prevents_api_abuse(env):
+    """Verifies rapid repeated ?force=1 calls are throttled by cooldown and do not spam PositionBook."""
+    mock, client, admin = env["mock"], env["client"], env["admin"]
+    FIN_SUMMARY.clear_account("ACC-A")
+    mock.call_counts["ZEBU_A"] = 0
+
+    r1 = client.get("/api/overview/financial-summary?account_id=ACC-A&force=1", headers=admin)
+    assert r1.status_code == 200
+    assert mock.call_counts["ZEBU_A"] == 1
+
+    # Immediate second force=1 within cooldown window must reuse verified snapshot (no second broker call)
+    r2 = client.get("/api/overview/financial-summary?account_id=ACC-A&force=1", headers=admin)
+    assert r2.status_code == 200
+    assert r2.json().get("force_throttled") is True
+    assert mock.call_counts["ZEBU_A"] == 1
+

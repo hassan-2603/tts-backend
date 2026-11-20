@@ -31,6 +31,8 @@ log = logging.getLogger("tts.financial_summary")
 TWO_DP = Decimal("0.01")
 FEED_STALE_SECONDS = 45.0
 CACHE_TTL_SECONDS = 3.0  # Short single-flight reuse window to avoid hammering broker API
+FORCE_REFRESH_COOLDOWN_SECONDS = 2.0  # Prevents force=1 abuse from triggering unlimited broker calls
+FORCE_REFRESH_MAX_PER_MINUTE = 10     # Per-account sliding-window cap for forced refreshes
 
 
 class FinancialValidationError(Exception):
@@ -123,6 +125,7 @@ class AccountFinancialCacheEntry:
     account_id: str
     uid: str
     actid: str
+    trader_id: Optional[str] = None
     last_verified: Optional[ValidatedPositionSnapshot] = None
     last_fetch_attempt_at: Optional[datetime] = None
     last_fetch_mono: float = 0.0
@@ -136,6 +139,7 @@ class AccountFinancialCacheEntry:
     cache_hits: int = 0
     cache_misses: int = 0
     live_mtm_override: Optional[Decimal] = None
+    force_refresh_timestamps: List[float] = field(default_factory=list)
 
 
 def validate_and_aggregate_position_book(
@@ -442,6 +446,7 @@ class FinancialSummaryService:
         self._last_selected_by_user[user_id] = aid
 
         entry = self._get_or_create_entry(aid, uid, actid)
+        entry.trader_id = acc.get("trader") or entry.trader_id
 
         # Resolve token securely server-side
         token = await self.token_resolver(aid) if self.token_resolver else None
@@ -458,6 +463,20 @@ class FinancialSummaryService:
 
         # Serve recent verified snapshot within short TTL unless forced
         now_mono = time.monotonic()
+        if force and entry.last_verified is not None and entry.last_error is None:
+            # Guard against force=1 abuse: enforce minimum cooldown & per-minute sliding-window cap
+            entry.force_refresh_timestamps = [t for t in entry.force_refresh_timestamps if now_mono - t < 60.0]
+            if (
+                (now_mono - entry.last_fetch_mono) < FORCE_REFRESH_COOLDOWN_SECONDS
+                or len(entry.force_refresh_timestamps) >= FORCE_REFRESH_MAX_PER_MINUTE
+            ):
+                entry.cache_hits += 1
+                log.info("FinancialSummary force refresh throttled: account=%s (serving verified snapshot)", aid)
+                resp = self._build_response(entry, acc, overall_status=None, cache_hit=True)
+                resp["force_throttled"] = True
+                return resp
+            entry.force_refresh_timestamps.append(now_mono)
+
         if (
             not force
             and entry.last_verified is not None
@@ -638,6 +657,7 @@ class FinancialSummaryService:
                 await self.ws_hub.broadcast({
                     "type": "financial_summary_updated",
                     "account_id": account_id,
+                    "trader_id": entry.trader_id,
                     "uid": entry.uid,
                     "actid": entry.actid,
                     "mtm": {

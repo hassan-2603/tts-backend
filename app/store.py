@@ -577,65 +577,151 @@ class Store:
                 for r in rows
             ]
 
-    async def put_many_positions_async(self, account_id: str, positions: List[Dict[str, Any]]):
-        async with AsyncSessionLocal() as session:
-            fresh_ids = set()
-            for p in positions:
-                tsym = str(p.get("tsym") or "")
-                if not tsym:
-                    continue
-                prd = str(p.get("prd") or "MIS")
-                pid = f"{account_id}|{tsym}|{prd}"
-                fresh_ids.add(pid)
-                stmt = select(Position).where(Position.id == pid)
-                row = (await session.execute(stmt)).scalar_one_or_none()
+    async def replace_account_positions_snapshot_async(
+        self,
+        account_id: str,
+        positions: List[Dict[str, Any]],
+        expected_uid: Optional[str] = None,
+        expected_actid: Optional[str] = None,
+        allow_empty: bool = False,
+        snapshot_time: Optional[datetime] = None,
+    ) -> int:
+        """Atomically replaces the current PositionBook snapshot for `account_id` inside a single DB transaction.
+
+        Safety guarantees:
+        - Validates account UID/ACTID and numeric fields BEFORE mutating any DB rows.
+        - Deduplicates duplicate rows by canonical key (exch, tsym, prd).
+        - Assigns a single uniform `snapshot_time` (UTC) to all rows in the snapshot.
+        - Removes stale rows belonging ONLY to `account_id` that are absent from this complete snapshot.
+        - Never touches other accounts, historical `fills`, `trades`, or `daily_account_reports`.
+        - If `positions` is empty and `allow_empty=False`, retains existing snapshot without deleting.
+        """
+        if not isinstance(positions, list):
+            raise ValueError(f"Invalid positions payload type: {type(positions).__name__}")
+
+        if len(positions) == 0 and not allow_empty:
+            return 0
+
+        def _clean_id(v: Optional[str]) -> str:
+            s = (v or "").strip().upper()
+            return s[:-2] if s.endswith("_U") else s
+
+        exp_uid = _clean_id(expected_uid)
+        exp_actid = _clean_id(expected_actid) or exp_uid
+        snap_ts = snapshot_time or datetime.now(timezone.utc)
+
+        # 1. Validate & deduplicate all rows in memory BEFORE opening a write transaction
+        validated_rows: Dict[str, Dict[str, Any]] = {}
+        for idx, p in enumerate(positions):
+            if not isinstance(p, dict):
+                raise ValueError(f"Malformed position row at index {idx}: expected dict")
+            row_stat = p.get("stat")
+            if row_stat is not None and str(row_stat).strip().lower() != "ok":
+                raise ValueError(f"Incomplete/failed position row at index {idx}: stat={row_stat!r}")
+            row_uid = _clean_id(p.get("uid"))
+            row_actid = _clean_id(p.get("actid"))
+            if exp_uid and row_uid and row_uid != exp_uid:
+                raise ValueError(f"Position row {idx} UID mismatch: expected {exp_uid}, got {row_uid}")
+            if exp_actid and row_actid and row_actid != exp_actid:
+                raise ValueError(f"Position row {idx} ACTID mismatch: expected {exp_actid}, got {row_actid}")
+
+            tsym = str(p.get("tsym") or "").strip()
+            exch = str(p.get("exch") or "NFO").strip().upper()
+            if not tsym:
+                raise ValueError(f"Missing tsym in position row {idx}")
+            prd = str(p.get("prd") or "MIS").strip().upper()
+            pid = f"{account_id}|{tsym}|{prd}"
+            if pid in validated_rows:
+                # Deduplicate identical position row within same PositionBook response
+                continue
+
+            try:
                 net_qty = float(p.get("netqty") or 0)
                 buy_qty = float(p.get("daybuyqty") or p.get("totbuyqty") or 0)
                 sell_qty = float(p.get("daysellqty") or p.get("totsellqty") or 0)
                 buy_avg = float(p.get("daybuyavgprc") or p.get("totbuyavgprc") or p.get("netavgprc") or 0)
                 sell_avg = float(p.get("daysellavgprc") or p.get("totsellavgprc") or 0)
                 lp_raw = p.get("lp")
-                ltp_val = float(lp_raw) if lp_raw is not None and lp_raw != "" else None
-                rpnl = float(p.get("rpnl") or 0)
-                urmtom = float(p.get("urmtom") or 0)
+                ltp_val = float(lp_raw) if lp_raw is not None and str(lp_raw).strip() != "" else None
+                rpnl = float(p.get("rpnl") if p.get("rpnl") not in (None, "") else 0)
+                urmtom = float(p.get("urmtom") if p.get("urmtom") not in (None, "") else 0)
+            except (ValueError, TypeError) as ve:
+                raise ValueError(f"Invalid numeric field in position row {idx} ({tsym}): {ve}") from ve
 
-                if not row:
-                    row = Position(
-                        id=pid,
-                        account_id=account_id,
-                        tsym=tsym,
-                        product=prd,
-                        exch=p.get("exch", "NFO"),
-                        net_qty=net_qty,
-                        buy_qty=buy_qty,
-                        sell_qty=sell_qty,
-                        buy_avg=buy_avg,
-                        sell_avg=sell_avg,
-                        ltp=ltp_val,
-                        realized_pnl=rpnl,
-                        unrealized_pnl=urmtom,
-                        raw_payload=p,
-                    )
-                    session.add(row)
-                else:
-                    row.net_qty = net_qty
-                    row.buy_qty = buy_qty
-                    row.sell_qty = sell_qty
-                    row.buy_avg = buy_avg
-                    row.sell_avg = sell_avg
-                    if ltp_val is not None:
-                        row.ltp = ltp_val
-                    row.realized_pnl = rpnl
-                    row.unrealized_pnl = urmtom
-                    row.raw_payload = p
-                    row.updated_at = datetime.now(timezone.utc)
-            # Remove stale prior-day Position rows not present in the fresh PositionBook snapshot
-            if fresh_ids:
-                existing_rows = (await session.execute(select(Position).where(Position.account_id == account_id))).scalars().all()
-                for er in existing_rows:
-                    if er.id not in fresh_ids:
-                        await session.delete(er)
-            await session.commit()
+            validated_rows[pid] = {
+                "id": pid,
+                "tsym": tsym,
+                "prd": prd,
+                "exch": exch,
+                "net_qty": net_qty,
+                "buy_qty": buy_qty,
+                "sell_qty": sell_qty,
+                "buy_avg": buy_avg,
+                "sell_avg": sell_avg,
+                "ltp": ltp_val,
+                "rpnl": rpnl,
+                "urmtom": urmtom,
+                "raw": p,
+            }
+
+        # 2. Atomic single-transaction replacement scoped strictly to `account_id`
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                existing_rows = (
+                    await session.execute(select(Position).where(Position.account_id == account_id))
+                ).scalars().all()
+                existing_by_id = {er.id: er for er in existing_rows}
+
+                # Delete stale rows belonging ONLY to this account that are absent from the fresh snapshot
+                for er_id, er_obj in existing_by_id.items():
+                    if er_id not in validated_rows:
+                        await session.delete(er_obj)
+
+                # Insert or update every validated row with uniform `snap_ts`
+                for pid, item in validated_rows.items():
+                    row = existing_by_id.get(pid)
+                    if not row:
+                        row = Position(
+                            id=pid,
+                            account_id=account_id,
+                            tsym=item["tsym"],
+                            product=item["prd"],
+                            exch=item["exch"],
+                            net_qty=item["net_qty"],
+                            buy_qty=item["buy_qty"],
+                            sell_qty=item["sell_qty"],
+                            buy_avg=item["buy_avg"],
+                            sell_avg=item["sell_avg"],
+                            ltp=item["ltp"],
+                            realized_pnl=item["rpnl"],
+                            unrealized_pnl=item["urmtom"],
+                            raw_payload=item["raw"],
+                            updated_at=snap_ts,
+                        )
+                        session.add(row)
+                    else:
+                        row.exch = item["exch"]
+                        row.net_qty = item["net_qty"]
+                        row.buy_qty = item["buy_qty"]
+                        row.sell_qty = item["sell_qty"]
+                        row.buy_avg = item["buy_avg"]
+                        row.sell_avg = item["sell_avg"]
+                        if item["ltp"] is not None:
+                            row.ltp = item["ltp"]
+                        row.realized_pnl = item["rpnl"]
+                        row.unrealized_pnl = item["urmtom"]
+                        row.raw_payload = item["raw"]
+                        row.updated_at = snap_ts
+
+        return len(validated_rows)
+
+    async def put_many_positions_async(self, account_id: str, positions: List[Dict[str, Any]]):
+        """Backward-compatible wrapper delegating to atomic snapshot replacement."""
+        await self.replace_account_positions_snapshot_async(
+            account_id=account_id,
+            positions=positions,
+            allow_empty=False,
+        )
 
     async def get_positions_async(self, account_id: Optional[str] = None) -> List[Dict[str, Any]]:
         async with AsyncSessionLocal() as session:

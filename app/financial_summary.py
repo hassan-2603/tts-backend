@@ -377,12 +377,14 @@ class FinancialSummaryService:
         ws_hub: Any = None,
         token_resolver: Optional[Callable[[str], Coroutine[Any, Any, Optional[str]]]] = None,
         link_state_resolver: Optional[Callable[[dict], Coroutine[Any, Any, str]]] = None,
+        position_persister: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
     ):
         self.zebu = zebu
         self.conn_mgr = conn_mgr
         self.ws_hub = ws_hub
         self.token_resolver = token_resolver
         self.link_state_resolver = link_state_resolver
+        self.position_persister = position_persister
 
         # Account-isolated cache keyed by "zebu:<uid>:<actid>:<account_id>"
         self._cache: Dict[str, AccountFinancialCacheEntry] = {}
@@ -546,6 +548,20 @@ class FinancialSummaryService:
             entry.last_error = None
             entry.last_error_type = None
             entry.live_mtm_override = None
+
+            # Sync validated current PositionBook snapshot to DB atomically so Trader Report & Overview match 100%
+            if self.position_persister and isinstance(raw_payload, list) or (self.position_persister and snapshot.empty_confirmed):
+                try:
+                    await self.position_persister(
+                        account_id=aid,
+                        positions=raw_payload if isinstance(raw_payload, list) else [],
+                        expected_uid=uid,
+                        expected_actid=actid,
+                        allow_empty=bool(snapshot.empty_confirmed and self._is_market_open_ist()),
+                        snapshot_time=snapshot.fetched_at,
+                    )
+                except Exception as pe:
+                    log.warning("Position snapshot DB sync notice for account=%s: %s", aid, pe)
 
             log.info(
                 "PositionBook fetch OK: account=%s uid=%s http=%s duration_ms=%.2f positions=%d open=%d rpnl=%s urmtom=%s",

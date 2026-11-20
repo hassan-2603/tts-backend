@@ -524,9 +524,21 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
                 o["order_history"] = _order_hist_cache[f"{aid}|{ord_no}"]
         await DB.put_many_orders_async(aid, orders)
 
-    # 2. Persist Positions & subscribe open position tokens to real-time WebSocket Touchline feed
+    # 2. Atomically replace current PositionBook snapshot (handling valid empty responses during market hours)
+    #    and subscribe open position tokens to real-time WebSocket Touchline feed.
+    try:
+        await DB.replace_account_positions_snapshot_async(
+            account_id=aid,
+            positions=positions,
+            expected_uid=uid,
+            expected_actid=actid,
+            allow_empty=in_market_window,
+            snapshot_time=now_utc,
+        )
+    except ValueError as pve:
+        log.error(f"PositionBook snapshot validation failed for {aid} (retaining previous snapshot): {pve}")
+        await DB.put_sync_state_async(aid, {"status": "STALE", "is_stale": True, "last_error": str(pve)[:300]})
     if positions:
-        await DB.put_many_positions_async(aid, positions)
         open_scrips = [
             f"{p.get('exch', 'NFO')}|{p.get('token')}"
             for p in positions
@@ -1443,6 +1455,7 @@ FIN_SUMMARY = FinancialSummaryService(
     ws_hub=WS_HUB,
     token_resolver=token_for_account_async,
     link_state_resolver=link_state,
+    position_persister=DB.replace_account_positions_snapshot_async,
 )
 
 
@@ -1734,30 +1747,57 @@ async def get_accounts(user=Depends(current_user)):
         DB.get_all_sync_states_async(),
         DB.get_positions_async(),
     )
-    today_ist_str = now_ist().date().isoformat()
-    broker_pnl_by_acc: Dict[str, Dict[str, Any]] = {}
+    today_ist_date = now_ist().date()
+    today_ist_str = today_ist_date.isoformat()
+    # Group today's positions per account and select ONLY the latest snapshot batch (within 5s of max updated_at)
+    # while excluding expired contracts (expiry < today_ist_date) so stale rows can NEVER leak into today's P&L.
+    today_pos_by_acc: Dict[str, List[Tuple[datetime, dict]]] = {}
     for pos in all_positions:
         p_aid = pos.get("account")
         if not p_aid:
             continue
         upd_raw = pos.get("updated_at")
-        is_today_pos = False
-        if upd_raw:
-            try:
-                upd_dt = datetime.fromisoformat(str(upd_raw).replace("Z", "+00:00"))
-                if upd_dt.tzinfo is None:
-                    upd_dt = upd_dt.replace(tzinfo=timezone.utc)
-                is_today_pos = upd_dt.astimezone(IST).date().isoformat() == today_ist_str
-            except Exception:
-                is_today_pos = False
-        if not is_today_pos:
+        if not upd_raw:
             continue
-        agg = broker_pnl_by_acc.setdefault(p_aid, {"rpnl": Decimal("0"), "urmtom": Decimal("0"), "count": 0, "updated_at": upd_raw})
-        agg["rpnl"] += Decimal(str(pos.get("realized_pnl") or 0))
-        agg["urmtom"] += Decimal(str(pos.get("unrealized_pnl") or 0))
-        agg["count"] += 1
-        if upd_raw and (not agg["updated_at"] or str(upd_raw) > str(agg["updated_at"])):
-            agg["updated_at"] = upd_raw
+        try:
+            upd_dt = datetime.fromisoformat(str(upd_raw).replace("Z", "+00:00"))
+            if upd_dt.tzinfo is None:
+                upd_dt = upd_dt.replace(tzinfo=timezone.utc)
+            if upd_dt.astimezone(IST).date().isoformat() != today_ist_str:
+                continue
+        except Exception:
+            continue
+        # Exclude expired contracts from prior trading days
+        parsed_inst = engine.parse_instrument(str(pos.get("tsym") or ""))
+        if parsed_inst and parsed_inst.get("expiry") and parsed_inst["expiry"] < today_ist_date:
+            continue
+        today_pos_by_acc.setdefault(p_aid, []).append((upd_dt, pos))
+
+    broker_pnl_by_acc: Dict[str, Dict[str, Any]] = {}
+    for p_aid, items in today_pos_by_acc.items():
+        max_upd = max(dt for dt, _ in items)
+        latest_batch = [
+            (dt, pos) for dt, pos in items
+            if (max_upd - dt).total_seconds() <= 5.0
+        ]
+        seen_keys: set[str] = set()
+        rpnl_sum = Decimal("0")
+        urmtom_sum = Decimal("0")
+        row_cnt = 0
+        for dt, pos in latest_batch:
+            ckey = f"{str(pos.get('exch') or 'NFO').upper()}|{str(pos.get('tsym') or '').strip()}|{str(pos.get('product') or 'MIS').upper()}"
+            if ckey in seen_keys:
+                continue
+            seen_keys.add(ckey)
+            rpnl_sum += Decimal(str(pos.get("realized_pnl") or 0))
+            urmtom_sum += Decimal(str(pos.get("unrealized_pnl") or 0))
+            row_cnt += 1
+        broker_pnl_by_acc[p_aid] = {
+            "rpnl": rpnl_sum,
+            "urmtom": urmtom_sum,
+            "count": row_cnt,
+            "updated_at": max_upd.isoformat(),
+        }
     tokens_by_id = {t["account"]: t for t in tokens_list}
     uid_by_aid = {a["id"]: (a.get("zebu_uid") or "").strip().upper() for a in all_acc}
     tokens_by_uid = {}

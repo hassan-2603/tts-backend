@@ -309,11 +309,11 @@ async def any_token_async() -> Tuple[Optional[str], Optional[str]]:
 
 
 async def _is_day_locked_for_account_async(aid: str, now: datetime) -> bool:
-    """Returns True if today's data for `aid` is locked after market close (15:30 IST) until 00:00 IST midnight."""
-    # Hard 9:00 PM IST cutoff for all accounts regardless of finalization state
-    if now.hour >= 21:
+    """Returns True if today's data for `aid` is locked after EOD finalization (or hard cutoff) until 00:00 IST midnight."""
+    cutoff_hr = int(getattr(CFG, "POST_MARKET_HARD_CUTOFF_HOUR", 21) or 21)
+    if now.hour >= cutoff_hr:
         return True
-    # After market close (15:30 IST), once EOD finalization has locked today's report, never mutate today's data
+    # After market close (15:30 IST), once EOD finalization has locked today's report, automatic polls must not mutate today's data
     if (now.hour, now.minute) > (15, 30):
         today_str = now.date().isoformat()
         reps = await DB.get_daily_reports_async(account_id=aid)
@@ -321,6 +321,51 @@ async def _is_day_locked_for_account_async(aid: str, now: datetime) -> bool:
             if r.get("account") == aid and r.get("date") == today_str and r.get("status") in ("FINALIZED", "ARCHIVED"):
                 return True
     return False
+
+
+async def _record_post_eod_versioned_reconciliation_async(acc: dict, now: datetime, positions: List[dict]):
+    """When a manual forced sync runs after EOD finalization, records a versioned correction note
+    on today's DailyAccountReport without creating duplicate rows or mutating past historical dates."""
+    aid = acc["id"]
+    today_str = now.date().isoformat()
+    reps = await DB.get_daily_reports_async(account_id=aid)
+    existing = next((r for r in reps if r.get("account") == aid and r.get("date") == today_str), None)
+    if not existing or existing.get("status") not in ("FINALIZED", "ARCHIVED"):
+        return
+    # Compute version number from prior notes
+    prev_notes = str(existing.get("reconciliation_notes") or "").strip()
+    version = prev_notes.count("[v") + 2
+    broker_rpnl = sum((Decimal(str(p.get("realized_pnl") if p.get("realized_pnl") is not None else (p.get("rpnl") or 0))) for p in positions), Decimal("0"))
+    broker_urmtom = sum((Decimal(str(p.get("unrealized_pnl") if p.get("unrealized_pnl") is not None else (p.get("urmtom") or 0))) for p in positions), Decimal("0"))
+    all_tr = await DB._all_trades(from_date=today_str)
+    closed_today = [
+        t for t in all_tr
+        if t.get("account") == aid and not t.get("open") and ((t.get("exitDate") or t.get("date")) == today_str)
+    ]
+    open_today = [t for t in all_tr if t.get("account") == aid and t.get("open")]
+    fifo_realized = sum((Decimal(str(t.get("realized_pnl") if t.get("realized_pnl") is not None else (t.get("pnl") or 0))) for t in closed_today), Decimal("0"))
+    charges_dec = sum((Decimal(str(t.get("charges") or 0)) for t in closed_today), Decimal("0"))
+    note_entry = (
+        f"[v{version} @ {now.strftime('%H:%M:%S')} IST] Manual forced reconciliation: "
+        f"broker_rpnl={broker_rpnl:.2f}, broker_urmtom={broker_urmtom:.2f}, fifo_closed={fifo_realized:.2f} "
+        f"(prev_realized={existing.get('realized_pnl', 0):.2f})"
+    )
+    combined_notes = (prev_notes + "\n" + note_entry).strip() if prev_notes else note_entry
+    await DB.put_daily_report_async(f"{aid}|{today_str}", {
+        **existing,
+        "realized_pnl": float(fifo_realized),
+        "unrealized_pnl": float(broker_urmtom),
+        "charges": float(charges_dec),
+        "net_pnl": float(fifo_realized - charges_dec),
+        "closed_trades": len(closed_today),
+        "open_trades": len(open_today),
+        "total_trades": len(closed_today) + len(open_today),
+        "winning_trades": len([t for t in closed_today if float(t.get("realized_pnl") or t.get("pnl") or 0) > 0]),
+        "losing_trades": len([t for t in closed_today if float(t.get("realized_pnl") or t.get("pnl") or 0) <= 0]),
+        "status": "FINALIZED",
+        "reconciliation_notes": combined_notes,
+        "finalized_at": datetime.now(timezone.utc),
+    }, allow_overwrite_finalized=True)
 
 
 async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = False, force: bool = False) -> str:
@@ -574,14 +619,12 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
         if sym_trades_today:
             if net_qty != 0:
                 open_trs = [t for t in sym_trades_today if t.get("open")]
-                closed_trs = [t for t in sym_trades_today if not t.get("open")]
                 if open_trs:
-                    closed_sum = sum(float(t.get("realized_pnl") if t.get("realized_pnl") is not None else (t.get("pnl") or 0)) for t in closed_trs)
-                    # Zebu PositionBook authoritative total P&L for this contract = rpnl + urmtom (or m2m)
-                    has_broker_pnl = (urmtom_raw is not None and urmtom_raw != "") or (p.get("m2m") is not None and p.get("m2m") != "")
-                    if has_broker_pnl:
-                        # Target open P&L so that closed_sum + sum(open_trs) == net_pos_pnl (exact match to Zebu MTM/PNL)
-                        target_open_total = round(net_pos_pnl - closed_sum, 2)
+                    # Keep TradeBook FIFO closed legs untouched; assign open position unrealized MTM
+                    # directly from Zebu PositionBook urmtom so MTM is never mixed with realized P&L or double-counted.
+                    has_broker_urmtom = (urmtom_raw is not None and urmtom_raw != "")
+                    if has_broker_urmtom:
+                        target_open_total = round(urmtom, 2)
                         tot_open_qty = sum(float(otr.get("qty") or (otr.get("lots", 1) * otr.get("lotSize", 1))) for otr in open_trs) or 1.0
                         assigned = 0.0
                         for idx_o, otr in enumerate(open_trs):
@@ -607,31 +650,9 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
                             otr["unrealized_pnl"] = calc_unrl
                             otr["net_pnl"] = round(calc_unrl - float(otr.get("charges") or 0), 2)
                             otr["pnl_source"] = "broker_ltp"
-            else:
-                # Fully closed today (net_qty == 0): reconcile today's closed legs against Zebu's authoritative PositionBook rpnl
-                closed_trs = [t for t in sym_trades_today if not t.get("open")]
-                has_broker_rpnl = (p.get("rpnl") is not None and p.get("rpnl") != "") or (p.get("m2m") is not None and p.get("m2m") != "")
-                if closed_trs and has_broker_rpnl:
-                    target_rpnl = round(net_pos_pnl, 2)
-                    closed_sum = round(sum(float(t.get("realized_pnl") if t.get("realized_pnl") is not None else (t.get("pnl") or 0)) for t in closed_trs), 2)
-                    diff = round(target_rpnl - closed_sum, 2)
-                    if abs(diff) > 0.05:
-                        # Adjust proportionally by quantity across today's closed legs so sum(realized_pnl) == Zebu rpnl exactly
-                        tot_c_qty = sum(float(ct.get("qty") or (ct.get("lots", 1) * ct.get("lotSize", 1))) for ct in closed_trs) or 1.0
-                        adj_acc = 0.0
-                        for idx_c, ct in enumerate(closed_trs):
-                            cur_r = float(ct.get("realized_pnl") if ct.get("realized_pnl") is not None else (ct.get("pnl") or 0))
-                            if idx_c == len(closed_trs) - 1:
-                                delta = round(diff - adj_acc, 2)
-                            else:
-                                cq = float(ct.get("qty") or (ct.get("lots", 1) * ct.get("lotSize", 1)))
-                                delta = round(diff * (cq / tot_c_qty), 2)
-                                adj_acc = round(adj_acc + delta, 2)
-                            new_r = round(cur_r + delta, 2)
-                            ct["pnl"] = new_r
-                            ct["realized_pnl"] = new_r
-                            ct["net_pnl"] = round(new_r - float(ct.get("charges") or 0), 2)
-                            ct["pnl_source"] = "broker_rpnl"
+            # Note: For closed legs (net_qty == 0 or partial closes), preserve genuine TradeBook FIFO execution P&L
+            # on individual trade rows. Authoritative broker rpnl is exposed separately from PositionBook without
+            # fabricating or arbitrarily redistributing differences onto individual trades.
         elif day_buy_q > 0 or day_sell_q > 0 or cf_buy_q > 0 or cf_sell_q > 0 or rpnl != 0 or net_qty != 0 or urmtom != 0 or m2m != 0:
             # Position exists in Zebu PositionBook (e.g. carry-forward position or position whose entry fill wasn't in local fills)
             is_pos_closed = (net_qty == 0)
@@ -1707,11 +1728,36 @@ async def delete_traders_bulk(request: Request, _=Depends(admin_only)):
 @app.get("/api/accounts")
 async def get_accounts(user=Depends(current_user)):
     out = []
-    all_acc, tokens_list, sync_states_map = await asyncio.gather(
+    all_acc, tokens_list, sync_states_map, all_positions = await asyncio.gather(
         DB.get_all_accounts_async(),
         DB._all_tokens(),
         DB.get_all_sync_states_async(),
+        DB.get_positions_async(),
     )
+    today_ist_str = now_ist().date().isoformat()
+    broker_pnl_by_acc: Dict[str, Dict[str, Any]] = {}
+    for pos in all_positions:
+        p_aid = pos.get("account")
+        if not p_aid:
+            continue
+        upd_raw = pos.get("updated_at")
+        is_today_pos = False
+        if upd_raw:
+            try:
+                upd_dt = datetime.fromisoformat(str(upd_raw).replace("Z", "+00:00"))
+                if upd_dt.tzinfo is None:
+                    upd_dt = upd_dt.replace(tzinfo=timezone.utc)
+                is_today_pos = upd_dt.astimezone(IST).date().isoformat() == today_ist_str
+            except Exception:
+                is_today_pos = False
+        if not is_today_pos:
+            continue
+        agg = broker_pnl_by_acc.setdefault(p_aid, {"rpnl": Decimal("0"), "urmtom": Decimal("0"), "count": 0, "updated_at": upd_raw})
+        agg["rpnl"] += Decimal(str(pos.get("realized_pnl") or 0))
+        agg["urmtom"] += Decimal(str(pos.get("unrealized_pnl") or 0))
+        agg["count"] += 1
+        if upd_raw and (not agg["updated_at"] or str(upd_raw) > str(agg["updated_at"])):
+            agg["updated_at"] = upd_raw
     tokens_by_id = {t["account"]: t for t in tokens_list}
     uid_by_aid = {a["id"]: (a.get("zebu_uid") or "").strip().upper() for a in all_acc}
     tokens_by_uid = {}
@@ -1741,6 +1787,7 @@ async def get_accounts(user=Depends(current_user)):
         safe_acc = {k: v for k, v in a.items() if k != "zebu_secret_key"}
         safe_acc["has_secret_key"] = bool(a.get("zebu_secret_key"))
         ws_st = conn_state.status if l_state == "Linked" else ("REAUTH_REQUIRED" if l_state == "Login expired" else "DISCONNECTED")
+        b_agg = broker_pnl_by_acc.get(a["id"])
         out.append({
             **safe_acc,
             "link": l_state,
@@ -1753,6 +1800,11 @@ async def get_accounts(user=Depends(current_user)):
             "last_sync_at": sync_st.get("last_sync_success") or t.get("last_sync_at"),
             "sync_error": sync_st.get("last_error"),
             "sync_message": t.get("sync_message"),
+            "broker_rpnl": float(b_agg["rpnl"]) if b_agg else None,
+            "broker_urmtom": float(b_agg["urmtom"]) if b_agg else None,
+            "broker_total_pnl": float(b_agg["rpnl"] + b_agg["urmtom"]) if b_agg else None,
+            "broker_positions_count": b_agg["count"] if b_agg else 0,
+            "broker_pos_updated_at": b_agg["updated_at"] if b_agg else None,
         })
     return out
 
@@ -2311,7 +2363,11 @@ async def get_trades(request: Request, user=Depends(current_user)):
     t0 = time.perf_counter()
     frm = request.query_params.get("from", "")
     acc_filter = request.query_params.get("account", "")
-    all_trades = await DB._all_trades(from_date=frm if frm else None)
+    limit_raw = request.query_params.get("limit", "")
+    offset_raw = request.query_params.get("offset", "")
+    limit_val = int(limit_raw) if limit_raw.isdigit() else None
+    offset_val = int(offset_raw) if offset_raw.isdigit() else None
+    all_trades = await DB._all_trades(from_date=frm if frm else None, limit=limit_val, offset=offset_val)
 
     if acc_filter:
         all_trades = [t for t in all_trades if t.get("account") == acc_filter or t.get("trader") == acc_filter]
@@ -2417,35 +2473,84 @@ async def put_settings(request: Request, _=Depends(admin_only)):
 
 
 @app.post("/api/sync")
-async def sync_now(request: Request, account: Optional[str] = None, force: bool = False, _=Depends(current_user)):
-    target_aid = account or request.query_params.get("account")
+async def sync_now(request: Request, account: Optional[str] = None, trader: Optional[str] = None, force: bool = False, user=Depends(current_user)):
+    target_aid = account or trader or request.query_params.get("account") or request.query_params.get("trader")
     force_flag = force or str(request.query_params.get("force", "")).lower() in ("1", "true", "yes")
     if not target_aid:
         try:
             body = await request.json()
-            target_aid = body.get("account")
+            target_aid = body.get("account") or body.get("trader")
             if body.get("force"):
                 force_flag = True
         except Exception:
             pass
 
     if target_aid:
-        acc = await DB.get_account_async(target_aid)
-        if not acc:
-            all_acc = await DB.get_all_accounts_async()
-            for a in all_acc:
-                if a.get("zebu_uid") == target_aid or a.get("trader") == target_aid or a.get("id") == target_aid:
-                    acc = a
-                    break
-        if acc:
-            now = now_ist()
+        all_acc = await DB.get_all_accounts_async()
+        # Priority 1: Resolve ALL accounts belonging to the selected trader or matching the account/UID
+        direct = [a for a in all_acc if a.get("id") == target_aid]
+        if direct:
+            matched_accounts = direct
+        else:
+            matched_accounts = [
+                a for a in all_acc
+                if a.get("trader") == target_aid or a.get("zebu_uid") == target_aid
+            ]
+
+        # Enforce account-level authorization so users can only sync authorized accounts
+        authorized_accounts = []
+        for a in matched_accounts:
             try:
-                res = await poll_account_async(acc, now, reconcile_today=True, force=force_flag)
-            except SessionExpired:
-                res = "expired"
-            except Exception as e:
-                res = f"error: {str(e)[:200]}"
-            return {"account": acc["id"], "result": res}
+                await _assert_user_can_access_account(user, a)
+                authorized_accounts.append(a)
+            except HTTPException:
+                continue
+
+        if not authorized_accounts and matched_accounts:
+            raise HTTPException(403, "Not authorized to synchronize the requested account(s)")
+
+        if authorized_accounts:
+            now = now_ist()
+
+            async def _sync_one_account(acc_obj: dict):
+                aid_i = acc_obj["id"]
+                async with CONN_MGR.semaphore:
+                    try:
+                        res_str = await poll_account_async(acc_obj, now, reconcile_today=True, force=force_flag)
+                        ok = not (res_str.startswith("error:") or res_str in ("expired", "not_linked"))
+                        # Record versioned reconciliation note if forced after EOD finalization
+                        if force_flag and ok:
+                            pos_rows = await DB.get_positions_async(account_id=aid_i)
+                            await _record_post_eod_versioned_reconciliation_async(acc_obj, now, pos_rows)
+                        return aid_i, {"ok": ok, "result": res_str, "account_name": acc_obj.get("name") or aid_i}
+                    except SessionExpired as se:
+                        return aid_i, {"ok": False, "result": "expired", "error": str(se), "account_name": acc_obj.get("name") or aid_i}
+                    except Exception as e:
+                        return aid_i, {"ok": False, "result": f"error: {str(e)[:200]}", "error": str(e)[:200], "account_name": acc_obj.get("name") or aid_i}
+
+            pairs = await asyncio.gather(*[_sync_one_account(a) for a in authorized_accounts], return_exceptions=True)
+            results_map: Dict[str, Any] = {}
+            succeeded = 0
+            failed = 0
+            for item in pairs:
+                if isinstance(item, tuple):
+                    k, v = item
+                    results_map[k] = v
+                    if v.get("ok"):
+                        succeeded += 1
+                    else:
+                        failed += 1
+
+            first_aid = authorized_accounts[0]["id"]
+            return {
+                "target": target_aid,
+                "account": first_aid,
+                "result": results_map.get(first_aid, {}).get("result", "ok"),
+                "accounts_synced": len(authorized_accounts),
+                "succeeded": succeeded,
+                "failed": failed,
+                "results": results_map,
+            }
 
     return await poll_all_async("manual", force=force_flag)
 
@@ -2517,6 +2622,7 @@ async def get_single_order_history(norenordno: str, account: Optional[str] = Non
 async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
     """Ultra-fast single-request bootstrap endpoint returning all dashboard state concurrently."""
     t0 = time.perf_counter()
+    frm = request.query_params.get("from", "")
     (
         traders_res,
         accounts_res,
@@ -2528,6 +2634,7 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
         status_res,
         daily_reports_res,
         violations_res,
+        has_older,
     ) = await asyncio.gather(
         get_traders(user=user),
         get_accounts(user=user),
@@ -2539,6 +2646,7 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
         status(_=user),
         get_daily_reports(user=user),
         get_violations(user=user),
+        DB.has_trades_before_async(frm) if frm else asyncio.sleep(0, result=False),
     )
     METRICS.record_api_latency((time.perf_counter() - t0) * 1000)
     return {
@@ -2547,6 +2655,7 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
         "accounts": accounts_res,
         "rules": rules_res,
         "trades": trades_res,
+        "has_older_trades": bool(has_older),
         "groups": groups_res,
         "settings": settings_res,
         "ruleLog": rulelog_res,

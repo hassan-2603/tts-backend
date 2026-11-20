@@ -166,7 +166,7 @@ class MarketScheduler:
                     s = {}
                 s = s or {}
                 summary_time = s.get("alerts", {}).get("summaryTime", "15:35")
-                eod_time = getattr(CFG, "EOD_FINALIZE_TIME", "15:31") or "15:31"
+                eod_time = getattr(CFG, "EOD_FINALIZE_TIME", "15:45") or "15:45"
 
                 from app.models import DailySyncRecord, DailyAccountReport
 
@@ -179,8 +179,8 @@ class MarketScheduler:
                     )
                     has_pending = (await session.execute(pending_stmt)).scalars().first() is not None
 
-                if weekday and hm >= market_close:
-                    # Trigger EOD finalization (also locks final snapshot at 21:00 IST with zero Zebu calls after 21:00 IST)
+                if weekday and hm >= eod_time:
+                    # Trigger configurable EOD finalization (after NSE closing prices settle; zero Zebu calls after hard cutoff)
                     should_finalize = (not rec or not getattr(rec, "finalized", False) or has_pending)
                     if should_finalize and self.finalize_eod_fn and (time.time() - self.last_eod_retry_time >= 60):
                         log.info(f"Triggering EOD reconciliation and finalization for {today_str} at {hm} IST")

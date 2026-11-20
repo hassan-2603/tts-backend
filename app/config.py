@@ -69,7 +69,9 @@ class Settings(BaseSettings):
     POLL_SECONDS: int = Field(default=15)
     MARKET_OPEN: str = Field(default="09:15")
     MARKET_CLOSE: str = Field(default="15:30")
-    EOD_FINALIZE_TIME: str = Field(default="15:31")
+    EOD_FINALIZE_TIME: str = Field(default="15:45")
+    EOD_LATE_RECONCILE_TIME: str = Field(default="16:00")
+    POST_MARKET_HARD_CUTOFF_HOUR: int = Field(default=21)
     REBUILD_LOOKBACK_DAYS: int = Field(default=30)
     DISABLE_SCHEDULER: bool = Field(default=False)
 

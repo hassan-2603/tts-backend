@@ -579,12 +579,14 @@ class Store:
 
     async def put_many_positions_async(self, account_id: str, positions: List[Dict[str, Any]]):
         async with AsyncSessionLocal() as session:
+            fresh_ids = set()
             for p in positions:
                 tsym = str(p.get("tsym") or "")
                 if not tsym:
                     continue
                 prd = str(p.get("prd") or "MIS")
                 pid = f"{account_id}|{tsym}|{prd}"
+                fresh_ids.add(pid)
                 stmt = select(Position).where(Position.id == pid)
                 row = (await session.execute(stmt)).scalar_one_or_none()
                 net_qty = float(p.get("netqty") or 0)
@@ -627,6 +629,12 @@ class Store:
                     row.unrealized_pnl = urmtom
                     row.raw_payload = p
                     row.updated_at = datetime.now(timezone.utc)
+            # Remove stale prior-day Position rows not present in the fresh PositionBook snapshot
+            if fresh_ids:
+                existing_rows = (await session.execute(select(Position).where(Position.account_id == account_id))).scalars().all()
+                for er in existing_rows:
+                    if er.id not in fresh_ids:
+                        await session.delete(er)
             await session.commit()
 
     async def get_positions_async(self, account_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1129,7 +1137,19 @@ class Store:
             await session.execute(sa_delete(Group).where(Group.id == gid))
             await session.commit()
 
-    async def _all_trades(self, from_date: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def has_trades_before_async(self, cutoff_date: str) -> bool:
+        async with AsyncSessionLocal() as session:
+            stmt = select(Trade.id).where(
+                (Trade.is_open == False) & (Trade.trade_date < cutoff_date) & ((Trade.exit_date == None) | (Trade.exit_date < cutoff_date))
+            ).limit(1)
+            return (await session.execute(stmt)).scalar_one_or_none() is not None
+
+    async def _all_trades(
+        self,
+        from_date: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         async with AsyncSessionLocal() as session:
             stmt = select(Trade)
             if from_date:
@@ -1138,6 +1158,10 @@ class Store:
                     (Trade.is_open == True) | (Trade.trade_date >= from_date) | (Trade.exit_date >= from_date)
                 )
             stmt = stmt.order_by(Trade.trade_date.desc(), Trade.trade_time.desc())
+            if offset is not None and offset > 0:
+                stmt = stmt.offset(offset)
+            if limit is not None and limit > 0:
+                stmt = stmt.limit(limit)
             res = (await session.execute(stmt)).scalars().all()
             return [self._trade_to_dict(t) for t in res]
 
@@ -1360,17 +1384,12 @@ class Store:
             )
             removed = (r1.rowcount or 0) + (r2.rowcount or 0)
             if removed > 0 or unlock_today:
-                # Unlock today's trades and today's daily report for this account so they rebuild cleanly from real fills
+                # Unlock today's trades for this account so they rebuild cleanly from real fills,
+                # while preserving today's DailyAccountReport for versioned reconciliation history.
                 await session.execute(
                     sa_update(Trade)
                     .where(Trade.account_id == aid, (Trade.trade_date == today_str) | (Trade.exit_date == today_str))
                     .values(is_finalized=False)
-                )
-                await session.execute(
-                    sa_delete(DailyAccountReport).where(
-                        DailyAccountReport.account_id == aid,
-                        DailyAccountReport.trade_date == today_str,
-                    )
                 )
             await session.commit()
         return removed

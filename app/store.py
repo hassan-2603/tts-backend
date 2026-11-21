@@ -250,7 +250,7 @@ class Store:
                 if "zebu_client_id" in doc:
                     acc.zebu_client_id = doc.get("zebu_client_id")
                 if "zebu_vc" in doc and doc.get("zebu_vc") is not None:
-                    v_vc = str(doc.get("zebu_vc")).strip().upper()
+                    v_vc = str(doc.get("zebu_vc")).strip()
                     if v_vc:
                         acc.zebu_vc = v_vc
                 if "zebu_secret_key" in doc and str(doc.get("zebu_secret_key") or "").strip():
@@ -271,7 +271,7 @@ class Store:
                     zebu_uid=doc.get("zebu_uid"),
                     zebu_actid=doc.get("zebu_actid"),
                     zebu_client_id=doc.get("zebu_client_id") or doc.get("zebu_uid"),
-                    zebu_vc=str(doc.get("zebu_vc") or "").strip().upper() or None,
+                    zebu_vc=str(doc.get("zebu_vc") or "").strip() or None,
                     zebu_secret_key=str(doc.get("zebu_secret_key") or "").strip() or None,
                     zebu_factor2_enc=encrypt_token(str(doc["zebu_factor2"]).strip()) if str(doc.get("zebu_factor2") or "").strip() else None,
                     zebu_password_enc=encrypt_token(str(doc["zebu_password"])) if str(doc.get("zebu_password") or "") != "" else None,

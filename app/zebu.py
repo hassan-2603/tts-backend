@@ -96,7 +96,7 @@ class ZebuClient:
         Never logs passwords, factor2, API secrets, or session tokens.
         """
         clean_uid = self._clean_uid(uid)
-        clean_vc = (vc or "").strip().upper()
+        clean_vc = (vc or "").strip()
         if not clean_vc and clean_uid:
             clean_vc = f"{clean_uid}_U"
         clean_factor2 = (factor2 or "").strip()
@@ -105,51 +105,78 @@ class ZebuClient:
             raise ZebuError("Missing required Zebu QuickAuth credentials (UID, VC, PAN/DOB, Secret App Key, Password).")
 
         pwd_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
-        appkey_hash = hashlib.sha256(f"{clean_uid}|{clean_secret}".encode("utf-8")).hexdigest()
 
-        payload = {
-            "uid": clean_uid,
-            "pwd": pwd_hash,
-            "factor2": clean_factor2,
-            "vc": clean_vc,
-            "appkey": appkey_hash,
-            "imei": (imei or "abc1234").strip(),
-            "source": (source or "API").strip(),
-            "apkversion": (apkversion or "1.0.0").strip(),
-        }
+        # Primary official Noren formula: SHA256(uid + "|" + api_secret)
+        # Safe fallbacks only if Zebu explicitly replies "Invalid App Key" (checked before password validation):
+        #  - pre-hashed 64-char hex appkey if user pasted an already-hashed key
+        #  - SHA256(vc + "|" + api_secret) if vendor code differs from uid
+        candidate_appkeys: List[str] = [
+            hashlib.sha256(f"{clean_uid}|{clean_secret}".encode("utf-8")).hexdigest()
+        ]
+        if len(clean_secret) == 64 and all(c in "0123456789abcdefABCDEF" for c in clean_secret):
+            candidate_appkeys.append(clean_secret.lower())
+        if clean_vc and clean_vc != clean_uid:
+            vc_hash = hashlib.sha256(f"{clean_vc}|{clean_secret}".encode("utf-8")).hexdigest()
+            if vc_hash not in candidate_appkeys:
+                candidate_appkeys.append(vc_hash)
+
         headers = {"Content-Type": "text/plain"}
-        body = "jData=" + json.dumps(payload, separators=(",", ":"))
         client = self._get_async_http(proxy=proxy)
+        last_emsg = "Authentication failed"
 
-        try:
-            resp = await client.post(
-                f"{self.base}/NorenWClientTP/QuickAuth",
-                content=body,
-                headers=headers,
-            )
-        except (httpx.ProxyError, httpx.ConnectError, httpx.TimeoutException) as e:
-            raise ZebuError(f"QuickAuth network error: {e}") from e
+        for idx, appkey_val in enumerate(candidate_appkeys):
+            payload = {
+                "uid": clean_uid,
+                "pwd": pwd_hash,
+                "factor2": clean_factor2,
+                "vc": clean_vc,
+                "appkey": appkey_val,
+                "imei": (imei or "abc1234").strip(),
+                "source": (source or "API").strip(),
+                "apkversion": (apkversion or "1.0.0").strip(),
+            }
+            body = "jData=" + json.dumps(payload, separators=(",", ":"))
 
-        if resp.status_code == 429:
-            raise RateLimitError("Zebu QuickAuth rate limit exceeded")
-        try:
-            data = resp.json()
-        except ValueError as ve:
-            raise ZebuError(f"QuickAuth: HTTP {resp.status_code} non-JSON response") from ve
+            try:
+                resp = await client.post(
+                    f"{self.base}/NorenWClientTP/QuickAuth",
+                    content=body,
+                    headers=headers,
+                )
+            except (httpx.ProxyError, httpx.ConnectError, httpx.TimeoutException) as e:
+                raise ZebuError(f"QuickAuth network error: {e}") from e
 
-        if not isinstance(data, dict):
-            raise ZebuError(f"QuickAuth: unexpected response type {type(data).__name__}")
+            if resp.status_code == 429:
+                raise RateLimitError("Zebu QuickAuth rate limit exceeded")
+            try:
+                data = resp.json()
+            except ValueError as ve:
+                raise ZebuError(f"QuickAuth: HTTP {resp.status_code} non-JSON response") from ve
 
-        if str(data.get("stat", "")).strip().lower() != "ok":
+            if not isinstance(data, dict):
+                raise ZebuError(f"QuickAuth: unexpected response type {type(data).__name__}")
+
+            if str(data.get("stat", "")).strip().lower() == "ok":
+                susertoken = str(data.get("susertoken") or "").strip()
+                if not susertoken:
+                    raise ZebuError("QuickAuth succeeded without returning a susertoken")
+                self.register_token_mode(susertoken, "quickauth")
+                return data
+
             emsg = str(data.get("emsg") or "Authentication failed").strip()
-            raise ZebuError(f"QuickAuth failed: {emsg}")
+            last_emsg = emsg
+            # Only retry alternate appkey formats when broker specifically rejects App Key
+            if "app key" in emsg.lower() and idx < len(candidate_appkeys) - 1:
+                continue
+            break
 
-        susertoken = str(data.get("susertoken") or "").strip()
-        if not susertoken:
-            raise ZebuError("QuickAuth succeeded without returning a susertoken")
-
-        self.register_token_mode(susertoken, "quickauth")
-        return data
+        if "app key" in last_emsg.lower():
+            raise ZebuError(
+                f"QuickAuth failed: {last_emsg}. "
+                f"Please verify UID ({clean_uid}), Vendor Code ({clean_vc}), and that you entered your Zebu MYNT API Key / Secret (not an OAuth-only secret). "
+                f"If your Zebu account only has an OAuth key, use 'Connect via Browser OAuth' below."
+            )
+        raise ZebuError(f"QuickAuth failed: {last_emsg}")
 
     def _clean_proxy(self, proxy: Optional[str]) -> Optional[str]:
         if not proxy:

@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     # Service Separation Flags
     RUN_WORKER_IN_PROCESS: bool = Field(default=True)
     RUN_SCHEDULER_IN_PROCESS: bool = Field(default=True)
+    RUN_NOTIFICATION_WORKER_IN_PROCESS: bool = Field(default=True)
 
     # Database
     DATABASE_URL: str = Field(
@@ -93,7 +94,7 @@ class Settings(BaseSettings):
         default="BANKNIFTY=NSE:26009,NIFTY=NSE:26000,FINNIFTY=NSE:26037,MIDCPNIFTY=NSE:26074,SENSEX=BSE:1"
     )
 
-    # Alerts
+    # Alerts (Legacy Telegram/SMTP + Resend Email + Meta WhatsApp Cloud API)
     TELEGRAM_BOT_TOKEN: str = Field(default="")
     TELEGRAM_CHAT_ID: str = Field(default="")
     TELEGRAM_API: str = Field(default="https://api.telegram.org")
@@ -105,6 +106,28 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = Field(default="")
     SMTP_FROM: str = Field(default="")
     SMTP_TLS: bool = Field(default=True)
+
+    # Resend Transactional Email
+    RESEND_API_KEY: str = Field(default="")
+    RESEND_FROM_EMAIL: str = Field(default="")
+
+    # Meta WhatsApp Cloud API
+    WHATSAPP_ACCESS_TOKEN: str = Field(default="")
+    WHATSAPP_PHONE_NUMBER_ID: str = Field(default="")
+    WHATSAPP_BUSINESS_ACCOUNT_ID: str = Field(default="")
+    WHATSAPP_APP_SECRET: str = Field(default="")
+    WHATSAPP_VERIFY_TOKEN: str = Field(default="")
+    WHATSAPP_API_VERSION: str = Field(default="v21.0")
+    WHATSAPP_ALERT_TEMPLATE: str = Field(default="tts_high_red_flag_alert")
+    WHATSAPP_SUMMARY_TEMPLATE: str = Field(default="tts_daily_trading_summary")
+    WHATSAPP_TEMPLATE_LANG: str = Field(default="en_US")
+    WHATSAPP_DEFAULT_COUNTRY_CODE: str = Field(default="91")
+
+    # Notification Worker Tuning
+    NOTIFICATION_POLL_SECONDS: int = Field(default=5)
+    NOTIFICATION_MAX_ATTEMPTS: int = Field(default=5)
+    NOTIFICATION_STALE_LOCK_SECONDS: int = Field(default=300)
+    DAILY_REPORT_GRACE_MINUTES: int = Field(default=15)
 
     @field_validator("ADMIN_PASSWORD")
     @classmethod

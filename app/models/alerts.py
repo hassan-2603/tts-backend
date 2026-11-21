@@ -67,3 +67,50 @@ class SentFlag(Base):
 
     key = Column(String(200), primary_key=True)
     sent_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+
+class NotificationJob(Base):
+    """PostgreSQL transactional outbox for reliable, idempotent Email (Resend) & WhatsApp (Meta Cloud) deliveries.
+
+    Supports multi-worker locking (FOR UPDATE SKIP LOCKED), exponential backoff retries,
+    abandoned-job recovery, and Meta webhook delivery-status tracking.
+    """
+    __tablename__ = "notification_jobs"
+
+    id = Column(String(120), primary_key=True)
+    event_key = Column(String(255), nullable=False, unique=True, index=True)
+    client_id = Column(String(100), nullable=False, default="main", index=True)
+    trading_date = Column(String(20), nullable=True, index=True)
+    channel = Column(String(30), nullable=False, index=True)  # email, whatsapp
+    notification_type = Column(String(50), nullable=False, index=True)  # high_red_flag, daily_summary, test
+    recipient = Column(String(200), nullable=False, index=True)
+    status = Column(String(30), nullable=False, default="PENDING", index=True)  # PENDING, PROCESSING, SENT, DELIVERED, READ, FAILED, RETRYING
+    attempt_count = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=5)
+    next_attempt_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, index=True)
+    locked_at = Column(DateTime(timezone=True), nullable=True)
+    locked_by = Column(String(120), nullable=True)
+    provider_message_id = Column(String(200), nullable=True, index=True)
+    payload_json = Column(JSON, nullable=False, default=dict)
+    last_error = Column(Text, nullable=True)
+    last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, index=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+    __table_args__ = (
+        Index("ix_notif_jobs_status_next", "status", "next_attempt_at"),
+        Index("ix_notif_jobs_channel_date", "channel", "trading_date"),
+    )
+
+
+class DailyReportDispatch(Base):
+    """Deduplication and audit record ensuring one consolidated daily report per (client_id, trading_date)."""
+    __tablename__ = "daily_report_dispatches"
+
+    id = Column(String(120), primary_key=True)  # e.g. main|2026-11-22
+    client_id = Column(String(100), nullable=False, default="main", index=True)
+    trading_date = Column(String(20), nullable=False, index=True)
+    report_status = Column(String(30), nullable=False, default="FINAL")  # FINAL, PROVISIONAL
+    summary_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)

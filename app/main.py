@@ -61,6 +61,7 @@ from app.security import hash_pw, check_pw, generate_session_token, generate_lin
 from app.store import Store
 from app.zebu import ZebuClient, SessionExpired, ZebuError
 from app.alerts import Alerter
+from app.notifications import NotificationEngine, verify_whatsapp_signature
 from app.connection_manager import ConnectionManager
 from app.financial_summary import FinancialSummaryService
 from app.scheduler import MarketScheduler, now_ist, IST
@@ -74,6 +75,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 DB = Store(CFG.DB_PATH)
 ZEBU = ZebuClient(CFG.ZEBU_BASE_URL, CFG.ZEBU_CLIENT_ID, CFG.ZEBU_SECRET_KEY, timeout=CFG.ZEBU_TIMEOUT)
 ALERT = Alerter(dict(os.environ))
+NOTIF = NotificationEngine()
 CONN_MGR = ConnectionManager(ZEBU)
 
 DEFAULT_SETTINGS = {
@@ -84,7 +86,16 @@ DEFAULT_SETTINGS = {
     "extendDays": 15,
     "pass": {"ruleFollow": 95, "highFlags": 2, "maxDDpct": 10, "accuracy": 50, "rr": 1.5},
     "capitalSteps": "₹5 L → ₹15 L → ₹50 L",
-    "alerts": {"telegram": "", "whatsapp": "", "email": "", "onHigh": True, "dailySummary": True, "summaryTime": "15:35"},
+    "alerts": {
+        "telegram": "",
+        "whatsapp": "",
+        "email": "",
+        "onHigh": True,
+        "dailySummary": True,
+        "summaryTime": "15:35",
+        "emailEnabled": True,
+        "whatsappEnabled": True,
+    },
 }
 
 
@@ -1562,9 +1573,29 @@ async def evaluate_and_record_violations_async(now: datetime, account_id: Option
                 "message": explanation,
             })
 
-            # External notification (Telegram/WhatsApp/Email) for today's High severity flags
+            # External notification (Telegram/SMTP + PostgreSQL Outbox for Resend Email & Meta WhatsApp) for today's High severity flags
             if alerts_cfg.get("onHigh") and t["date"] == today and f["level"] == "High":
                 sent_key = f"{tid}|{f['rule']}"
+                inst_label = f"{t.get('symbol') or ''} {t.get('strike') or ''} {t.get('opt') or ''}".strip()
+                # Queue independent Resend Email + Meta WhatsApp jobs (strictly deduplicated by flag_key)
+                await NOTIF.enqueue_high_flag_alert(
+                    flag_key=f"{t.get('account')}|{tid}|{f['rule']}",
+                    trading_date=today,
+                    alerts_cfg=alerts_cfg,
+                    payload={
+                        "trader_name": name,
+                        "trader_id": t.get("trader") or "",
+                        "account_id": t.get("account") or "",
+                        "instrument": inst_label or str(t.get("tsym") or "—"),
+                        "severity": f["level"],
+                        "rule_violated": f["rule"],
+                        "detection_time": f"{t.get('date')} {t.get('time')} IST",
+                        "observed_value": f.get("observed") or f["did"],
+                        "allowed_value": f.get("condition") or f["rule"],
+                        "explanation": f["did"],
+                        "dashboard_url": f"{CFG.FRONTEND_URL.rstrip('/')}/#flags",
+                    },
+                )
                 if not await DB._get_sent_flag(sent_key):
                     text_msg = (
                         f"🚩 Red flag · {name} · {t['time']}\nRule: {f['rule']}\nWhat he did: {f['did']}\n"
@@ -1603,10 +1634,216 @@ async def notify_expired_async(now: datetime, res: dict):
                 )
 
 
+async def build_daily_report_data_async(trading_date: str) -> Dict[str, Any]:
+    """Assemble consolidated daily trading report from existing TTS DB & live read-only Zebu data.
+    Never invents unavailable values; clearly marks PROVISIONAL if final broker sync is incomplete.
+    """
+    all_trades, all_traders, all_accounts, daily_reps, sync_states, positions = await asyncio.gather(
+        DB._all_trades(),
+        DB._all_traders(),
+        DB.get_all_accounts_async(),
+        DB.get_daily_reports_async(),
+        DB.get_all_sync_states_async(),
+        DB.get_positions_async(),
+    )
+    rules_map = await get_rules_map_async()
+    flags_dict = engine.check_trades(all_trades, rules_map, today_str=trading_date)
+    traders_by_id = {t["id"]: t for t in all_traders}
+    accounts_by_id = {a["id"]: a for a in all_accounts}
+
+    # Filter trades belonging to `trading_date` (exited on trading_date or entered on trading_date / currently open)
+    day_trades = [
+        t for t in all_trades
+        if (not t.get("open") and (t.get("exitDate") or t.get("date")) == trading_date)
+        or (t.get("open") and (t.get("date") or "") <= trading_date)
+    ]
+
+    # Check EOD finalization / sync completeness
+    day_reps = [r for r in daily_reps if r.get("date") == trading_date]
+    pending_reps = [r for r in day_reps if r.get("status") == "PENDING_RECONCILIATION"]
+    stale_accs = [aid for aid, st in (sync_states or {}).items() if st.get("is_stale") or st.get("status") in ("REAUTH_REQUIRED", "ERROR")]
+    zebu_accs = [a for a in all_accounts if (a.get("broker") or "Zebu") == "Zebu"]
+    finalized_aids = {r.get("account") for r in day_reps if r.get("status") in ("FINALIZED", "ARCHIVED")}
+
+    report_status = "FINAL"
+    sync_notes: List[str] = []
+    if pending_reps:
+        report_status = "PROVISIONAL"
+        sync_notes.append(f"{len(pending_reps)} account(s) pending EOD reconciliation")
+    if stale_accs:
+        report_status = "PROVISIONAL"
+        sync_notes.append(f"Stale/incomplete sync on: {', '.join(stale_accs[:5])}")
+    if zebu_accs and not finalized_aids:
+        report_status = "PROVISIONAL"
+        sync_notes.append("EOD finalization not yet completed for this trading date")
+
+    # Fetch live funds summary (best-effort read-only; unavailable if no linked accounts or broker offline)
+    funds_by_acc: Dict[str, Dict[str, Optional[float]]] = {}
+    total_avail: Optional[float] = None
+    total_util: Optional[float] = None
+    funds_note = "Zebu Limits API"
+    try:
+        funds_res = await _fetch_overview_funds_summary_async(all_accounts, "daily_report")
+        if funds_res.get("available_funds") is not None:
+            total_avail = float(funds_res["available_funds"])
+        if funds_res.get("utilized_funds") is not None:
+            total_util = float(funds_res["utilized_funds"])
+        if funds_res.get("status") != "LIVE":
+            funds_note = f"Funds status: {funds_res.get('status')} ({funds_res.get('error') or 'partial/unavailable'})"
+        for fa in (funds_res.get("accounts") or []):
+            if fa.get("ok"):
+                funds_by_acc[fa["account_id"]] = {
+                    "available": float(fa["available_funds"]),
+                    "utilized": float(fa["utilized_funds"]),
+                }
+    except Exception as e:
+        funds_note = f"Limits unavailable: {str(e)[:120]}"
+
+    # Per-account Realized P&L & Unrealized MTM (using finalized DailyAccountReport when present, else trades/positions)
+    rep_by_acc = {r["account"]: r for r in day_reps if r.get("account")}
+    acc_financials: List[Dict[str, Any]] = []
+    tot_realized = Decimal("0")
+    tot_unrealized = Decimal("0")
+
+    for acc in all_accounts:
+        aid = acc["id"]
+        rep = rep_by_acc.get(aid)
+        if rep and rep.get("status") in ("FINALIZED", "ARCHIVED"):
+            rp_d = engine._dec(rep.get("realized_pnl"), Decimal("0"))
+            ur_d = engine._dec(rep.get("unrealized_pnl"), Decimal("0"))
+            acc_st = rep.get("status")
+        else:
+            acc_day_tr = [t for t in day_trades if t.get("account") == aid]
+            rp_d = sum((engine._dec(engine.gross_pnl(t), Decimal("0")) for t in acc_day_tr if not t.get("open")), Decimal("0"))
+            ur_d = sum((engine._dec(t.get("pnl"), Decimal("0")) for t in acc_day_tr if t.get("open") and t.get("pnl") is not None), Decimal("0"))
+            acc_st = (sync_states.get(aid) or {}).get("status") or "LIVE"
+        tot_realized += rp_d
+        tot_unrealized += ur_d
+        fa = funds_by_acc.get(aid) or {}
+        acc_financials.append({
+            "account_id": aid,
+            "account_name": acc.get("name") or aid,
+            "zebu_uid": acc.get("zebu_uid") or "—",
+            "available_funds": fa.get("available"),
+            "utilized_funds": fa.get("utilized"),
+            "realized_pnl": float(engine._q2(rp_d)),
+            "unrealized_mtm": float(engine._q2(ur_d)),
+            "status": acc_st,
+        })
+
+    # Per-trader performance
+    trader_perf: List[Dict[str, Any]] = []
+    active_traders = 0
+    for tr in all_traders:
+        tid = tr["id"]
+        tr_accs = [a["id"] for a in all_accounts if a.get("trader") == tid or a["id"] == tid]
+        tr_day = [t for t in day_trades if t.get("trader") == tid or t.get("account") in tr_accs]
+        if tr_day or tr_accs:
+            active_traders += 1
+        rp_t = sum((engine._dec(engine.gross_pnl(t), Decimal("0")) for t in tr_day if not t.get("open")), Decimal("0"))
+        ur_t = sum((engine._dec(t.get("pnl"), Decimal("0")) for t in tr_day if t.get("open") and t.get("pnl") is not None), Decimal("0"))
+        clean_t = sum(1 for t in tr_day if not flags_dict.get(t["id"]))
+        rf_t = round(clean_t / len(tr_day) * 100.0, 1) if tr_day else None
+        trader_perf.append({
+            "trader_name": tr.get("name") or tid,
+            "trader_id": tid,
+            "broker_account": ", ".join(tr_accs) if tr_accs else "—",
+            "realized_pnl": float(engine._q2(rp_t)),
+            "unrealized_mtm": float(engine._q2(ur_t)),
+            "total_pnl": float(engine._q2(rp_t + ur_t)),
+            "trade_count": len(tr_day),
+            "rule_follow_pct": rf_t,
+        })
+
+    # Trade details & Red flag details for trading_date
+    trade_details: List[Dict[str, Any]] = []
+    red_flags: List[Dict[str, Any]] = []
+    day_trade_ids = {t["id"] for t in day_trades}
+    clean_total = 0
+
+    for t in day_trades:
+        tid = t["id"]
+        fl = flags_dict.get(tid) or []
+        if not fl:
+            clean_total += 1
+        tr_name = traders_by_id.get(t.get("trader"), {}).get("name") or t.get("trader") or "—"
+        inst_name = f"{t.get('symbol') or ''} {t.get('strike') or ''} {t.get('opt') or ''}".strip() or str(t.get("tsym") or "—")
+        trade_details.append({
+            **t,
+            "trader_name": tr_name,
+            "instrument_name": inst_name,
+            "pnl": float(engine.gross_pnl(t)) if not t.get("open") else (float(t["pnl"]) if t.get("pnl") is not None else None),
+        })
+        for f in fl:
+            red_flags.append({
+                "trader": t.get("trader") or "—",
+                "trader_name": tr_name,
+                "account": t.get("account") or "—",
+                "rule": f.get("rule") or "—",
+                "severity": f.get("level") or "Medium",
+                "instrument": inst_name,
+                "detection_time": f"{t.get('date')} {t.get('time')} IST",
+                "observed_value": f.get("observed") or f.get("did") or "—",
+                "allowed_value": f.get("condition") or f.get("rule") or "—",
+                "status": f.get("status") or "ACTIVE",
+            })
+
+    high_n = sum(1 for x in red_flags if x["severity"] == "High")
+    med_n = sum(1 for x in red_flags if x["severity"] == "Medium")
+    low_n = sum(1 for x in red_flags if x["severity"] == "Low")
+    flagged_traders_n = len({x["trader"] for x in red_flags if x.get("trader")})
+    overall_rf = round(clean_total / len(day_trades) * 100.0, 1) if day_trades else None
+
+    return {
+        "trading_date": trading_date,
+        "report_status": report_status,
+        "generated_ist": now_ist().strftime("%d %b %Y, %H:%M:%S IST"),
+        "sync_note": "; ".join(sync_notes),
+        "summary": {
+            "realized_pnl": float(engine._q2(tot_realized)),
+            "unrealized_mtm": float(engine._q2(tot_unrealized)),
+            "overall_pnl": float(engine._q2(tot_realized + tot_unrealized)),
+            "available_funds": total_avail,
+            "utilized_funds": total_util,
+            "funds_note": funds_note,
+            "total_trades": len(day_trades),
+            "active_traders": active_traders,
+            "high_flags": high_n,
+            "medium_flags": med_n,
+            "low_flags": low_n,
+            "total_flags": len(red_flags),
+            "traders_with_flags": flagged_traders_n,
+            "rule_follow_pct": overall_rf,
+        },
+        "trader_performance": trader_perf,
+        "account_financials": acc_financials,
+        "trade_details": trade_details,
+        "red_flags": red_flags,
+    }
+
+
+NOTIF.set_report_data_builder(build_daily_report_data_async)
+
+
 async def daily_summary_async(now: datetime):
     s = (await DB._get_setting("main")) or {}
-    alerts_cfg = s.get("alerts") or DEFAULT_SETTINGS["alerts"]
+    alerts_cfg = {**DEFAULT_SETTINGS["alerts"], **(s.get("alerts") or {})}
     today = now.date().isoformat()
+
+    # 1. Queue Resend Email (with 6-sheet Excel report) + individual Meta WhatsApp summaries
+    try:
+        report_data = await build_daily_report_data_async(today)
+        await NOTIF.enqueue_daily_report(
+            trading_date=today,
+            alerts_cfg=alerts_cfg,
+            report_data=report_data,
+            client_id="main",
+            force=False,
+        )
+    except Exception as e:
+        log.error("Failed to enqueue automated daily report for %s: %s", today, e, exc_info=True)
+
+    # 2. Preserve existing Telegram / legacy summary notification intact
     flags = await all_flags_async()
     lines = [f"📊 Daily summary · {today}"]
     all_trades = await DB._all_trades()
@@ -1681,16 +1918,22 @@ async def lifespan(app: FastAPI):
     if CFG.RUN_SCHEDULER_IN_PROCESS and not CFG.DISABLE_SCHEDULER:
         await SCHEDULER.start()
 
+    if CFG.RUN_NOTIFICATION_WORKER_IN_PROCESS:
+        await NOTIF.start_worker()
+
     log.info("Trader Tracking System startup complete.")
     yield
 
     # Shutdown
+    if CFG.RUN_NOTIFICATION_WORKER_IN_PROCESS:
+        await NOTIF.stop_worker()
     if CFG.RUN_SCHEDULER_IN_PROCESS and not CFG.DISABLE_SCHEDULER:
         await SCHEDULER.stop()
     if CFG.RUN_WORKER_IN_PROCESS:
         await CONN_MGR.stop()
     await ZEBU.aclose()
     await ALERT.aclose()
+    await NOTIF.aclose()
     log.info("Trader Tracking System shutdown complete.")
 
 
@@ -3303,13 +3546,79 @@ async def sync_now(request: Request, account: Optional[str] = None, trader: Opti
 @app.post("/api/alerts/test")
 async def test_alert(_=Depends(admin_only)):
     s = (await DB._get_setting("main")) or {}
-    alerts_cfg = s.get("alerts") or DEFAULT_SETTINGS["alerts"]
+    alerts_cfg = {**DEFAULT_SETTINGS["alerts"], **(s.get("alerts") or {})}
     sent = await ALERT.send_async(
         "✅ Test alert from modernized Trader Tracking System",
         settings_alerts=alerts_cfg,
         severity="Low",
     )
     return {"sent": sent}
+
+
+@app.get("/api/notifications/history")
+async def get_notification_history(
+    limit: int = 100,
+    channel: Optional[str] = None,
+    trading_date: Optional[str] = None,
+    _=Depends(admin_only),
+):
+    """Admin-only notification delivery history & provider configuration status (never exposes secrets)."""
+    items = await NOTIF.list_history(limit=min(max(limit, 1), 500), channel=channel, trading_date=trading_date)
+    return {
+        "resend_configured": NOTIF.email_configured(),
+        "whatsapp_configured": NOTIF.whatsapp_configured(),
+        "items": items,
+    }
+
+
+@app.post("/api/notifications/daily-report/send")
+async def trigger_daily_report_now(request: Request, _=Depends(admin_only)):
+    """Admin-only manual trigger to generate and queue the consolidated Daily Trading Report (Excel + WhatsApp)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    t_date = str((body or {}).get("date") or now_ist().date().isoformat()).strip()
+    force = bool((body or {}).get("force", True))
+    s = (await DB._get_setting("main")) or {}
+    alerts_cfg = {**DEFAULT_SETTINGS["alerts"], **(s.get("alerts") or {})}
+    report_data = await build_daily_report_data_async(t_date)
+    res = await NOTIF.enqueue_daily_report(
+        trading_date=t_date,
+        alerts_cfg=alerts_cfg,
+        report_data=report_data,
+        client_id="main",
+        force=force,
+    )
+    # Process queued jobs promptly in background so HTTP response is non-blocking
+    asyncio.create_task(NOTIF.process_pending_jobs_once(batch_size=10))
+    return {"ok": True, **res}
+
+
+@app.get("/api/webhooks/whatsapp")
+async def whatsapp_webhook_verify(request: Request):
+    """Meta WhatsApp Cloud API webhook verification challenge."""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+    if mode == "subscribe" and CFG.WHATSAPP_VERIFY_TOKEN and token == CFG.WHATSAPP_VERIFY_TOKEN:
+        return HTMLResponse(content=str(challenge or ""), status_code=200)
+    raise HTTPException(403, "Invalid WhatsApp webhook verification token")
+
+
+@app.post("/api/webhooks/whatsapp")
+async def whatsapp_webhook_receive(request: Request):
+    """Meta WhatsApp Cloud API delivery status webhook with HMAC-SHA256 signature verification."""
+    raw = await request.body()
+    sig = request.headers.get("X-Hub-Signature-256") or ""
+    if not verify_whatsapp_signature(raw, sig):
+        raise HTTPException(403, "Invalid X-Hub-Signature-256 signature")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(400, "Invalid JSON payload")
+    updated = await NOTIF.process_whatsapp_webhook(payload)
+    return {"ok": True, "updated": updated}
 
 
 @app.get("/api/status")

@@ -33,12 +33,14 @@ class ZebuWebSocketClient:
         on_order_update: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
         on_touchline_update: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
         on_status_change: Optional[Callable[[str, str], Coroutine[Any, Any, None]]] = None,
+        auth_mode: str = "oauth",
     ):
         self.ws_url = ws_url
         self.account_id = account_id
         self.uid = uid
         self.actid = actid or uid
         self.token = token
+        self.auth_mode = (auth_mode or "oauth").strip().lower()
         self.on_order_update = on_order_update
         self.on_touchline_update = on_touchline_update
         self.on_status_change = on_status_change
@@ -141,15 +143,24 @@ class ZebuWebSocketClient:
                 ) as ws:
                     self._ws = ws
 
-                    # 1. Handshake (Official Zebu OAuth WebSocket task 'a')
-                    handshake_a = {
-                        "t": "a",
-                        "uid": self.uid,
-                        "actid": self.actid or self.uid,
-                        "accesstoken": self.token,
-                        "source": "API",
-                    }
-                    await ws.send(json.dumps(handshake_a))
+                    # 1. Handshake (QuickAuth Noren TP task 'c' vs OAuth task 'a')
+                    if self.auth_mode == "quickauth":
+                        handshake = {
+                            "t": "c",
+                            "uid": self.uid,
+                            "actid": self.actid or self.uid,
+                            "susertoken": self.token,
+                            "source": "API",
+                        }
+                    else:
+                        handshake = {
+                            "t": "a",
+                            "uid": self.uid,
+                            "actid": self.actid or self.uid,
+                            "accesstoken": self.token,
+                            "source": "API",
+                        }
+                    await ws.send(json.dumps(handshake))
 
                     # 2. Receive Handshake Ack (t='ak' or 'ck' with s='OK')
                     ack_raw = await asyncio.wait_for(ws.recv(), timeout=15.0)

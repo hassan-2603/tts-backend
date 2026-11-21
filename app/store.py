@@ -179,9 +179,38 @@ class Store:
                 "zebu_uid": acc.zebu_uid,
                 "zebu_actid": acc.zebu_actid,
                 "zebu_client_id": getattr(acc, "zebu_client_id", None) or acc.zebu_uid,
+                "zebu_vc": getattr(acc, "zebu_vc", None) or (f"{acc.zebu_uid}_U" if acc.zebu_uid and not str(acc.zebu_uid).endswith("_U") else acc.zebu_uid),
+                "has_zebu_secret_key": bool(getattr(acc, "zebu_secret_key", None)),
+                "has_zebu_factor2": bool(getattr(acc, "zebu_factor2_enc", None)),
+                "has_zebu_password": bool(getattr(acc, "zebu_password_enc", None)),
                 "zebu_secret_key": getattr(acc, "zebu_secret_key", None),
                 "proxy_url": getattr(acc, "proxy_url", None),
                 "group_id": acc.group_id,
+            }
+
+    async def get_account_credentials_async(self, aid: str) -> Optional[Dict[str, Any]]:
+        """Server-internal helper returning decrypted Zebu QuickAuth credentials.
+        NEVER serialize this dict to any HTTP API response or log it."""
+        async with AsyncSessionLocal() as session:
+            stmt = select(Account).where(Account.id == aid)
+            acc = (await session.execute(stmt)).scalar_one_or_none()
+            if not acc:
+                return None
+            uid = (acc.zebu_uid or "").strip().upper()
+            clean_uid = uid[:-2] if uid.endswith("_U") else uid
+            vc = (getattr(acc, "zebu_vc", None) or "").strip().upper()
+            if not vc and clean_uid:
+                vc = f"{clean_uid}_U"
+            return {
+                "id": acc.id,
+                "name": acc.name,
+                "zebu_uid": clean_uid,
+                "zebu_actid": (acc.zebu_actid or clean_uid).strip().upper(),
+                "zebu_vc": vc,
+                "zebu_secret_key": (getattr(acc, "zebu_secret_key", None) or "").strip(),
+                "zebu_factor2": (decrypt_token(getattr(acc, "zebu_factor2_enc", None)) or "").strip(),
+                "zebu_password": decrypt_token(getattr(acc, "zebu_password_enc", None)) or "",
+                "proxy_url": getattr(acc, "proxy_url", None),
             }
 
     async def get_all_accounts_async(self) -> List[Dict[str, Any]]:
@@ -197,6 +226,10 @@ class Store:
                     "zebu_uid": a.zebu_uid,
                     "zebu_actid": a.zebu_actid,
                     "zebu_client_id": getattr(a, "zebu_client_id", None) or a.zebu_uid,
+                    "zebu_vc": getattr(a, "zebu_vc", None) or (f"{a.zebu_uid}_U" if a.zebu_uid and not str(a.zebu_uid).endswith("_U") else a.zebu_uid),
+                    "has_zebu_secret_key": bool(getattr(a, "zebu_secret_key", None)),
+                    "has_zebu_factor2": bool(getattr(a, "zebu_factor2_enc", None)),
+                    "has_zebu_password": bool(getattr(a, "zebu_password_enc", None)),
                     "zebu_secret_key": getattr(a, "zebu_secret_key", None),
                     "proxy_url": getattr(a, "proxy_url", None),
                     "group_id": a.group_id,
@@ -216,8 +249,16 @@ class Store:
                 acc.zebu_actid = doc.get("zebu_actid", acc.zebu_actid)
                 if "zebu_client_id" in doc:
                     acc.zebu_client_id = doc.get("zebu_client_id")
-                if "zebu_secret_key" in doc and doc.get("zebu_secret_key"):
-                    acc.zebu_secret_key = doc.get("zebu_secret_key")
+                if "zebu_vc" in doc and doc.get("zebu_vc") is not None:
+                    v_vc = str(doc.get("zebu_vc")).strip().upper()
+                    if v_vc:
+                        acc.zebu_vc = v_vc
+                if "zebu_secret_key" in doc and str(doc.get("zebu_secret_key") or "").strip():
+                    acc.zebu_secret_key = str(doc["zebu_secret_key"]).strip()
+                if "zebu_factor2" in doc and str(doc.get("zebu_factor2") or "").strip():
+                    acc.zebu_factor2_enc = encrypt_token(str(doc["zebu_factor2"]).strip())
+                if "zebu_password" in doc and str(doc.get("zebu_password") or "") != "":
+                    acc.zebu_password_enc = encrypt_token(str(doc["zebu_password"]))
                 if "proxy_url" in doc:
                     acc.proxy_url = doc.get("proxy_url")
                 acc.group_id = doc.get("group_id", acc.group_id)
@@ -230,7 +271,10 @@ class Store:
                     zebu_uid=doc.get("zebu_uid"),
                     zebu_actid=doc.get("zebu_actid"),
                     zebu_client_id=doc.get("zebu_client_id") or doc.get("zebu_uid"),
-                    zebu_secret_key=doc.get("zebu_secret_key"),
+                    zebu_vc=str(doc.get("zebu_vc") or "").strip().upper() or None,
+                    zebu_secret_key=str(doc.get("zebu_secret_key") or "").strip() or None,
+                    zebu_factor2_enc=encrypt_token(str(doc["zebu_factor2"]).strip()) if str(doc.get("zebu_factor2") or "").strip() else None,
+                    zebu_password_enc=encrypt_token(str(doc["zebu_password"])) if str(doc.get("zebu_password") or "") != "" else None,
                     proxy_url=doc.get("proxy_url"),
                     group_id=doc.get("group_id"),
                 )
@@ -261,6 +305,7 @@ class Store:
             return {
                 "access_token": decrypt_token(bs.access_token_enc),
                 "refresh_token": decrypt_token(bs.refresh_token_enc),
+                "auth_mode": getattr(bs, "auth_mode", None) or "oauth",
                 "expires_at": exp_dt.timestamp() if exp_dt else None,
                 "linked_at": bs.linked_at.isoformat() if bs.linked_at else None,
                 "cliname": bs.cliname,
@@ -303,6 +348,8 @@ class Store:
                     bs.access_token_enc = acc_token_enc
                 if "refresh_token" in doc:
                     bs.refresh_token_enc = ref_token_enc
+                if doc.get("auth_mode"):
+                    bs.auth_mode = str(doc["auth_mode"]).strip().lower()
                 if exp_dt is not None:
                     bs.expires_at = exp_dt
                 if linked_dt is not None:
@@ -322,6 +369,7 @@ class Store:
                     account_id=aid,
                     access_token_enc=acc_token_enc,
                     refresh_token_enc=ref_token_enc,
+                    auth_mode=str(doc.get("auth_mode") or "oauth").strip().lower(),
                     expires_at=exp_dt,
                     linked_at=linked_dt,
                     cliname=doc.get("cliname"),
@@ -1627,6 +1675,7 @@ class Store:
                     "account": bs.account_id,
                     "access_token": decrypt_token(bs.access_token_enc),
                     "refresh_token": decrypt_token(bs.refresh_token_enc),
+                    "auth_mode": getattr(bs, "auth_mode", None) or "oauth",
                     "expires_at": bs.expires_at.timestamp() if bs.expires_at else None,
                     "linked_at": bs.linked_at.isoformat() if bs.linked_at else None,
                     "last_sync_at": bs.last_sync_at.isoformat() if getattr(bs, "last_sync_at", None) else None,

@@ -47,7 +47,10 @@ class Account(Base):
     zebu_uid = Column(String(100), nullable=True, index=True)
     zebu_actid = Column(String(100), nullable=True)
     zebu_client_id = Column(String(100), nullable=True)
+    zebu_vc = Column(String(100), nullable=True)
     zebu_secret_key = Column(String(200), nullable=True)
+    zebu_factor2_enc = Column(Text, nullable=True)  # Encrypted PAN or DOB
+    zebu_password_enc = Column(Text, nullable=True)  # Encrypted Zebu password
     proxy_url = Column(String(300), nullable=True)
     group_id = Column(String(100), ForeignKey("groups.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now)
@@ -67,6 +70,7 @@ class BrokerSession(Base):
     account_id = Column(String(100), ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True)
     access_token_enc = Column(Text, nullable=True)  # Encrypted at rest
     refresh_token_enc = Column(Text, nullable=True)  # Encrypted at rest
+    auth_mode = Column(String(30), nullable=True, default="oauth")  # quickauth | oauth
     expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
     issued_at = Column(DateTime(timezone=True), nullable=True)
     linked_at = Column(DateTime(timezone=True), nullable=True)

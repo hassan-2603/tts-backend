@@ -93,9 +93,11 @@ class ConnectionManager:
         on_fill: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
         on_touchline: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
         on_status_change: Optional[Callable[[str, str], Coroutine[Any, Any, None]]] = None,
+        auth_mode: str = "oauth",
     ):
         """Attaches and starts a real-time WebSocket connection for an account."""
         state = self.get_account_state(account_id)
+        norm_mode = (auth_mode or "oauth").strip().lower()
 
         # Avoid duplicate WebSocket connection if already running with same credentials
         if (
@@ -104,6 +106,7 @@ class ConnectionManager:
             and state.ws_client.token == token
             and state.ws_client.uid == uid
             and state.ws_client.actid == (actid or uid)
+            and getattr(state.ws_client, "auth_mode", "oauth") == norm_mode
         ):
             if on_touchline is not None:
                 state.ws_client.on_touchline_update = on_touchline
@@ -158,6 +161,7 @@ class ConnectionManager:
             on_order_update=_on_order_update,
             on_touchline_update=_on_touchline_update,
             on_status_change=_on_status_change,
+            auth_mode=norm_mode,
         )
         state.ws_client = ws_client
         await ws_client.start()

@@ -378,6 +378,7 @@ class FinancialSummaryService:
         token_resolver: Optional[Callable[[str], Coroutine[Any, Any, Optional[str]]]] = None,
         link_state_resolver: Optional[Callable[[dict], Coroutine[Any, Any, str]]] = None,
         position_persister: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
+        reauth_resolver: Optional[Callable[[str], Coroutine[Any, Any, Optional[str]]]] = None,
     ):
         self.zebu = zebu
         self.conn_mgr = conn_mgr
@@ -385,6 +386,7 @@ class FinancialSummaryService:
         self.token_resolver = token_resolver
         self.link_state_resolver = link_state_resolver
         self.position_persister = position_persister
+        self.reauth_resolver = reauth_resolver
 
         # Account-isolated cache keyed by "zebu:<uid>:<actid>:<account_id>"
         self._cache: Dict[str, AccountFinancialCacheEntry] = {}
@@ -516,6 +518,7 @@ class FinancialSummaryService:
         acc: dict,
         token: str,
         ensure_ws_cb: Optional[Callable[[dict, str], Coroutine[Any, Any, None]]] = None,
+        _retried_auth: bool = False,
     ):
         aid = entry.account_id
         uid = entry.uid
@@ -588,6 +591,17 @@ class FinancialSummaryService:
                     log.debug("Touchline subscription sync warning for %s: %s", aid, sube)
 
         except SessionExpired as se:
+            if not _retried_auth and self.reauth_resolver:
+                try:
+                    fresh_tok = await self.reauth_resolver(aid)
+                    if fresh_tok:
+                        log.info("PositionBook auto-reauthenticated via QuickAuth for account=%s; retrying", aid)
+                        await self._fetch_and_validate_position_book(
+                            entry, acc, fresh_tok, ensure_ws_cb=ensure_ws_cb, _retried_auth=True
+                        )
+                        return
+                except Exception as re_err:
+                    log.warning("PositionBook auto-reauth failed for account=%s: %s", aid, re_err)
             entry.last_latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
             entry.last_error = f"Session expired: {se}"
             entry.last_error_type = "SESSION_EXPIRED"

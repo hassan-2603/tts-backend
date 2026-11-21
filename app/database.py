@@ -70,8 +70,12 @@ async def init_models(engine: AsyncEngine = None):
         await conn.run_sync(Base.metadata.create_all)
         migrations = [
             ("accounts", "zebu_client_id", "VARCHAR(100)"),
+            ("accounts", "zebu_vc", "VARCHAR(100)"),
             ("accounts", "zebu_secret_key", "VARCHAR(200)"),
+            ("accounts", "zebu_factor2_enc", "TEXT"),
+            ("accounts", "zebu_password_enc", "TEXT"),
             ("accounts", "proxy_url", "VARCHAR(300)"),
+            ("broker_sessions", "auth_mode", "VARCHAR(30) DEFAULT 'oauth'"),
             ("trades", "pnl", "NUMERIC(14, 2)"),
             ("trades", "realized_pnl", "NUMERIC(14, 2)"),
             ("trades", "unrealized_pnl", "NUMERIC(14, 2)"),

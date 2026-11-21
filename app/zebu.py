@@ -22,6 +22,8 @@ log = logging.getLogger("tts.zebu")
 
 READ_ONLY_ENDPOINTS = {
     "GenAcsTok",      # exchange OAuth code for access token
+    "QuickAuth",      # NorenWClientTP credential-based login (returns susertoken)
+    "UserDetails",    # verify user details (NorenWClientTP)
     "ClientDetails",  # verify the linked account
     "TradeBook",      # every fill of the day
     "OrderBook",      # order list (status, remarks, ordersource)
@@ -59,6 +61,95 @@ class ZebuClient:
         self._sync_http: Optional[httpx.Client] = None
         self._proxy_async_clients: Dict[str, httpx.AsyncClient] = {}
         self._proxy_sync_clients: Dict[str, httpx.Client] = {}
+        self._token_auth_modes: Dict[str, str] = {}  # token -> "quickauth" | "oauth"
+
+    def register_token_mode(self, token: Optional[str], auth_mode: str = "oauth"):
+        if token:
+            self._token_auth_modes[str(token)] = (auth_mode or "oauth").strip().lower()
+
+    def get_token_mode(self, token: Optional[str], explicit_mode: Optional[str] = None) -> str:
+        if explicit_mode:
+            return explicit_mode.strip().lower()
+        if token and str(token) in self._token_auth_modes:
+            return self._token_auth_modes[str(token)]
+        return "oauth"
+
+    async def quick_auth_async(
+        self,
+        uid: str,
+        password: str,
+        factor2: str,
+        vc: str,
+        api_secret: str,
+        imei: str = "abc1234",
+        source: str = "API",
+        apkversion: str = "1.0.0",
+        proxy: Optional[str] = None,
+    ) -> dict:
+        """Official Zebu / Noren QuickAuth login: POST {BASE}/NorenWClientTP/QuickAuth.
+
+        Hashing per official Noren API specification:
+          - pwd    = SHA256(password)
+          - appkey = SHA256(uid + "|" + api_secret)
+
+        Returns full QuickAuth response dict containing `susertoken` on success.
+        Never logs passwords, factor2, API secrets, or session tokens.
+        """
+        clean_uid = self._clean_uid(uid)
+        clean_vc = (vc or "").strip().upper()
+        if not clean_vc and clean_uid:
+            clean_vc = f"{clean_uid}_U"
+        clean_factor2 = (factor2 or "").strip()
+        clean_secret = (api_secret or "").strip()
+        if not clean_uid or not password or not clean_factor2 or not clean_vc or not clean_secret:
+            raise ZebuError("Missing required Zebu QuickAuth credentials (UID, VC, PAN/DOB, Secret App Key, Password).")
+
+        pwd_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        appkey_hash = hashlib.sha256(f"{clean_uid}|{clean_secret}".encode("utf-8")).hexdigest()
+
+        payload = {
+            "uid": clean_uid,
+            "pwd": pwd_hash,
+            "factor2": clean_factor2,
+            "vc": clean_vc,
+            "appkey": appkey_hash,
+            "imei": (imei or "abc1234").strip(),
+            "source": (source or "API").strip(),
+            "apkversion": (apkversion or "1.0.0").strip(),
+        }
+        headers = {"Content-Type": "text/plain"}
+        body = "jData=" + json.dumps(payload, separators=(",", ":"))
+        client = self._get_async_http(proxy=proxy)
+
+        try:
+            resp = await client.post(
+                f"{self.base}/NorenWClientTP/QuickAuth",
+                content=body,
+                headers=headers,
+            )
+        except (httpx.ProxyError, httpx.ConnectError, httpx.TimeoutException) as e:
+            raise ZebuError(f"QuickAuth network error: {e}") from e
+
+        if resp.status_code == 429:
+            raise RateLimitError("Zebu QuickAuth rate limit exceeded")
+        try:
+            data = resp.json()
+        except ValueError as ve:
+            raise ZebuError(f"QuickAuth: HTTP {resp.status_code} non-JSON response") from ve
+
+        if not isinstance(data, dict):
+            raise ZebuError(f"QuickAuth: unexpected response type {type(data).__name__}")
+
+        if str(data.get("stat", "")).strip().lower() != "ok":
+            emsg = str(data.get("emsg") or "Authentication failed").strip()
+            raise ZebuError(f"QuickAuth failed: {emsg}")
+
+        susertoken = str(data.get("susertoken") or "").strip()
+        if not susertoken:
+            raise ZebuError("QuickAuth succeeded without returning a susertoken")
+
+        self.register_token_mode(susertoken, "quickauth")
+        return data
 
     def _clean_proxy(self, proxy: Optional[str]) -> Optional[str]:
         if not proxy:
@@ -274,13 +365,20 @@ class ZebuClient:
         return None
 
     # ---------- Low Level Async Request with Exponential Backoff ----------
-    async def _post_async(self, endpoint: str, payload: dict, token: Optional[str] = None, retries: int = 2, proxy: Optional[str] = None) -> Any:
+    async def _post_async(self, endpoint: str, payload: dict, token: Optional[str] = None, retries: int = 2, proxy: Optional[str] = None, auth_mode: Optional[str] = None) -> Any:
         if endpoint not in READ_ONLY_ENDPOINTS:
             raise PermissionError(f"{endpoint} is not allowed — tracking software is strictly read-only")
 
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        mode = self.get_token_mode(token, auth_mode)
+        if mode == "quickauth":
+            api_prefix = "NorenWClientTP"
+            headers = {"Content-Type": "text/plain"}
+        else:
+            api_prefix = "NorenWClientAPI"
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
         body = "jData=" + json.dumps(payload, separators=(",", ":"))
         if token:
             body += f"&jKey={token}"
@@ -289,7 +387,7 @@ class ZebuClient:
         last_ex = None
         for attempt in range(retries + 1):
             try:
-                resp = await client.post(f"{self.base}/NorenWClientAPI/{endpoint}", content=body, headers=headers)
+                resp = await client.post(f"{self.base}/{api_prefix}/{endpoint}", content=body, headers=headers)
                 if resp.status_code == 429:
                     raise RateLimitError("Zebu API Rate limit exceeded")
                 try:
@@ -328,25 +426,29 @@ class ZebuClient:
         proxy: Optional[str] = None,
         timeout: Optional[float] = None,
         retries: int = 2,
+        auth_mode: Optional[str] = None,
     ) -> Tuple[Any, int, float]:
-        """Official Zebu OAuth PositionBook snapshot call (STRICTLY READ-ONLY).
+        """Official Zebu PositionBook snapshot call (STRICTLY READ-ONLY).
 
-        Endpoint: POST /NorenWClientAPI/PositionBook
-        Header:   Authorization: Bearer <access_token>
-                  Content-Type: text/plain
-        Body:     jData={"uid":"...","actid":"..."}
-
+        Supports both QuickAuth (NorenWClientTP + jKey) and OAuth (NorenWClientAPI + Bearer).
         Returns (parsed_json, http_status, elapsed_ms) without silently coercing
         malformed or error payloads into empty lists.
         """
         u = self._clean_uid(uid)
         a = self._clean_uid(actid) or u
         payload = {"uid": u, "actid": a}
-        headers = {
-            "Content-Type": "text/plain",
-            "Authorization": f"Bearer {token}",
-        }
-        body = "jData=" + json.dumps(payload, separators=(",", ":"))
+        mode = self.get_token_mode(token, auth_mode)
+        if mode == "quickauth":
+            api_prefix = "NorenWClientTP"
+            headers = {"Content-Type": "text/plain"}
+            body = "jData=" + json.dumps(payload, separators=(",", ":")) + f"&jKey={token}"
+        else:
+            api_prefix = "NorenWClientAPI"
+            headers = {
+                "Content-Type": "text/plain",
+                "Authorization": f"Bearer {token}",
+            }
+            body = "jData=" + json.dumps(payload, separators=(",", ":"))
         client = self._get_async_http(proxy=proxy)
         req_timeout = timeout if timeout is not None else min(self.timeout, 12.0)
 
@@ -355,7 +457,7 @@ class ZebuClient:
         for attempt in range(retries + 1):
             try:
                 resp = await client.post(
-                    f"{self.base}/NorenWClientAPI/PositionBook",
+                    f"{self.base}/{api_prefix}/PositionBook",
                     content=body,
                     headers=headers,
                     timeout=req_timeout,
@@ -398,19 +500,25 @@ class ZebuClient:
         raise ZebuError(f"PositionBook failed: {last_ex}")
 
     # ---------- Low Level Sync Request (Preserved for compatibility) ----------
-    def _post_sync(self, endpoint: str, payload: dict, token: Optional[str] = None, proxy: Optional[str] = None) -> Any:
+    def _post_sync(self, endpoint: str, payload: dict, token: Optional[str] = None, proxy: Optional[str] = None, auth_mode: Optional[str] = None) -> Any:
         if endpoint not in READ_ONLY_ENDPOINTS:
             raise PermissionError(f"{endpoint} is not allowed — tracking software is strictly read-only")
 
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        mode = self.get_token_mode(token, auth_mode)
+        if mode == "quickauth":
+            api_prefix = "NorenWClientTP"
+            headers = {"Content-Type": "text/plain"}
+        else:
+            api_prefix = "NorenWClientAPI"
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
         body = "jData=" + json.dumps(payload, separators=(",", ":"))
         if token:
             body += f"&jKey={token}"
         client = self._get_sync_http(proxy=proxy)
 
-        resp = client.post(f"{self.base}/NorenWClientAPI/{endpoint}", content=body, headers=headers)
+        resp = client.post(f"{self.base}/{api_prefix}/{endpoint}", content=body, headers=headers)
         try:
             data = resp.json()
         except ValueError:

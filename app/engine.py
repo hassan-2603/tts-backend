@@ -836,6 +836,206 @@ def mlabel(d: int) -> str:
     return "ATM" if d == 0 else (f"{d} ITM" if d > 0 else f"{-d} OTM")
 
 
+def _parse_amt_token(s: Optional[str]) -> Optional[float]:
+    if not s:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(k|l|lac|lakh)?", str(s).replace(",", ""), re.I)
+    if not m:
+        return None
+    v = float(m.group(1))
+    u = (m.group(2) or "").lower()
+    if u == "k":
+        v *= 1000.0
+    elif u in ("l", "lac", "lakh"):
+        v *= 100000.0
+    return v
+
+
+def _parse_time_token(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", str(s), re.I)
+    if not m:
+        return None
+    h = int(m.group(1))
+    mn = int(m.group(2) or 0)
+    ap = (m.group(3) or "").lower()
+    if ap == "pm" and h < 12:
+        h += 12
+    if ap == "am" and h == 12:
+        h = 0
+    if not ap and 1 <= h <= 6:
+        h += 12
+    if not (0 <= h <= 23 and 0 <= mn <= 59):
+        return None
+    return f"{h:02d}:{mn:02d}"
+
+
+def parse_custom_rule(raw_text: str) -> Dict[str, Any]:
+    """Parse an easy-language plain-English trading rule into executable checks."""
+    text = str(raw_text or "").strip()
+    if not text:
+        return {"ok": False, "checks": [], "summary": ""}
+    s = re.sub(r"\s+", " ", text.lower())
+    checks: List[Dict[str, Any]] = []
+    sym_alias = [
+        ("bank nifty", "BANKNIFTY"), ("banknifty", "BANKNIFTY"),
+        ("fin nifty", "FINNIFTY"), ("finnifty", "FINNIFTY"),
+        ("midcap nifty", "MIDCPNIFTY"), ("midcap", "MIDCPNIFTY"), ("midcpnifty", "MIDCPNIFTY"),
+        ("nifty", "NIFTY"), ("sensex", "SENSEX"), ("bankex", "BANKEX"),
+        ("crude oil", "CRUDEOIL"), ("crude", "CRUDEOIL"), ("natural gas", "NATURALGAS"),
+    ]
+
+    if re.search(r"\b(no|avoid|dont|don't|never|ban)\b", s):
+        for alias, sym in sym_alias:
+            if re.search(rf"\b(no|avoid|dont|don't|never|ban)\s+(trading\s+)?(in\s+)?{re.escape(alias)}\b", s):
+                if not any(c["type"] == "ban_symbol" and c.get("val") == sym for c in checks):
+                    checks.append({"type": "ban_symbol", "val": sym, "desc": f"No {sym} trades"})
+        if re.search(r"\b(no|avoid|dont|don't|never)\s+(trading\s+)?(in\s+)?(ce|calls?)\b", s):
+            checks.append({"type": "ban_opt", "val": "CE", "desc": "No Call (CE) trades"})
+        if re.search(r"\b(no|avoid|dont|don't|never)\s+(trading\s+)?(in\s+)?(pe|puts?)\b", s):
+            checks.append({"type": "ban_opt", "val": "PE", "desc": "No Put (PE) trades"})
+        if re.search(r"\b(no|avoid|dont|don't|never)\s+(trading\s+)?(in\s+)?(futures?|fut)\b", s):
+            checks.append({"type": "ban_opt", "val": "FUT", "desc": "No Futures trades"})
+        if re.search(r"\b(no|avoid|dont|don't|never)\s+(trading\s+)?(in\s+)?(options?|opt)\b", s):
+            checks.append({"type": "ban_options", "desc": "No Options (CE/PE) trades"})
+        if re.search(r"\b(no|avoid|dont|don't|never)\s+(option\s+)?(selling|short|shorting|sell)\b", s):
+            checks.append({"type": "only_side", "val": "BUY", "desc": "Buying only (no selling/shorting)"})
+        if re.search(r"\b(no|avoid|dont|don't|never)\s+(option\s+)?(buying|long|buy)\b", s):
+            checks.append({"type": "only_side", "val": "SELL", "desc": "Selling only (no buying)"})
+
+    if re.search(r"\bonly\b", s):
+        for alias, sym in sym_alias:
+            if re.search(rf"\bonly\s+(trade\s+)?(in\s+)?{re.escape(alias)}\b|\b{re.escape(alias)}\s+only\b", s):
+                if not any(c["type"] == "only_symbol" and c.get("val") == sym for c in checks):
+                    checks.append({"type": "only_symbol", "val": sym, "desc": f"Only {sym}"})
+        if re.search(r"\bonly\s+(ce|calls?)\b|\b(ce|calls?)\s+only\b", s):
+            checks.append({"type": "only_opt", "val": "CE", "desc": "Calls (CE) only"})
+        if re.search(r"\bonly\s+(pe|puts?)\b|\b(pe|puts?)\s+only\b", s):
+            checks.append({"type": "only_opt", "val": "PE", "desc": "Puts (PE) only"})
+        if re.search(r"\bonly\s+(option\s+)?(buying|buy|long)\b|\b(buying|buy)\s+only\b", s):
+            checks.append({"type": "only_side", "val": "BUY", "desc": "Buying only"})
+        if re.search(r"\bonly\s+(option\s+)?(selling|sell|short)\b|\b(selling|sell)\s+only\b", s):
+            checks.append({"type": "only_side", "val": "SELL", "desc": "Selling only"})
+        if re.search(r"\b(only\s+equity|equity\s+only|cash\s+only)\b", s):
+            checks.append({"type": "ban_options", "desc": "Equity / Cash only (no options)"})
+
+    if re.search(r"\b(no|avoid|dont|don't|never)\s+(trading\s+)?(on\s+)?(expiry\s*day|0\s*dte|zero\s*dte)\b", s):
+        checks.append({"type": "no_expiry_day", "desc": "No 0DTE / expiry-day trading"})
+    if re.search(r"\b(no|avoid|dont|don't)\s+weekly(\s+expiry)?\b|\bonly\s+monthly(\s+expiry)?\b|\bmonthly(\s+expiry)?\s+only\b", s):
+        checks.append({"type": "only_expiry_type", "val": "Monthly", "desc": "Monthly expiry only"})
+    if re.search(r"\b(no|avoid|dont|don't)\s+monthly(\s+expiry)?\b|\bonly\s+weekly(\s+expiry)?\b|\bweekly(\s+expiry)?\s+only\b", s):
+        checks.append({"type": "only_expiry_type", "val": "Weekly", "desc": "Weekly expiry only"})
+
+    if re.search(r"\b(no|avoid|dont|don't)\s+deep\s+otm\b", s):
+        checks.append({"type": "max_otm_strikes", "val": 2, "desc": "No deep OTM (> 2 strikes OTM)"})
+    elif re.search(r"\b(no|avoid|dont|don't)\s+otm\b", s):
+        checks.append({"type": "ban_moneyness", "val": "OTM", "desc": "No OTM strikes"})
+    if re.search(r"\b(no|avoid|dont|don't)\s+itm\b", s):
+        checks.append({"type": "ban_moneyness", "val": "ITM", "desc": "No ITM strikes"})
+    if re.search(r"\bonly\s+atm\b|\batm\s+only\b", s):
+        checks.append({"type": "only_moneyness", "val": "ATM", "desc": "ATM strikes only"})
+    if re.search(r"\bonly\s+itm\b|\bitm\s+only\b", s):
+        checks.append({"type": "only_moneyness", "val": "ITM", "desc": "ITM strikes only"})
+    if re.search(r"\bonly\s+otm\b|\botm\s+only\b", s):
+        checks.append({"type": "only_moneyness", "val": "OTM", "desc": "OTM strikes only"})
+    m_otm = re.search(r"max\s+(\d+)\s+strikes?\s+otm", s)
+    if m_otm:
+        checks.append({"type": "max_otm_strikes", "val": int(m_otm.group(1)), "desc": f"Max {m_otm.group(1)} strikes OTM"})
+
+    m_between = re.search(r"between\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+(?:and|to|-)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)", s)
+    if m_between:
+        t1, t2 = _parse_time_token(m_between.group(1)), _parse_time_token(m_between.group(2))
+        if t1:
+            checks.append({"type": "time_after", "val": t1, "desc": f"Entry from {t1}"})
+        if t2:
+            checks.append({"type": "time_before", "val": t2, "desc": f"Entry till {t2}"})
+    else:
+        m_after = re.search(r"(?:no|avoid|dont|don't|stop)\s+(?:new\s+)?(?:trades?|trading|entry|entries)\s+after\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)", s)
+        if m_after:
+            t_v = _parse_time_token(m_after.group(1))
+            if t_v:
+                checks.append({"type": "time_before", "val": t_v, "desc": f"No entry after {t_v}"})
+        m_before = re.search(r"(?:no|avoid|dont|don't)\s+(?:new\s+)?(?:trades?|trading|entry|entries)\s+before\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)", s)
+        if m_before:
+            t_v = _parse_time_token(m_before.group(1))
+            if t_v:
+                checks.append({"type": "time_after", "val": t_v, "desc": f"No entry before {t_v}"})
+    m_exit = re.search(r"exit\s+before\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)", s)
+    if m_exit:
+        t_v = _parse_time_token(m_exit.group(1))
+        if t_v:
+            checks.append({"type": "exit_before", "val": t_v, "desc": f"Exit before {t_v}"})
+    m_first = re.search(r"(?:no|avoid|dont|don't)\s+(?:trades?|trading|entry)\s+(?:in\s+)?first\s+(\d+)\s*min", s)
+    if m_first:
+        mins = 9 * 60 + 15 + int(m_first.group(1))
+        t_v = f"{mins // 60:02d}:{mins % 60:02d}"
+        checks.append({"type": "time_after", "val": t_v, "desc": f"No entry in first {m_first.group(1)} min"})
+    m_last = re.search(r"(?:no|avoid|dont|don't)\s+(?:trades?|trading|entry)\s+(?:in\s+)?last\s+(\d+)\s*min", s)
+    if m_last:
+        mins = 15 * 60 + 30 - int(m_last.group(1))
+        t_v = f"{mins // 60:02d}:{mins % 60:02d}"
+        checks.append({"type": "time_before", "val": t_v, "desc": f"No entry in last {m_last.group(1)} min"})
+
+    m_lots = re.search(r"(?:max|maximum|no more than|limit|upto|up to)\s+(\d+(?:\.\d+)?)\s*lots?\b", s)
+    if m_lots:
+        checks.append({"type": "max_lots", "val": float(m_lots.group(1)), "desc": f"Max {m_lots.group(1)} lots/trade"})
+    m_qty = re.search(r"(?:max|maximum|no more than|limit|upto|up to)\s+(\d+)\s*(?:qty|quantity|shares)\b", s)
+    if m_qty:
+        checks.append({"type": "max_qty", "val": int(m_qty.group(1)), "desc": f"Max {m_qty.group(1)} qty/trade"})
+    m_consec = re.search(r"(?:stop\s+after|max|maximum|no more than)\s+(\d+)\s+(?:consecutive|back\s*to\s*back|row)\s+loss(?:es|ing\s+trades?)?", s)
+    if m_consec:
+        checks.append({"type": "max_consec_losses", "val": int(m_consec.group(1)), "desc": f"Stop after {m_consec.group(1)} consecutive losses"})
+    m_loss_tr = re.search(r"(?:stop\s+after|max|maximum|no more than)\s+(\d+)\s+(?:losing\s+trades?|losses)\s*(?:per\s+day|a\s+day|/day|daily)?", s)
+    if m_loss_tr and not m_consec:
+        checks.append({"type": "max_losing_trades_day", "val": int(m_loss_tr.group(1)), "desc": f"Max {m_loss_tr.group(1)} losing trades/day"})
+    m_trades = re.search(r"(?:max|maximum|no more than|limit|upto|up to)\s+(\d+)\s+trades?\s*(?:per\s+day|a\s+day|/day|daily)?", s)
+    if m_trades:
+        checks.append({"type": "max_trades_day", "val": int(m_trades.group(1)), "desc": f"Max {m_trades.group(1)} trades/day"})
+    if re.search(r"\b(no|avoid|dont|don't)\s+revenge\s+trad", s):
+        checks.append({"type": "no_revenge", "val": 5, "desc": "No revenge trading (re-entry within 5 min of a loss)"})
+
+    m_sl_lot = re.search(r"(?:max\s+)?(?:sl|stop\s*-?\s*loss|loss)\s*(?:max\s+)?(?:₹|rs\.?|inr)?\s*([\d,.]+\s*(?:k|l|lac|lakh)?)\s*(?:per|/)\s*lot", s)
+    if m_sl_lot:
+        v = _parse_amt_token(m_sl_lot.group(1))
+        if v and v > 0:
+            checks.append({"type": "sl_per_lot", "val": v, "desc": f"Max SL ₹{v:,.0f}/lot"})
+    m_day_loss = re.search(r"(?:max\s+(?:daily|day)\s+loss|daily\s+loss\s+(?:limit|max)|stop\s+after\s+(?:₹|rs\.?|inr)?\s*([\d,.]+\s*(?:k|l|lac|lakh)?)\s*(?:daily\s+)?loss)(?:\s*(?:of|is|:)?\s*(?:₹|rs\.?|inr)?\s*([\d,.]+\s*(?:k|l|lac|lakh)?))?", s)
+    if m_day_loss:
+        v = _parse_amt_token(m_day_loss.group(1) or m_day_loss.group(2))
+        if v and v > 0:
+            checks.append({"type": "daily_loss", "val": v, "desc": f"Stop after ₹{v:,.0f} daily loss"})
+    m_day_profit = re.search(r"(?:stop\s+after\s+(?:₹|rs\.?|inr)?\s*([\d,.]+\s*(?:k|l|lac|lakh)?)\s*(?:daily\s+)?profit|(?:daily\s+)?profit\s+target\s*(?:of|is|:)?\s*(?:₹|rs\.?|inr)?\s*([\d,.]+\s*(?:k|l|lac|lakh)?))", s)
+    if m_day_profit:
+        v = _parse_amt_token(m_day_profit.group(1) or m_day_profit.group(2))
+        if v and v > 0:
+            checks.append({"type": "daily_profit_cap", "val": v, "desc": f"Stop after ₹{v:,.0f} daily profit target"})
+    m_tr_loss = re.search(r"(?:max\s+(?:sl|stop\s*-?\s*loss|loss)\s*(?:of|is|:)?\s*(?:₹|rs\.?|inr)?\s*([\d,.]+\s*(?:k|l|lac|lakh)?)\s*(?:per\s+trade|/trade|in\s+(?:a|one)\s+trade)?)", s)
+    if m_tr_loss and not m_sl_lot and not m_day_loss:
+        v = _parse_amt_token(m_tr_loss.group(1))
+        if v and v > 0:
+            checks.append({"type": "max_loss_trade", "val": v, "desc": f"Max loss ₹{v:,.0f}/trade"})
+
+    if re.search(r"\b(intraday\s+only|mis\s+only|no\s+overnight|no\s+carry\s*forward|no\s+btst|no\s+nrml|avoid\s+overnight|avoid\s+btst)\b", s):
+        checks.append({"type": "intraday_only", "desc": "Intraday only (no overnight / BTST / NRML)"})
+    if re.search(r"\b(no\s+naked\s+(?:sell|selling|options?)|hedge\s+required|must\s+hedge|always\s+hedge|only\s+hedged)\b", s):
+        checks.append({"type": "hedge_required", "desc": "Hedge required (no naked positions)"})
+    if re.search(r"\b(manual\s+only|only\s+manual|no\s+algo)\b", s):
+        checks.append({"type": "only_source", "val": "Manual", "desc": "Manual trades only"})
+    if re.search(r"\b(algo\s+only|only\s+algo|no\s+manual)\b", s):
+        checks.append({"type": "only_source", "val": "Algo", "desc": "Algo trades only"})
+    m_min_h = re.search(r"(?:min|minimum)\s+hold(?:ing)?(?:\s+time)?\s+(\d+)\s*min", s)
+    if m_min_h:
+        checks.append({"type": "min_hold", "val": int(m_min_h.group(1)), "desc": f"Min holding time {m_min_h.group(1)} min"})
+    elif re.search(r"\b(no|avoid|dont|don't)\s+scalp", s):
+        checks.append({"type": "min_hold", "val": 2, "desc": "No scalping (min 2 min hold)"})
+    m_max_h = re.search(r"(?:max|maximum)\s+hold(?:ing)?(?:\s+time)?\s+(\d+)\s*min", s)
+    if m_max_h:
+        checks.append({"type": "max_hold", "val": int(m_max_h.group(1)), "desc": f"Max holding time {m_max_h.group(1)} min"})
+
+    return {"ok": len(checks) > 0, "checks": checks, "summary": " · ".join(c["desc"] for c in checks)}
+
+
 def check_trades(
     trades: List[dict],
     rules_by_trader: dict,
@@ -869,8 +1069,17 @@ def check_trades(
             or {}
         )
         r = {**DEFAULT_RULES, **raw_rules}
+        custom_parsed = []
+        for cr in (r.get("customRules") or []):
+            if isinstance(cr, dict) and cr.get("text"):
+                pr = parse_custom_rule(cr["text"])
+                if pr["ok"]:
+                    custom_parsed.append({"text": cr["text"], "level": cr.get("level") or "Medium", "parsed": pr})
         day_pnl = Decimal("0")
         stop = False
+        consec_losses = 0
+        day_loss_count = 0
+        last_loss_exit_min = None
         # Track unique entry orders per day so split partial-closure legs of the same entry order aren't double-counted as separate new entries
         seen_entry_orders = []
 
@@ -1048,10 +1257,95 @@ def check_trades(
                     observed=str(t.get("expiryType")),
                 )
 
+            # 13. Custom plain-English rules
+            e_min = to_min(t.get("exitTime")) if (exit_d == t.get("date") and t.get("exitTime") and t.get("exitTime") != "OPEN") else None
+            hold_min = (e_min - t_min) if (t_min is not None and e_min is not None and e_min >= t_min) else None
+            sym_u = str(t.get("symbol") or "").upper()
+            opt_u = str(t.get("opt") or "").upper()
+            qty_val = float(t.get("qty") or (float(t.get("lots") or 0) * float(t.get("lotSize") or 1)) or 0)
+            g_cur = gross_pnl(t) if has_valid_pnl else None
+            for cr in custom_parsed:
+                lbl = f"Custom: {cr['text']}"
+                lv = cr["level"]
+                for c in cr["parsed"]["checks"]:
+                    ct = c["type"]
+                    cv = c.get("val")
+                    if ct == "ban_symbol" and sym_u == cv:
+                        add(lbl, f"Traded banned symbol {sym_u}", lv)
+                    elif ct == "only_symbol" and sym_u != cv:
+                        add(lbl, f"Traded {sym_u} (allowed: {cv})", lv)
+                    elif ct == "ban_opt" and opt_u == cv:
+                        add(lbl, f"Traded {opt_u}", lv)
+                    elif ct == "only_opt" and opt_u and opt_u != cv:
+                        add(lbl, f"Traded {opt_u} (allowed: {cv})", lv)
+                    elif ct == "ban_options" and opt_u in ("CE", "PE"):
+                        add(lbl, f"Traded option {sym_u} {t.get('strike') or ''} {opt_u}", lv)
+                    elif ct == "only_side" and t.get("side") != cv:
+                        add(lbl, f"{t.get('side')} trade (allowed: {cv})", lv)
+                    elif ct == "no_expiry_day" and t.get("expiry") and str(t["expiry"])[:10] == t.get("date"):
+                        add(lbl, f"Traded on expiry day ({t['expiry']})", lv)
+                    elif ct == "only_expiry_type" and t.get("expiryType") and t["expiryType"] != cv:
+                        add(lbl, f"Traded {t['expiryType']} expiry", lv)
+                    elif ct == "ban_moneyness" and opt_u in ("CE", "PE") and t.get("spot"):
+                        _, md = moneyness(t, step)
+                        if (cv == "OTM" and md < 0) or (cv == "ITM" and md > 0):
+                            add(lbl, f"{t.get('strike')} {opt_u} is {mlabel(md)}", lv)
+                    elif ct == "only_moneyness" and opt_u in ("CE", "PE") and t.get("spot"):
+                        _, md = moneyness(t, step)
+                        if (cv == "ATM" and md != 0) or (cv == "ITM" and md <= 0) or (cv == "OTM" and md >= 0):
+                            add(lbl, f"{t.get('strike')} {opt_u} is {mlabel(md)}", lv)
+                    elif ct == "max_otm_strikes" and opt_u in ("CE", "PE") and t.get("spot"):
+                        _, md = moneyness(t, step)
+                        if md < -cv:
+                            add(lbl, f"{t.get('strike')} {opt_u} is {mlabel(md)} (max {cv} OTM)", lv)
+                    elif ct == "time_after" and t_min is not None and to_min(cv) is not None and t_min < to_min(cv):
+                        add(lbl, f"Entry at {t.get('time')} (before {cv})", lv)
+                    elif ct == "time_before" and t_min is not None and to_min(cv) is not None and t_min > to_min(cv):
+                        add(lbl, f"Entry at {t.get('time')} (after {cv})", lv)
+                    elif ct == "exit_before" and e_min is not None and to_min(cv) is not None and e_min > to_min(cv):
+                        add(lbl, f"Exited at {t.get('exitTime')} (after {cv})", lv)
+                    elif ct == "max_lots" and float(t.get("lots") or 0) > cv:
+                        add(lbl, f"Took {t.get('lots')} lots (max {cv})", lv)
+                    elif ct == "max_qty" and qty_val > cv:
+                        add(lbl, f"Took {qty_val:g} qty (max {cv})", lv)
+                    elif ct == "max_trades_day" and trade_seq_idx >= cv:
+                        add(lbl, f"Took trade #{trade_seq_idx + 1} (max {cv}/day)", lv)
+                    elif ct == "max_consec_losses" and consec_losses >= cv:
+                        add(lbl, f"Traded after {consec_losses} consecutive losses", lv)
+                    elif ct == "max_losing_trades_day" and day_loss_count >= cv:
+                        add(lbl, f"Traded after {day_loss_count} losing trades today", lv)
+                    elif ct == "no_revenge" and last_loss_exit_min is not None and t_min is not None and 0 <= (t_min - last_loss_exit_min) <= cv:
+                        add(lbl, f"Re-entered {t_min - last_loss_exit_min} min after a loss", lv)
+                    elif ct == "sl_per_lot" and has_valid_pnl and g_cur < 0 and float(t.get("lots") or 0) > 0 and (-g_cur / float(t["lots"])) > cv:
+                        add(lbl, f"Lost ₹{-g_cur / float(t['lots']):,.0f}/lot (max ₹{cv:,.0f})", lv)
+                    elif ct == "max_loss_trade" and has_valid_pnl and g_cur < 0 and (-g_cur) > cv:
+                        add(lbl, f"Lost ₹{-g_cur:,.0f} in one trade (max ₹{cv:,.0f})", lv)
+                    elif ct == "daily_loss" and day_pnl <= -_dec(cv, Decimal("0")):
+                        add(lbl, f"Kept trading after day P&L hit ₹{float(day_pnl):,.0f}", lv)
+                    elif ct == "daily_profit_cap" and day_pnl >= _dec(cv, Decimal("0")):
+                        add(lbl, f"Kept trading after profit target ₹{cv:,.0f} hit", lv)
+                    elif ct == "intraday_only" and (t.get("product") == "NRML" or carried_overnight):
+                        add(lbl, "Carried position overnight / NRML", lv)
+                    elif ct == "hedge_required" and not t.get("hedged"):
+                        add(lbl, "Unhedged / naked position", lv)
+                    elif ct == "only_source" and t.get("source") != cv:
+                        add(lbl, f"Placed via {t.get('source')} (allowed: {cv})", lv)
+                    elif ct == "min_hold" and hold_min is not None and hold_min < cv:
+                        add(lbl, f"Held only {hold_min} min (min {cv} min)", lv)
+                    elif ct == "max_hold" and hold_min is not None and hold_min > cv:
+                        add(lbl, f"Held {hold_min} min (max {cv} min)", lv)
+
             if has_valid_pnl:
-                day_pnl += _dec(gross_pnl(t), Decimal("0"))
+                day_pnl += _dec(g_cur, Decimal("0"))
                 if r.get("dailyLoss") and day_pnl <= -_dec(r["dailyLoss"], Decimal("0")):
                     stop = True
+                if g_cur < 0:
+                    consec_losses += 1
+                    day_loss_count += 1
+                    if e_min is not None:
+                        last_loss_exit_min = e_min
+                elif g_cur > 0:
+                    consec_losses = 0
 
             out[t["id"]] = f
     return out

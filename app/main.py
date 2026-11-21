@@ -82,7 +82,7 @@ DEFAULT_SETTINGS = {
     "strikeStep": 100,
     "testDays": 30,
     "extendDays": 15,
-    "pass": {"ruleFollow": 95, "highFlags": 2, "maxDDpct": 10, "accuracy": 50, "rr": 1.5, "pf": 1.3},
+    "pass": {"ruleFollow": 95, "highFlags": 2, "maxDDpct": 10, "accuracy": 50, "rr": 1.5},
     "capitalSteps": "₹5 L → ₹15 L → ₹50 L",
     "alerts": {"telegram": "", "whatsapp": "", "email": "", "onHigh": True, "dailySummary": True, "summaryTime": "15:35"},
 }

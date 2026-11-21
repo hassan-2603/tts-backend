@@ -114,3 +114,64 @@ def test_risk_rules_evaluation():
     assert any("Entry from 09:20" in r for r in flag_rules)
     assert any("Max 3 lots" in r for r in flag_rules)
     assert any("Intraday only" in r for r in flag_rules)
+
+
+def test_custom_plain_english_rules():
+    from app.engine import parse_custom_rule
+
+    assert parse_custom_rule("No BankNifty")["ok"] is True
+    assert parse_custom_rule("No entry after 2:30 pm")["ok"] is True
+    assert parse_custom_rule("Stop after 2 consecutive losses")["ok"] is True
+    assert parse_custom_rule("No 0DTE")["ok"] is True
+    assert parse_custom_rule("No naked selling")["ok"] is True
+    assert parse_custom_rule("No revenge trading")["ok"] is True
+
+    trades = [
+        {
+            "id": "C-1", "trader": "TR-02", "account": "AC-02", "date": "2026-11-26", "time": "10:00",
+            "exitDate": "2026-11-26", "exitTime": "10:10", "expiry": "2026-11-26",
+            "symbol": "BANKNIFTY", "strike": 52000, "opt": "CE", "side": "SELL",
+            "lots": 1, "lotSize": 30, "entry": 100, "exit": 150, "pnl": -1500.0,
+            "product": "MIS", "open": False, "charges": 0, "source": "Manual", "hedged": False,
+        },
+        {
+            "id": "C-2", "trader": "TR-02", "account": "AC-02", "date": "2026-11-26", "time": "10:12",
+            "exitDate": "2026-11-26", "exitTime": "10:20", "expiry": "2026-11-28",
+            "symbol": "NIFTY", "strike": 24500, "opt": "PE", "side": "BUY",
+            "lots": 1, "lotSize": 75, "entry": 100, "exit": 80, "pnl": -1500.0,
+            "product": "MIS", "open": False, "charges": 0, "source": "Manual", "hedged": True,
+        },
+        {
+            "id": "C-3", "trader": "TR-02", "account": "AC-02", "date": "2026-11-26", "time": "14:45",
+            "exitDate": "2026-11-26", "exitTime": "14:55", "expiry": "2026-11-28",
+            "symbol": "NIFTY", "strike": 24500, "opt": "PE", "side": "BUY",
+            "lots": 1, "lotSize": 75, "entry": 100, "exit": 120, "pnl": 1500.0,
+            "product": "MIS", "open": False, "charges": 0, "source": "Manual", "hedged": True,
+        },
+    ]
+    custom_rules = {
+        "TR-02": {
+            "instrument": "ANY", "expiry": "ANY", "strikeMode": "ANY", "strikeDist": 0,
+            "side": "ANY", "product": "ANY", "timeFrom": "", "timeTo": "",
+            "maxTradesDay": 0, "maxLots": 0, "slPerLot": 0, "dailyLoss": 0,
+            "hedge": False, "source": "ANY",
+            "customRules": [
+                {"id": "1", "text": "No BankNifty", "level": "High"},
+                {"id": "2", "text": "No 0DTE", "level": "High"},
+                {"id": "3", "text": "No naked selling", "level": "High"},
+                {"id": "4", "text": "No revenge trading", "level": "Medium"},
+                {"id": "5", "text": "Stop after 2 consecutive losses", "level": "High"},
+                {"id": "6", "text": "No entry after 2:30 pm", "level": "Medium"},
+            ],
+        }
+    }
+    flags = check_trades(trades, custom_rules)
+    r1 = [f["rule"] for f in flags["C-1"]]
+    r2 = [f["rule"] for f in flags["C-2"]]
+    r3 = [f["rule"] for f in flags["C-3"]]
+    assert "Custom: No BankNifty" in r1
+    assert "Custom: No 0DTE" in r1
+    assert "Custom: No naked selling" in r1
+    assert "Custom: No revenge trading" in r2
+    assert "Custom: Stop after 2 consecutive losses" in r3
+    assert "Custom: No entry after 2:30 pm" in r3

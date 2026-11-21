@@ -324,48 +324,20 @@ async def _is_day_locked_for_account_async(aid: str, now: datetime) -> bool:
 
 
 async def _record_post_eod_versioned_reconciliation_async(acc: dict, now: datetime, positions: List[dict]):
-    """When a manual forced sync runs after EOD finalization, records a versioned correction note
-    on today's DailyAccountReport without creating duplicate rows or mutating past historical dates."""
+    """Daily P&L Calendar immutability guard: once a day's DailyAccountReport is FINALIZED or ARCHIVED,
+    its stored financial values (realized_pnl, unrealized_pnl, net_pnl, charges, trade_details) are
+    NEVER modified or overwritten."""
     aid = acc["id"]
     today_str = now.date().isoformat()
     reps = await DB.get_daily_reports_async(account_id=aid)
     existing = next((r for r in reps if r.get("account") == aid and r.get("date") == today_str), None)
     if not existing or existing.get("status") not in ("FINALIZED", "ARCHIVED"):
         return
-    # Compute version number from prior notes
-    prev_notes = str(existing.get("reconciliation_notes") or "").strip()
-    version = prev_notes.count("[v") + 2
-    broker_rpnl = sum((Decimal(str(p.get("realized_pnl") if p.get("realized_pnl") is not None else (p.get("rpnl") or 0))) for p in positions), Decimal("0"))
-    broker_urmtom = sum((Decimal(str(p.get("unrealized_pnl") if p.get("unrealized_pnl") is not None else (p.get("urmtom") or 0))) for p in positions), Decimal("0"))
-    all_tr = await DB._all_trades(from_date=today_str)
-    closed_today = [
-        t for t in all_tr
-        if t.get("account") == aid and not t.get("open") and ((t.get("exitDate") or t.get("date")) == today_str)
-    ]
-    open_today = [t for t in all_tr if t.get("account") == aid and t.get("open")]
-    fifo_realized = sum((Decimal(str(t.get("realized_pnl") if t.get("realized_pnl") is not None else (t.get("pnl") or 0))) for t in closed_today), Decimal("0"))
-    charges_dec = sum((Decimal(str(t.get("charges") or 0)) for t in closed_today), Decimal("0"))
-    note_entry = (
-        f"[v{version} @ {now.strftime('%H:%M:%S')} IST] Manual forced reconciliation: "
-        f"broker_rpnl={broker_rpnl:.2f}, broker_urmtom={broker_urmtom:.2f}, fifo_closed={fifo_realized:.2f} "
-        f"(prev_realized={existing.get('realized_pnl', 0):.2f})"
+    # Strictly immutable: log audit notice without altering finalized Daily P&L Calendar figures
+    log.info(
+        "Daily P&L Calendar report %s|%s is %s and immutable — preserving finalized values unchanged.",
+        aid, today_str, existing.get("status"),
     )
-    combined_notes = (prev_notes + "\n" + note_entry).strip() if prev_notes else note_entry
-    await DB.put_daily_report_async(f"{aid}|{today_str}", {
-        **existing,
-        "realized_pnl": float(fifo_realized),
-        "unrealized_pnl": float(broker_urmtom),
-        "charges": float(charges_dec),
-        "net_pnl": float(fifo_realized - charges_dec),
-        "closed_trades": len(closed_today),
-        "open_trades": len(open_today),
-        "total_trades": len(closed_today) + len(open_today),
-        "winning_trades": len([t for t in closed_today if float(t.get("realized_pnl") or t.get("pnl") or 0) > 0]),
-        "losing_trades": len([t for t in closed_today if float(t.get("realized_pnl") or t.get("pnl") or 0) <= 0]),
-        "status": "FINALIZED",
-        "reconciliation_notes": combined_notes,
-        "finalized_at": datetime.now(timezone.utc),
-    }, allow_overwrite_finalized=True)
 
 
 async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = False, force: bool = False) -> str:

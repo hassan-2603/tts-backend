@@ -256,9 +256,10 @@ def test_p4_eod_finalization_and_post_eod_versioned_forced_reconciliation(ctx):
     r = client.post("/api/sync?account=ACC-S1&force=1", headers=admin)
     assert r.status_code == 200
 
-    # Verify single DailyAccountReport row with versioned correction note
+    # Verify single DailyAccountReport row remains strictly immutable after finalization
     reps = asyncio.run(DB.get_daily_reports_async(account_id="ACC-S1"))
     today_reps = [x for x in reps if x["account"] == "ACC-S1" and x["date"] == today_str]
     assert len(today_reps) == 1
-    assert "[v2 @" in (today_reps[0].get("reconciliation_notes") or "")
-    assert today_reps[0]["unrealized_pnl"] == 3000.0
+    assert today_reps[0]["status"] == "FINALIZED"
+    # Finalized Daily P&L Calendar snapshot MUST NOT be modified by subsequent syncs
+    assert today_reps[0]["unrealized_pnl"] == 2250.0

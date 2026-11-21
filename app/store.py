@@ -160,6 +160,19 @@ class Store:
             await session.merge(s)
             await session.commit()
 
+    async def delete_user_sessions_async(self, username: str) -> int:
+        async with AsyncSessionLocal() as session:
+            res = await session.execute(sa_delete(UserSession).where(UserSession.user == username))
+            await session.commit()
+            return int(res.rowcount or 0)
+
+    async def delete_user_async(self, username: str) -> bool:
+        async with AsyncSessionLocal() as session:
+            await session.execute(sa_delete(UserSession).where(UserSession.user == username))
+            res = await session.execute(sa_delete(User).where(User.user == username))
+            await session.commit()
+            return bool(res.rowcount)
+
     async def _delete_session(self, token: str):
         async with AsyncSessionLocal() as session:
             await session.execute(sa_delete(UserSession).where(UserSession.id == token))

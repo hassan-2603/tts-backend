@@ -313,6 +313,20 @@ class DashboardWebSocketManager:
             except Exception:
                 self.disconnect(connection)
 
+    async def disconnect_user(self, username: str, reason: str = "Password changed"):
+        """Force-logout every active WebSocket session for `username` across all devices/tabs."""
+        for connection, scope in list(self.active_connections.items()):
+            if scope.get("user") == username:
+                try:
+                    await connection.send_json({"type": "force_logout", "reason": reason})
+                except Exception:
+                    pass
+                try:
+                    await connection.close(code=4001, reason=reason)
+                except Exception:
+                    pass
+                self.disconnect(connection)
+
 
 WS_HUB = DashboardWebSocketManager()
 
@@ -348,23 +362,40 @@ async def _ensure_account_ws_stream(acc: dict, token: str, auth_mode: Optional[s
     )
 
 
-async def _assert_user_can_access_account(user: dict, acc: dict):
-    """Strictly enforces per-user account isolation (prevents cross-account parameter tampering)."""
+async def _user_allowed_scope_async(user: dict) -> Optional[Dict[str, set]]:
+    """Returns None for admin (unrestricted access).
+    For viewer / trader, returns fail-closed sets of authorized {accounts, traders, uids}."""
     role = user.get("role")
     if role == "admin":
-        return
+        return None
     u = await DB.get_user_async(user.get("user", ""))
+    all_acc = await DB.get_all_accounts_async()
+    if role == "viewer":
+        raw_allowed = set((u.get("assigned_accounts") if u else None) or [])
+        matched = [a for a in all_acc if a.get("id") in raw_allowed]
+        acc_ids = {a["id"] for a in matched}
+        tr_ids = {a.get("trader") for a in matched if a.get("trader")} | acc_ids
+        uids = {a.get("zebu_uid") for a in matched if a.get("zebu_uid")}
+        return {"accounts": acc_ids, "traders": tr_ids, "uids": uids, "all_keys": acc_ids | tr_ids | uids}
     if role == "trader":
         tid = u.get("trader_id") if u else None
-        if not tid or (acc.get("trader") != tid and acc.get("id") != tid):
-            raise HTTPException(403, "Not authorized to access this account's financial data")
+        if not tid:
+            return {"accounts": set(), "traders": set(), "uids": set(), "all_keys": set()}
+        matched = [a for a in all_acc if a.get("trader") == tid or a.get("id") == tid]
+        acc_ids = {a["id"] for a in matched}
+        tr_ids = {tid} | acc_ids
+        uids = {a.get("zebu_uid") for a in matched if a.get("zebu_uid")}
+        return {"accounts": acc_ids, "traders": tr_ids, "uids": uids, "all_keys": acc_ids | tr_ids | uids}
+    return {"accounts": set(), "traders": set(), "uids": set(), "all_keys": set()}
+
+
+async def _assert_user_can_access_account(user: dict, acc: dict):
+    """Strictly enforces per-user account isolation (prevents cross-account parameter tampering)."""
+    scope = await _user_allowed_scope_async(user)
+    if scope is None:
         return
-    if role == "viewer":
-        allowed = u.get("assigned_accounts") if u else None
-        if not allowed or acc.get("id") not in allowed:
-            raise HTTPException(403, "Not authorized to access this account's financial data")
-        return
-    raise HTTPException(403, "Not authorized to access this account's financial data")
+    if acc.get("id") not in scope["accounts"]:
+        raise HTTPException(403, "Not authorized to access this account's financial data")
 
 
 # ---------------- Polling & Synchronization ----------------
@@ -2080,7 +2111,7 @@ async def test_proxy(proxy: str = ""):
 
 
 @app.get("/api/account-pnl/{aid}")
-async def get_raw_account_pnl(aid: str, _=Depends(current_user)):
+async def get_raw_account_pnl(aid: str, user=Depends(current_user)):
     acc = await DB.get_account_async(aid)
     if not acc:
         all_acc = await DB.get_all_accounts_async()
@@ -2089,7 +2120,8 @@ async def get_raw_account_pnl(aid: str, _=Depends(current_user)):
                 acc = a
                 break
     if not acc:
-        return {"error": f"Account {aid} not found", "accounts": [a.get("id") for a in await DB.get_all_accounts_async()]}
+        raise HTTPException(404, f"Account {aid} not found")
+    await _assert_user_can_access_account(user, acc)
 
     tok = await token_for_account_async(acc["id"])
     uid = acc.get("zebu_uid")
@@ -2171,23 +2203,62 @@ async def me(user=Depends(current_user)):
 @app.get("/api/users")
 async def get_users(_=Depends(admin_only)):
     users = await DB.get_all_users_async()
-    return [{"user": u["user"], "role": u["role"]} for u in users]
+    return [
+        {
+            "user": u["user"],
+            "role": u["role"],
+            "assigned_accounts": u.get("assigned_accounts") or [],
+        }
+        for u in users
+    ]
 
 
 @app.put("/api/users/{name}")
 async def put_user(name: str, request: Request, _=Depends(admin_only)):
     d = await request.json()
     old = (await DB.get_user_async(name)) or {}
+    role = str(d.get("role", old.get("role", "viewer"))).strip().lower()
+    if role not in ("admin", "viewer"):
+        raise HTTPException(400, "Role must be 'admin' or 'viewer'")
+    new_pw_raw = d.get("password")
+    password_changed = bool(new_pw_raw and str(new_pw_raw).strip())
+    raw_assigned = d.get("assigned_accounts", old.get("assigned_accounts", []))
+    assigned_accounts = [] if role == "admin" else [str(x).strip() for x in (raw_assigned or []) if str(x).strip()]
     doc = {
         "user": name,
-        "role": d.get("role", old.get("role", "viewer")),
-        "pw": hash_pw(d["password"]) if d.get("password") else old.get("pw"),
+        "role": role,
+        "pw": hash_pw(str(new_pw_raw)) if password_changed else old.get("pw"),
         "trader_id": d.get("trader_id", old.get("trader_id")),
-        "assigned_accounts": d.get("assigned_accounts", old.get("assigned_accounts", [])),
+        "assigned_accounts": assigned_accounts,
     }
     if not doc["pw"]:
         raise HTTPException(400, "Password needed")
     await DB.put_user_async(name, doc)
+
+    # Clear cached funds for this user so updated account permissions take effect immediately
+    _FUNDS_CACHE.pop(f"user:{name}", None)
+    _FUNDS_CACHE_MONO.pop(f"user:{name}", None)
+    _FUNDS_LAST_VERIFIED.pop(f"user:{name}", None)
+
+    revoked = 0
+    if password_changed and old:
+        # Password changed -> immediately log this user out of everywhere (all sessions + live WebSockets)
+        revoked = await DB.delete_user_sessions_async(name)
+        await WS_HUB.disconnect_user(name, reason="Password changed")
+    elif old and (old.get("role") != role or (old.get("assigned_accounts") or []) != assigned_accounts):
+        await WS_HUB.disconnect_user(name, reason="Account permissions updated")
+
+    return {"ok": True, "sessions_revoked": revoked}
+
+
+@app.delete("/api/users/{name}")
+async def delete_user(name: str, user=Depends(admin_only)):
+    if name == user.get("user"):
+        raise HTTPException(400, "You cannot delete your own logged-in admin account")
+    await WS_HUB.disconnect_user(name, reason="User removed")
+    await DB.delete_user_async(name)
+    _FUNDS_CACHE.pop(f"user:{name}", None)
+    _FUNDS_CACHE_MONO.pop(f"user:{name}", None)
     return {"ok": True}
 
 
@@ -2205,14 +2276,10 @@ def _resolve_token_doc_fast(acc: dict, tokens_by_id: Dict[str, dict], tokens_by_
 @app.get("/api/traders")
 async def get_traders(user=Depends(current_user)):
     all_traders = await DB._all_traders()
-
-    if user["role"] == "admin":
+    scope = await _user_allowed_scope_async(user)
+    if scope is None:
         return all_traders
-    elif user["role"] == "trader":
-        u = await DB.get_user_async(user["user"])
-        tid = u.get("trader_id") if u else None
-        return [t for t in all_traders if t["id"] == tid] if tid else all_traders
-    return all_traders
+    return [t for t in all_traders if t.get("id") in scope["traders"]]
 
 
 @app.put("/api/traders/{tid}")
@@ -2316,16 +2383,9 @@ async def get_accounts(user=Depends(current_user)):
             if u:
                 tokens_by_uid[u] = t
 
-    if user["role"] == "trader":
-        u = await DB.get_user_async(user["user"])
-        tid = u.get("trader_id") if u else None
-        if tid:
-            all_acc = [a for a in all_acc if a.get("trader") == tid or a.get("id") == tid]
-    elif user["role"] == "viewer":
-        u = await DB.get_user_async(user["user"])
-        allowed = u.get("assigned_accounts") if u else None
-        if allowed:
-            all_acc = [a for a in all_acc if a.get("id") in allowed]
+    scope = await _user_allowed_scope_async(user)
+    if scope is not None:
+        all_acc = [a for a in all_acc if a.get("id") in scope["accounts"]]
 
     for a in all_acc:
         t = _resolve_token_doc_fast(a, tokens_by_id, tokens_by_uid)
@@ -2914,8 +2974,12 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
 
 
 @app.get("/api/rules")
-async def get_rules(_=Depends(current_user)):
-    return await get_rules_map_async()
+async def get_rules(user=Depends(current_user)):
+    rmap = await get_rules_map_async()
+    scope = await _user_allowed_scope_async(user)
+    if scope is None:
+        return rmap
+    return {k: v for k, v in rmap.items() if k in scope["all_keys"]}
 
 
 async def _related_rule_ids_async(tid: str) -> List[str]:
@@ -2989,40 +3053,29 @@ async def delete_rules(tid: str, user=Depends(admin_only)):
 
 
 @app.get("/api/rulelog")
-async def get_rulelog(_=Depends(current_user)):
+async def get_rulelog(user=Depends(current_user)):
     logs = await DB._all_rule_logs()
+    scope = await _user_allowed_scope_async(user)
+    if scope is not None:
+        logs = [l for l in logs if l.get("trader") in scope["all_keys"]]
     return sorted(logs, key=lambda x: x["at"])
 
 
 @app.get("/api/violations")
 async def get_violations(account: Optional[str] = None, user=Depends(current_user)):
     violations = await DB.get_rule_violations_async(account_id=account)
-    if user["role"] == "trader":
-        u = await DB.get_user_async(user["user"])
-        tid = u.get("trader_id") if u else None
-        if tid:
-            violations = [v for v in violations if v.get("trader") == tid or v.get("account") == tid]
-    elif user["role"] == "viewer":
-        u = await DB.get_user_async(user["user"])
-        allowed = u.get("assigned_accounts") if u else None
-        if allowed:
-            violations = [v for v in violations if v.get("account") in allowed]
+    scope = await _user_allowed_scope_async(user)
+    if scope is not None:
+        violations = [v for v in violations if v.get("account") in scope["accounts"]]
     return violations
 
 
 @app.get("/api/daily-reports")
 async def get_daily_reports(account: Optional[str] = None, from_date: Optional[str] = None, user=Depends(current_user)):
     reports = await DB.get_daily_reports_async(account_id=account, from_date=from_date)
-    if user["role"] == "trader":
-        u = await DB.get_user_async(user["user"])
-        tid = u.get("trader_id") if u else None
-        if tid:
-            reports = [r for r in reports if r.get("trader") == tid or r.get("account") == tid]
-    elif user["role"] == "viewer":
-        u = await DB.get_user_async(user["user"])
-        allowed = u.get("assigned_accounts") if u else None
-        if allowed:
-            reports = [r for r in reports if r.get("account") in allowed]
+    scope = await _user_allowed_scope_async(user)
+    if scope is not None:
+        reports = [r for r in reports if r.get("account") in scope["accounts"]]
     return reports
 
 
@@ -3062,17 +3115,10 @@ async def get_trades(request: Request, user=Depends(current_user)):
     if acc_filter:
         all_trades = [t for t in all_trades if t.get("account") == acc_filter or t.get("trader") == acc_filter]
 
-    # Account-level isolation
-    if user["role"] == "trader":
-        u = await DB.get_user_async(user["user"])
-        tid = u.get("trader_id") if u else None
-        if tid:
-            all_trades = [t for t in all_trades if t.get("trader") == tid or t.get("account") == tid]
-    elif user["role"] == "viewer":
-        u = await DB.get_user_async(user["user"])
-        allowed = u.get("assigned_accounts") if u else None
-        if allowed:
-            all_trades = [t for t in all_trades if t.get("account") in allowed]
+    # Account-level isolation (strict fail-closed for viewers)
+    scope = await _user_allowed_scope_async(user)
+    if scope is not None:
+        all_trades = [t for t in all_trades if t.get("account") in scope["accounts"]]
 
     METRICS.record_api_latency((time.perf_counter() - t0) * 1000)
     return all_trades
@@ -3125,8 +3171,17 @@ async def delete_trades_bulk(request: Request, _=Depends(admin_only)):
 
 
 @app.get("/api/groups")
-async def get_groups(_=Depends(current_user)):
-    return await DB._all_groups()
+async def get_groups(user=Depends(current_user)):
+    groups = await DB._all_groups()
+    scope = await _user_allowed_scope_async(user)
+    if scope is None:
+        return groups
+    filtered = []
+    for g in groups:
+        accs = [aid for aid in (g.get("accounts") or []) if aid in scope["accounts"]]
+        if accs:
+            filtered.append({**g, "accounts": accs})
+    return filtered
 
 
 @app.put("/api/groups/{gid}")
@@ -3163,7 +3218,7 @@ async def put_settings(request: Request, _=Depends(admin_only)):
 
 
 @app.post("/api/sync")
-async def sync_now(request: Request, account: Optional[str] = None, trader: Optional[str] = None, force: bool = False, user=Depends(current_user)):
+async def sync_now(request: Request, account: Optional[str] = None, trader: Optional[str] = None, force: bool = False, user=Depends(admin_only)):
     target_aid = account or trader or request.query_params.get("account") or request.query_params.get("trader")
     force_flag = force or str(request.query_params.get("force", "")).lower() in ("1", "true", "yes")
     if not target_aid:
@@ -3258,13 +3313,19 @@ async def test_alert(_=Depends(admin_only)):
 
 
 @app.get("/api/status")
-async def status(_=Depends(current_user)):
+async def status(user=Depends(current_user)):
     poll_stat, acc_sync_states = await asyncio.gather(
         DB._get_status("poll"),
         DB.get_all_sync_states_async(),
     )
+    poll_out = dict(poll_stat or {})
+    scope = await _user_allowed_scope_async(user)
+    if scope is not None:
+        acc_sync_states = {k: v for k, v in (acc_sync_states or {}).items() if k in scope["accounts"]}
+        if isinstance(poll_out.get("results"), dict):
+            poll_out["results"] = {k: v for k, v in poll_out["results"].items() if k in scope["accounts"]}
     return {
-        "poll": poll_stat or {},
+        "poll": poll_out,
         "account_sync": acc_sync_states,
         "zebu_configured": bool(CFG.ZEBU_CLIENT_ID and CFG.ZEBU_SECRET_KEY),
         "redirect_url": CFG.PUBLIC_URL + "/auth/zebu/callback",
@@ -3276,14 +3337,21 @@ async def status(_=Depends(current_user)):
 
 
 @app.get("/api/orders")
-async def get_orders_endpoint(account: Optional[str] = None, _=Depends(current_user)):
-    return await DB.get_orders_async(account_id=account)
+async def get_orders_endpoint(account: Optional[str] = None, user=Depends(current_user)):
+    orders = await DB.get_orders_async(account_id=account)
+    scope = await _user_allowed_scope_async(user)
+    if scope is not None:
+        orders = [o for o in orders if o.get("account") in scope["accounts"]]
+    return orders
 
 
 @app.get("/api/orders/{norenordno}/history")
-async def get_single_order_history(norenordno: str, account: Optional[str] = None, _=Depends(current_user)):
+async def get_single_order_history(norenordno: str, account: Optional[str] = None, user=Depends(current_user)):
     """Official Zebu SingleOrdHist endpoint proxy with local cache fallback."""
     all_acc = await DB.get_all_accounts_async()
+    scope = await _user_allowed_scope_async(user)
+    if scope is not None:
+        all_acc = [a for a in all_acc if a.get("id") in scope["accounts"]]
     target_acc = None
     if account:
         target_acc = next((a for a in all_acc if a["id"] == account or a.get("zebu_uid") == account), None)
@@ -3328,12 +3396,12 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
     ) = await asyncio.gather(
         get_traders(user=user),
         get_accounts(user=user),
-        get_rules(_=user),
+        get_rules(user=user),
         get_trades(request=request, user=user),
-        get_groups(_=user),
+        get_groups(user=user),
         get_settings(_=user),
-        get_rulelog(_=user),
-        status(_=user),
+        get_rulelog(user=user),
+        status(user=user),
         get_daily_reports(user=user),
         get_violations(user=user),
         DB.has_trades_before_async(frm) if frm else asyncio.sleep(0, result=False),

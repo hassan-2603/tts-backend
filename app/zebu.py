@@ -32,6 +32,7 @@ READ_ONLY_ENDPOINTS = {
     "TPSeries",       # 1-min candles -> index spot at entry time
     "GetIndexList",   # find index tokens (Nifty Bank etc.)
     "GetQuotes",      # last price of a contract
+    "GetSecurityInfo",# static instrument metadata (exd expiry date, ls, ti, etc.)
     "SearchScrip",    # search contract master token
 }
 
@@ -494,6 +495,17 @@ class ZebuClient:
         u = self._clean_uid(uid)
         return await self._post_async("GetQuotes", {"uid": u, "exch": exch, "token": str(sym_token)}, token, proxy=proxy)
 
+    async def security_info_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], proxy: Optional[str] = None) -> dict:
+        """Official Zebu GetSecurityInfo endpoint (READ-ONLY): POST /NorenWClientAPI/GetSecurityInfo.
+        Returns static contract metadata including exact broker-provided expiry date (`exd`)."""
+        u = self._clean_uid(uid)
+        exch_u = (exch or "").strip().upper()
+        tok_s = str(sym_token or "").strip()
+        if not exch_u or not tok_s:
+            return {}
+        r = await self._post_async("GetSecurityInfo", {"uid": u, "exch": exch_u, "token": tok_s}, token, proxy=proxy)
+        return r if isinstance(r, dict) else {}
+
     # ---------- Sync Read Calls (Backward Compatibility) ----------
     def client_details(self, token: str, uid: str, actid: str):
         u = self._clean_uid(uid)
@@ -538,3 +550,11 @@ class ZebuClient:
 
     def quote(self, token: str, uid: str, exch: str, sym_token: Union[str, int]):
         return self._post_sync("GetQuotes", {"uid": uid, "exch": exch, "token": str(sym_token)}, token)
+
+    def security_info(self, token: str, uid: str, exch: str, sym_token: Union[str, int]):
+        exch_u = (exch or "").strip().upper()
+        tok_s = str(sym_token or "").strip()
+        if not exch_u or not tok_s:
+            return {}
+        r = self._post_sync("GetSecurityInfo", {"uid": self._clean_uid(uid), "exch": exch_u, "token": tok_s}, token)
+        return r if isinstance(r, dict) else {}

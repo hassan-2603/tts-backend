@@ -84,6 +84,7 @@ async def init_models(engine: AsyncEngine = None):
             ("trades", "finalized_at", "TIMESTAMP WITH TIME ZONE"),
             ("trades", "is_archived", "BOOLEAN DEFAULT FALSE"),
             ("trades", "archived_at", "TIMESTAMP WITH TIME ZONE"),
+            ("trades", "token", "VARCHAR(50)"),
             ("positions", "raw_payload", "JSON"),
             ("account_sync_states", "is_stale", "BOOLEAN DEFAULT FALSE"),
             ("daily_sync_records", "finalized", "BOOLEAN DEFAULT FALSE"),

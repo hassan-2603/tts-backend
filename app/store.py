@@ -1325,6 +1325,8 @@ class Store:
         t.expiry_type = doc.get("expiryType", t.expiry_type)
         t.tsym = doc.get("tsym") or doc.get("symbol") or t.tsym or "UNKNOWN"
         t.exch = doc.get("exch", t.exch or "NFO")
+        if "token" in doc and doc.get("token"):
+            t.token = str(doc["token"]).strip()
         t.side = (doc.get("side") or t.side or "BUY").upper()
         lots = doc.get("lots") if doc.get("lots") is not None else (t.lots or 1)
         t.lots = Decimal(str(lots)) if lots is not None else Decimal("1")
@@ -1422,6 +1424,7 @@ class Store:
             "expiryType": t.expiry_type,
             "tsym": t.tsym,
             "exch": t.exch,
+            "token": getattr(t, "token", None),
             "side": t.side,
             "lots": lots,
             "lotSize": lot_size,
@@ -1495,6 +1498,7 @@ class Store:
                     "flid": f.flid,
                     "tsym": f.tsym,
                     "exch": f.exch,
+                    "token": f.token or (f.raw_payload or {}).get("token"),
                     "trantype": f.side,
                     "prd": f.product,
                     "flqty": str(f.qty),
@@ -1639,3 +1643,118 @@ class Store:
             stmt = select(SentFlag)
             res = (await session.execute(stmt)).scalars().all()
             return [{"key": sf.key, "at": sf.sent_at.isoformat()} for sf in res]
+
+    async def get_instruments_by_exch_tokens_async(
+        self, keys: List[Tuple[str, str]]
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Look up persisted instrument metadata strictly by (exch, token)."""
+        clean_keys = list({
+            (str(exch or "").strip().upper(), str(tok or "").strip())
+            for exch, tok in keys
+            if exch and tok
+        })
+        if not clean_keys:
+            return {}
+        tokens_list = list({tok for _, tok in clean_keys})
+        out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        async with AsyncSessionLocal() as session:
+            stmt = select(Instrument).where(Instrument.token.in_(tokens_list))
+            rows = (await session.execute(stmt)).scalars().all()
+            wanted = set(clean_keys)
+            for row in rows:
+                k = ((row.exch or "").strip().upper(), str(row.token or "").strip())
+                if k in wanted:
+                    out[k] = {
+                        "symbol": row.symbol,
+                        "exch": k[0],
+                        "token": k[1],
+                        "underlying": row.underlying,
+                        "instrument_type": row.instrument_type,
+                        "strike": float(row.strike) if row.strike is not None else None,
+                        "opt_type": row.opt_type,
+                        "exd": row.expiry_date.isoformat() if row.expiry_date else None,
+                        "expiry_date": row.expiry_date.isoformat() if row.expiry_date else None,
+                        "expiry_type": row.expiry_type,
+                        "lot_size": row.lot_size,
+                    }
+        return out
+
+    async def upsert_instrument_async(self, doc: Dict[str, Any]):
+        """Persist broker-verified instrument metadata keyed by (exch, token)."""
+        exch_u = str(doc.get("exch") or "").strip().upper()
+        tok_s = str(doc.get("token") or "").strip()
+        if not exch_u or not tok_s:
+            return
+        pk_symbol = f"{exch_u}|{tok_s}"
+        exp_val = doc.get("expiry_date") or doc.get("exd")
+        exp_date_obj = None
+        if exp_val:
+            try:
+                if isinstance(exp_val, str):
+                    exp_date_obj = datetime.strptime(exp_val[:10], "%Y-%m-%d").date()
+                elif hasattr(exp_val, "year"):
+                    exp_date_obj = exp_val
+            except ValueError:
+                exp_date_obj = None
+
+        async with AsyncSessionLocal() as session:
+            stmt = select(Instrument).where(
+                Instrument.exch == exch_u,
+                Instrument.token == tok_s,
+            )
+            inst = (await session.execute(stmt)).scalars().first()
+            if not inst:
+                stmt2 = select(Instrument).where(Instrument.symbol == pk_symbol)
+                inst = (await session.execute(stmt2)).scalar_one_or_none()
+            if inst:
+                inst.exch = exch_u
+                inst.token = tok_s
+                if doc.get("underlying"):
+                    inst.underlying = str(doc["underlying"])[:50]
+                if doc.get("instrument_type"):
+                    inst.instrument_type = str(doc["instrument_type"])[:30]
+                if doc.get("strike") is not None:
+                    try:
+                        inst.strike = Decimal(str(doc["strike"]))
+                    except Exception:
+                        pass
+                if doc.get("opt_type") is not None:
+                    inst.opt_type = str(doc["opt_type"])[:10]
+                if exp_date_obj is not None:
+                    inst.expiry_date = exp_date_obj
+                if doc.get("expiry_type") is not None:
+                    inst.expiry_type = str(doc["expiry_type"])[:20]
+                if doc.get("lot_size"):
+                    try:
+                        inst.lot_size = int(float(doc["lot_size"])) or 1
+                    except Exception:
+                        pass
+                inst.updated_at = datetime.now(timezone.utc)
+            else:
+                strike_dec = None
+                if doc.get("strike") is not None and str(doc.get("strike")).strip() != "":
+                    try:
+                        strike_dec = Decimal(str(doc["strike"]))
+                    except Exception:
+                        strike_dec = None
+                ls_int = 1
+                if doc.get("lot_size"):
+                    try:
+                        ls_int = int(float(doc["lot_size"])) or 1
+                    except Exception:
+                        ls_int = 1
+                inst = Instrument(
+                    symbol=pk_symbol,
+                    token=tok_s,
+                    exch=exch_u,
+                    underlying=str(doc.get("underlying") or doc.get("tsym") or tok_s)[:50],
+                    instrument_type=str(doc.get("instrument_type") or "UNKNOWN")[:30],
+                    strike=strike_dec,
+                    opt_type=str(doc.get("opt_type") or "")[:10] or None,
+                    expiry_date=exp_date_obj,
+                    expiry_type=str(doc.get("expiry_type") or "")[:20] or None,
+                    lot_size=ls_int,
+                    updated_at=datetime.now(timezone.utc),
+                )
+                session.add(inst)
+            await session.commit()

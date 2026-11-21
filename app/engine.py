@@ -17,6 +17,42 @@ from typing import Dict, List, Optional, Tuple, Any
 
 MONTHS = {m: i for i, m in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
 
+_EXD_FMTS = (
+    "%d-%b-%Y",
+    "%d-%b-%y",
+    "%Y-%m-%d",
+    "%d-%m-%Y",
+    "%d/%m/%Y",
+    "%d %b %Y",
+    "%d%b%Y",
+    "%Y/%m/%d",
+)
+
+
+def normalize_expiry_date(exd: Any) -> Optional[str]:
+    """Strictly normalize broker-provided expiry date (`exd`) to YYYY-MM-DD.
+    Returns None for equities, blank values, or unparseable strings.
+    NEVER infers or invents an expiry date from calendar assumptions."""
+    if exd is None:
+        return None
+    if isinstance(exd, datetime):
+        return exd.date().isoformat() if exd.year > 2000 else None
+    if isinstance(exd, date):
+        return exd.isoformat() if exd.year > 2000 else None
+    s = str(exd).strip()
+    if not s or s.upper() in ("0", "NA", "N/A", "NONE", "NULL", "-", "—"):
+        return None
+    s_clean = s.split(" ")[0] if ("-" in s or "/" in s) else s
+    for candidate in (s, s_clean):
+        for fmt in _EXD_FMTS:
+            try:
+                d = datetime.strptime(candidate.upper(), fmt).date()
+                if d.year > 2000:
+                    return d.isoformat()
+            except ValueError:
+                continue
+    return None
+
 DEFAULT_RULES = {
     "instrument": "BANKNIFTY",
     "expiry": "Monthly",
@@ -111,49 +147,35 @@ def parse_instrument(tsym: str, master: Optional[dict] = None) -> Optional[dict]
             "expiryType": "Equity",
         }
 
-    # Futures check
+    # Futures check (NEVER infer expiry from calendar assumptions; expiry comes only from broker GetSecurityInfo/master)
     for p in _FUT_PATTERNS:
         m = p.match(tsym)
         if m:
             g = m.groupdict()
-            y = 2000 + int(g["y"])
-            exp = last_weekday_of_month(y, MONTHS.get(g["m"], 1), 3)  # Last Thursday
             return {
                 "type": "FUT",
                 "underlying": g["u"],
-                "expiry": exp,
+                "expiry": None,
                 "opt": "FUT",
                 "strike": 0.0,
-                "expiryType": "Monthly",
+                "expiryType": "",
             }
 
-    # Options check
+    # Options check (NEVER infer expiry from calendar assumptions; expiry comes only from broker GetSecurityInfo/master)
     for p in _OPT_PATTERNS:
         m = p.match(tsym)
         if not m:
             continue
         g = m.groupdict()
-        y = 2000 + int(g["y"])
         opt = "CE" if g["o"] in ("C", "CE") else "PE"
-        exp = None
-        try:
-            if g.get("m") and g.get("d"):
-                exp = date(y, MONTHS[g["m"]], int(g["d"]))
-            elif g.get("m"):
-                exp = last_weekday_of_month(y, MONTHS[g["m"]], 1)  # NSE Tuesday expiry
-            elif g.get("mn"):
-                mon = {"O": 10, "N": 11, "D": 12}.get(g["mn"]) or int(g["mn"])
-                exp = date(y, mon, int(g["d"]))
-        except (KeyError, ValueError):
-            exp = None
 
         return {
             "type": "OPT",
             "underlying": g["u"],
-            "expiry": exp,
+            "expiry": None,
             "opt": opt,
             "strike": float(g["k"]),
-            "expiryType": expiry_type(exp),
+            "expiryType": "",
         }
 
     # Fallback generic instrument
@@ -267,12 +289,16 @@ def build_trades(
     master: Optional[dict] = None,
     split_partial_closures: bool = True,
     positions: Optional[list] = None,
+    security_info: Optional[Dict[Tuple[str, str], dict]] = None,
 ) -> list:
     """FIFO-match fills per contract with Decimal precision.
 
     Supports partial fills, multi-leg entries/exits, position reversals,
     carry-forward positions (including PositionBook cfbuyqty/cfsellqty seed reconciliation),
     and all instrument classes.
+    Uses (exchange, instrument token) as the primary contract identifier when token is present.
+    Expiry dates are populated strictly from broker-provided GetSecurityInfo / instrument master (`exd`)
+    and NEVER inferred from calendar assumptions.
     When split_partial_closures is True and a position has both closed exits and remaining open quantity
     (or exits across multiple trading days):
     - Closed portions are emitted as closed trade records on their respective exit dates with exact realized P&L.
@@ -284,14 +310,28 @@ def build_trades(
         now = now.replace(tzinfo=None)
     today_d = now.date() if now else date.today()
 
+    # Normalize security_info lookup keyed strictly by (EXCH, TOKEN)
+    sec_info_map: Dict[Tuple[str, str], dict] = {}
+    for k, v in (security_info or {}).items():
+        if isinstance(k, tuple) and len(k) == 2 and k[0] and k[1] and isinstance(v, dict):
+            sec_info_map[(str(k[0]).strip().upper(), str(k[1]).strip())] = v
+
+    def _contract_key(exch_val: Any, token_val: Any, tsym_val: Any) -> Tuple[str, str]:
+        exch_u = str(exch_val or "NFO").strip().upper()
+        tok_s = str(token_val or "").strip()
+        if tok_s:
+            return (exch_u, tok_s)
+        return ("TSYM", str(tsym_val or "").strip())
+
     # Map PositionBook metadata (prcftr, lotsize, ltp, carry-forward & day quantities)
-    pos_by_sym: Dict[str, List[dict]] = defaultdict(list)
+    pos_by_key: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
     prcftr_by_sym: Dict[str, Decimal] = {}
     for p in (positions or []):
         tsym = p.get("tsym")
         if not tsym:
             continue
-        pos_by_sym[tsym].append(p)
+        pk = _contract_key(p.get("exch"), p.get("token"), tsym)
+        pos_by_key[pk].append(p)
         exch_u = str(p.get("exch") or "").upper()
         if exch_u in ("MCX", "CDS"):
             pf = _dec(p.get("prcftr"), Decimal("1"))
@@ -323,6 +363,7 @@ def build_trades(
             if dedup_f in seen_fill_keys:
                 continue
             seen_fill_keys.add(dedup_f)
+        fill_exd = normalize_expiry_date(f.get("exd"))
         o = orders.setdefault(
             oid,
             {
@@ -332,7 +373,8 @@ def build_trades(
                 "side": "BUY" if str(f.get("trantype", "")).upper() in ("B", "BUY") else "SELL",
                 "prd": f.get("prd"),
                 "ls": int(_f(f.get("ls"), 1)) or 1,
-                "token": f.get("token"),
+                "token": str(f.get("token") or "").strip() or None,
+                "exd": fill_exd,
                 "ordersource": f.get("ordersource", ""),
                 "remarks": f.get("remarks", ""),
                 "qty": Decimal("0"),
@@ -341,51 +383,58 @@ def build_trades(
                 "last": ts,
             },
         )
+        if not o.get("exd") and fill_exd:
+            o["exd"] = fill_exd
+        if not o.get("token") and f.get("token"):
+            o["token"] = str(f.get("token")).strip()
         o["qty"] += q
         o["val"] += q * p
         o["ts"] = min(o["ts"], ts)
         o["last"] = max(o["last"], ts)
 
-    by_sym = defaultdict(list)
+    by_contract: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
+    tsym_to_ckey: Dict[str, Tuple[str, str]] = {}
     for o in orders.values():
         if o["qty"] > Decimal("0"):
-            by_sym[o["tsym"]].append(o)
+            ck = _contract_key(o.get("exch"), o.get("token"), o.get("tsym"))
+            by_contract[ck].append(o)
+            if o.get("tsym") and o["tsym"] not in tsym_to_ckey:
+                tsym_to_ckey[o["tsym"]] = ck
 
     # 2. Reconcile carry-forward (cfbuyqty/cfsellqty) and missing intraday PositionBook entries
-    for tsym, plist in pos_by_sym.items():
-        existing_orders = by_sym.get(tsym, [])
+    for pk, plist in pos_by_key.items():
+        p0 = plist[0]
+        tsym = p0.get("tsym")
+        target_ck = pk if pk in by_contract else tsym_to_ckey.get(tsym, pk)
+        existing_orders = by_contract.get(target_ck, [])
         prior_buy = sum((o["qty"] for o in existing_orders if o["ts"].date() < today_d and o["side"] == "BUY"), Decimal("0"))
         prior_sell = sum((o["qty"] for o in existing_orders if o["ts"].date() < today_d and o["side"] == "SELL"), Decimal("0"))
         prior_net = prior_buy - prior_sell
 
-        today_buy = sum((o["qty"] for o in existing_orders if o["ts"].date() == today_d and o["side"] == "BUY"), Decimal("0"))
-        today_sell = sum((o["qty"] for o in existing_orders if o["ts"].date() == today_d and o["side"] == "SELL"), Decimal("0"))
-
         cf_buy_total = sum((_dec(p.get("cfbuyqty"), Decimal("0")) for p in plist), Decimal("0"))
         cf_sell_total = sum((_dec(p.get("cfsellqty"), Decimal("0")) for p in plist), Decimal("0"))
-        day_buy_total = sum((_dec(p.get("daybuyqty"), Decimal("0")) for p in plist), Decimal("0"))
-        day_sell_total = sum((_dec(p.get("daysellqty"), Decimal("0")) for p in plist), Decimal("0"))
 
-        p0 = plist[0]
         ls_p = int(_f(p0.get("ls"), 1)) or 1
         prd_p = p0.get("prd", "M")
         exch_p = p0.get("exch", "NFO")
+        tok_p = str(p0.get("token") or "").strip() or None
+        exd_p = normalize_expiry_date(p0.get("exd"))
         prev_day_ts = datetime.combine(today_d - timedelta(days=1), datetime.min.time()).replace(hour=9, minute=15)
-        today_open_ts = datetime.combine(today_d, datetime.min.time()).replace(hour=9, minute=20)
 
         # Inject carry-forward seed lot if Zebu PositionBook reports carry-forward qty not in prior fills
         if cf_buy_total > Decimal("0") and prior_net < cf_buy_total:
             missing_cf_b = cf_buy_total - max(prior_net, Decimal("0"))
             cf_px = _dec(p0.get("cforgavgprc") or p0.get("cfbuyavgprc") or p0.get("netavgprc"), Decimal("0"))
             if missing_cf_b > Decimal("0") and cf_px > Decimal("0"):
-                by_sym[tsym].append({
+                by_contract[target_ck].append({
                     "oid": f"CF-{tsym}-B",
                     "tsym": tsym,
                     "exch": exch_p,
                     "side": "BUY",
                     "prd": prd_p,
                     "ls": ls_p,
-                    "token": p0.get("token"),
+                    "token": tok_p,
+                    "exd": exd_p,
                     "ordersource": "CarryForward",
                     "remarks": "Carry-forward position from PositionBook",
                     "qty": missing_cf_b,
@@ -397,14 +446,15 @@ def build_trades(
             missing_cf_s = cf_sell_total - max(-prior_net, Decimal("0"))
             cf_px = _dec(p0.get("cforgavgprc") or p0.get("cfsellavgprc") or p0.get("netavgprc"), Decimal("0"))
             if missing_cf_s > Decimal("0") and cf_px > Decimal("0"):
-                by_sym[tsym].append({
+                by_contract[target_ck].append({
                     "oid": f"CF-{tsym}-S",
                     "tsym": tsym,
                     "exch": exch_p,
                     "side": "SELL",
                     "prd": prd_p,
                     "ls": ls_p,
-                    "token": p0.get("token"),
+                    "token": tok_p,
+                    "exd": exd_p,
                     "ordersource": "CarryForward",
                     "remarks": "Carry-forward position from PositionBook",
                     "qty": missing_cf_s,
@@ -414,10 +464,40 @@ def build_trades(
                 })
 
     trades = []
-    for tsym, olist in by_sym.items():
+    for ckey, olist in by_contract.items():
+        if not olist:
+            continue
+        tsym = olist[0].get("tsym") or ""
         info = parse_instrument(tsym, master)
         if not info:
             continue
+        exch_u = str(olist[0].get("exch") or "NFO").strip().upper()
+        tok_s = next((str(o.get("token")).strip() for o in olist if o.get("token")), "")
+
+        # Resolve exact broker expiry strictly via (exchange, token) from GetSecurityInfo / instrument master
+        resolved_exd: Optional[str] = None
+        if tok_s:
+            sinfo = sec_info_map.get((exch_u, tok_s))
+            if sinfo:
+                resolved_exd = normalize_expiry_date(
+                    sinfo.get("exd") or sinfo.get("expiry_date") or sinfo.get("expiry")
+                )
+        if not resolved_exd:
+            resolved_exd = next((o.get("exd") for o in olist if o.get("exd")), None)
+        if not resolved_exd and info.get("expiry"):
+            resolved_exd = normalize_expiry_date(info.get("expiry"))
+
+        resolved_exp_str = resolved_exd or ""
+        if resolved_exd:
+            try:
+                resolved_exp_type = expiry_type(date.fromisoformat(resolved_exd))
+            except ValueError:
+                resolved_exp_type = ""
+        elif info.get("type") == "EQ":
+            resolved_exp_type = "Equity"
+        else:
+            resolved_exp_type = ""
+
         olist.sort(key=lambda o: (o["ts"], o["oid"]))
 
         # FIFO matching
@@ -508,10 +588,11 @@ def build_trades(
                         "symbol": info["underlying"],
                         "strike": info["strike"],
                         "opt": info["opt"],
-                        "expiry": info["expiry"].isoformat() if info.get("expiry") else "",
-                        "expiryType": info.get("expiryType", ""),
+                        "expiry": resolved_exp_str,
+                        "expiryType": resolved_exp_type,
                         "tsym": tsym,
                         "exch": o["exch"],
+                        "token": tok_s or None,
                         "side": "BUY" if is_buy else "SELL",
                         "lots": float(_q2(leg_qty / ls_dec)),
                         "lotSize": o["ls"],
@@ -572,10 +653,11 @@ def build_trades(
                         "symbol": info["underlying"],
                         "strike": info["strike"],
                         "opt": info["opt"],
-                        "expiry": info["expiry"].isoformat() if info.get("expiry") else "",
-                        "expiryType": info.get("expiryType", ""),
+                        "expiry": resolved_exp_str,
+                        "expiryType": resolved_exp_type,
                         "tsym": tsym,
                         "exch": o["exch"],
+                        "token": tok_s or None,
                         "side": "BUY" if is_buy else "SELL",
                         "lots": float(_q2(rem_qty / ls_dec)),
                         "lotSize": o["ls"],
@@ -657,10 +739,11 @@ def build_trades(
                     "symbol": info["underlying"],
                     "strike": info["strike"],
                     "opt": info["opt"],
-                    "expiry": info["expiry"].isoformat() if info.get("expiry") else "",
-                    "expiryType": info.get("expiryType", ""),
+                    "expiry": resolved_exp_str,
+                    "expiryType": resolved_exp_type,
                     "tsym": tsym,
                     "exch": o["exch"],
+                    "token": tok_s or None,
                     "side": "BUY" if is_buy else "SELL",
                     "lots": float(_q2(total_qty / ls_dec)),
                     "lotSize": o["ls"],

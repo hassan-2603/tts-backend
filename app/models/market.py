@@ -107,6 +107,7 @@ class Trade(Base):
     expiry_type = Column(String(20), nullable=True)  # Monthly / Weekly
     tsym = Column(String(100), nullable=False, index=True)
     exch = Column(String(20), nullable=True, default="NFO")
+    token = Column(String(50), nullable=True)
     side = Column(String(10), nullable=False)  # BUY / SELL
     lots = Column(Numeric(10, 2), nullable=False)
     lot_size = Column(Integer, nullable=False, default=1)

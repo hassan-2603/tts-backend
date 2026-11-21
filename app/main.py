@@ -21,7 +21,7 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
@@ -127,6 +127,123 @@ async def index_token_async(underlying: str) -> Optional[Tuple[str, str]]:
                 return _index_tokens[underlying]
 
     return None
+
+
+# In-memory cache of broker-verified instrument metadata keyed strictly by (EXCH, TOKEN).
+# Backed by the relational `instruments` table so expired contracts remain accurate historically.
+_security_info_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+
+async def resolve_instruments_security_info_async(
+    tok: str,
+    uid: str,
+    proxy_url: Optional[str],
+    fills: List[dict],
+    positions: List[dict],
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Resolve exact broker expiry dates (`exd`) via Zebu GetSecurityInfo strictly by (exch, token).
+
+    Resolution order:
+    1. In-memory `_security_info_cache[(exch, token)]`
+    2. Persisted DB `instruments` table lookup by `(exch, token)` (retains expired contracts)
+    3. Live Zebu `POST /NorenWClientAPI/GetSecurityInfo` with bounded concurrency
+
+    Handles missing tokens, expired contracts, unmatched instruments, and API failures safely
+    without ever inventing or inferring an expiry date from calendar assumptions.
+    """
+    unique_keys: List[Tuple[str, str]] = []
+    seen_keys = set()
+    for row in list(fills or []) + list(positions or []):
+        exch_u = str(row.get("exch") or "").strip().upper()
+        tok_s = str(row.get("token") or "").strip()
+        if not exch_u or not tok_s:
+            continue
+        k = (exch_u, tok_s)
+        if k not in seen_keys:
+            seen_keys.add(k)
+            unique_keys.append(k)
+
+    if not unique_keys:
+        return {}
+
+    resolved: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    missing_for_db: List[Tuple[str, str]] = []
+    for k in unique_keys:
+        if k in _security_info_cache:
+            resolved[k] = _security_info_cache[k]
+        else:
+            missing_for_db.append(k)
+
+    # Check persisted instruments table so already-resolved or expired contracts need no API call
+    if missing_for_db:
+        try:
+            db_hits = await DB.get_instruments_by_exch_tokens_async(missing_for_db)
+            for k, doc in db_hits.items():
+                _security_info_cache[k] = doc
+                resolved[k] = doc
+        except Exception as e:
+            log.debug(f"Instrument DB cache lookup error: {e}")
+
+    missing_for_api = [k for k in unique_keys if k not in resolved]
+    if not missing_for_api or not tok or not uid:
+        return resolved
+
+    sem = asyncio.Semaphore(5)
+
+    async def _fetch_one(exch_u: str, tok_s: str):
+        async with sem:
+            try:
+                res = await asyncio.wait_for(
+                    ZEBU.security_info_async(tok, uid, exch_u, tok_s, proxy=proxy_url),
+                    timeout=5.0,
+                )
+            except SessionExpired:
+                raise
+            except Exception as e:
+                log.debug(f"GetSecurityInfo failed for {exch_u}|{tok_s}: {e}")
+                return
+            if not isinstance(res, dict) or str(res.get("stat", "")).strip().lower() != "ok":
+                return
+            exd_iso = engine.normalize_expiry_date(res.get("exd"))
+            exp_type = ""
+            if exd_iso:
+                try:
+                    exp_type = engine.expiry_type(date.fromisoformat(exd_iso))
+                except ValueError:
+                    exp_type = ""
+            elif str(res.get("instname") or "").upper() == "EQ" or exch_u in ("NSE", "BSE"):
+                exp_type = "Equity"
+
+            doc = {
+                "exch": exch_u,
+                "token": tok_s,
+                "tsym": res.get("tsym") or "",
+                "underlying": res.get("symname") or res.get("cname") or res.get("tsym") or tok_s,
+                "instrument_type": res.get("instname") or ("EQ" if exch_u in ("NSE", "BSE") else "UNKNOWN"),
+                "strike": res.get("strprc"),
+                "opt_type": res.get("optt") or "",
+                "exd": exd_iso,
+                "expiry_date": exd_iso,
+                "expiry_type": exp_type,
+                "lot_size": res.get("ls") or 1,
+            }
+            _security_info_cache[(exch_u, tok_s)] = doc
+            resolved[(exch_u, tok_s)] = doc
+            try:
+                await DB.upsert_instrument_async(doc)
+            except Exception as de:
+                log.debug(f"Instrument DB persist skipped for {exch_u}|{tok_s}: {de}")
+
+    results = await asyncio.gather(
+        *[_fetch_one(exch_u, tok_s) for exch_u, tok_s in missing_for_api],
+        return_exceptions=True,
+    )
+    for r in results:
+        if isinstance(r, SessionExpired):
+            log.warning(f"GetSecurityInfo encountered SessionExpired: {r}")
+            break
+
+    return resolved
 
 
 async def spot_at_async(underlying: str, ts: datetime) -> Optional[float]:
@@ -563,6 +680,9 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
         "txn_pct": CFG.CHG_TXN_PCT,
         "stamp_buy_pct": CFG.CHG_STAMP_BUY_PCT,
     }
+    # Resolve exact broker expiry dates strictly via (exch, token) using Zebu GetSecurityInfo + DB cache
+    sec_info = await resolve_instruments_security_info_async(tok, uid, proxy_url, recent_fills, positions)
+
     # Reconcile open and active positions with PositionBook (authoritative broker LTP, rpnl, and urmtom)
     product_map = json.loads(CFG.PRODUCT_MAP)
     built = engine.build_trades(
@@ -574,6 +694,7 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
         now,
         ltp,
         positions=positions,
+        security_info=sec_info,
     )
 
     for p in positions:
@@ -690,6 +811,24 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
             entry_date_str = prev_pos["date"] if (prev_pos and prev_pos.get("date")) else today_str
             entry_time_str = prev_pos["time"] if (prev_pos and prev_pos.get("time")) else "09:15"
 
+            pos_exch_u = str(p.get("exch") or "NFO").strip().upper()
+            pos_tok_s = str(p.get("token") or "").strip()
+            pos_sinfo = sec_info.get((pos_exch_u, pos_tok_s)) if pos_tok_s else None
+            pos_exd = (
+                engine.normalize_expiry_date(pos_sinfo.get("exd") if pos_sinfo else None)
+                or engine.normalize_expiry_date(p.get("exd"))
+                or (engine.normalize_expiry_date(prev_pos.get("expiry")) if prev_pos else None)
+                or ""
+            )
+            pos_exp_type = ""
+            if pos_exd:
+                try:
+                    pos_exp_type = engine.expiry_type(date.fromisoformat(pos_exd))
+                except ValueError:
+                    pos_exp_type = ""
+            elif parsed.get("type") == "EQ":
+                pos_exp_type = "Equity"
+
             built.append({
                 "id": pos_tid,
                 "parent_trade_id": pos_tid,
@@ -701,10 +840,11 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
                 "symbol": parsed.get("underlying") or tsym,
                 "strike": parsed.get("strike") or 0,
                 "opt": parsed.get("opt") or "",
-                "expiry": parsed.get("expiry").isoformat() if parsed.get("expiry") else "",
-                "expiryType": parsed.get("expiryType", ""),
+                "expiry": pos_exd,
+                "expiryType": pos_exp_type,
                 "tsym": tsym,
                 "exch": p.get("exch", "NFO"),
+                "token": pos_tok_s or None,
                 "side": side_str,
                 "lots": lots,
                 "lotSize": ls,
@@ -755,11 +895,15 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
                 t["net_pnl"] = prev.get("net_pnl")
                 t["pnl_source"] = prev.get("pnl_source", "retained_ltp")
 
-    # Resolve spot price at entry (bounded timeout so slow candle API never blocks trade sync)
+    # Resolve spot price at entry and preserve any previously stored expiry date if broker lookup failed
     for t in built:
         if t["id"] in finalized_ids:
             continue
         prev = old_trades.get(t["id"])
+        if prev and not t.get("expiry") and prev.get("expiry"):
+            t["expiry"] = prev["expiry"]
+            if not t.get("expiryType") and prev.get("expiryType"):
+                t["expiryType"] = prev["expiryType"]
         if prev and prev.get("spot"):
             t["spot"] = prev["spot"]
         else:

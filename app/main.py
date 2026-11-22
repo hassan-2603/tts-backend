@@ -3734,7 +3734,7 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
     frm = request.query_params.get("from", "")
     lim_raw = request.query_params.get("limit", "")
     lim_val = int(lim_raw) if lim_raw.isdigit() else 1000
-    sem = asyncio.Semaphore(3)
+    sem = asyncio.Semaphore(6)
 
     async def _bounded(coro):
         async with sem:

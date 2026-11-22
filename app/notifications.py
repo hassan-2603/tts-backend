@@ -28,7 +28,7 @@ import httpx
 from sqlalchemy import and_, or_, select
 
 from app.config import CFG
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, async_engine
 from app.excel_report import generate_daily_excel_bytes
 from app.models import DailyReportDispatch, NotificationJob
 from app.scheduler import IST, now_ist
@@ -580,7 +580,11 @@ class NotificationEngine:
         claimed_ids: List[str] = []
 
         async with AsyncSessionLocal() as session:
-            is_pg = bool(session.bind and "postgresql" in str(session.bind.url))
+            try:
+                bind = session.get_bind()
+                is_pg = bool(bind and "postgresql" in str(bind.url))
+            except Exception:
+                is_pg = "postgresql" in str(async_engine.url)
             stmt = (
                 select(NotificationJob)
                 .where(
@@ -730,6 +734,7 @@ class NotificationEngine:
         log.info("NotificationEngine background worker stopped (%s)", self.worker_id)
 
     async def _worker_loop(self):
+        await asyncio.sleep(5)
         while self._running:
             try:
                 n = await self.process_pending_jobs_once(batch_size=10)

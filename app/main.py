@@ -1897,34 +1897,48 @@ async def lifespan(app: FastAPI):
     if not settings_existing:
         await DB._put_setting("main", DEFAULT_SETTINGS)
 
-    # 3. Run startup recovery for midnight archiving and past unfinalized trading days (Req 3.8, 3.9, 9.6)
-    try:
-        await midnight_archive_async(now_ist())
-    except Exception as e:
-        log.error(f"Startup recovery notice in lifespan: {e}")
+    # 3. Schedule heavy startup recovery, WS streams, scheduler & notification worker in background
+    # so Uvicorn becomes ready immediately and never triggers Render 502 startup timeouts.
+    async def _post_startup_init():
+        try:
+            await midnight_archive_async(now_ist())
+        except Exception as e:
+            log.error(f"Startup recovery notice in lifespan: {e}")
 
-    # 4. Start Connection Manager & Scheduler if configured for in-process execution
-    if CFG.RUN_WORKER_IN_PROCESS:
-        await CONN_MGR.start()
-        all_accounts = await DB.get_all_accounts_async()
-        for acc in all_accounts:
-            tok = await token_for_account_async(acc["id"])
-            if tok and acc.get("zebu_uid"):
-                await _ensure_account_ws_stream(acc, tok)
-        now_s = now_ist()
-        if (9, 15) <= (now_s.hour, now_s.minute) <= (15, 45):
-            asyncio.create_task(poll_all_async("startup"))
+        if CFG.RUN_WORKER_IN_PROCESS:
+            try:
+                await CONN_MGR.start()
+                all_accounts = await DB.get_all_accounts_async()
+                for acc in all_accounts:
+                    tok = await token_for_account_async(acc["id"])
+                    if tok and acc.get("zebu_uid"):
+                        await _ensure_account_ws_stream(acc, tok)
+                now_s = now_ist()
+                if (9, 15) <= (now_s.hour, now_s.minute) <= (15, 45):
+                    asyncio.create_task(poll_all_async("startup"))
+            except Exception as e:
+                log.error(f"Startup worker init error: {e}")
 
-    if CFG.RUN_SCHEDULER_IN_PROCESS and not CFG.DISABLE_SCHEDULER:
-        await SCHEDULER.start()
+        if CFG.RUN_SCHEDULER_IN_PROCESS and not CFG.DISABLE_SCHEDULER:
+            try:
+                await SCHEDULER.start()
+            except Exception as e:
+                log.error(f"Scheduler start error: {e}")
 
-    if CFG.RUN_NOTIFICATION_WORKER_IN_PROCESS:
-        await NOTIF.start_worker()
+        if CFG.RUN_NOTIFICATION_WORKER_IN_PROCESS:
+            try:
+                await NOTIF.start_worker()
+            except Exception as e:
+                log.error(f"Notification worker start error: {e}")
 
-    log.info("Trader Tracking System startup complete.")
+    bg_init_task = asyncio.create_task(_post_startup_init())
+
+    log.info("Trader Tracking System startup complete (background workers initializing).")
     yield
 
     # Shutdown
+    if not bg_init_task.done():
+        bg_init_task.cancel()
     if CFG.RUN_NOTIFICATION_WORKER_IN_PROCESS:
         await NOTIF.stop_worker()
     if CFG.RUN_SCHEDULER_IN_PROCESS and not CFG.DISABLE_SCHEDULER:
@@ -2141,14 +2155,14 @@ async def _fetch_overview_funds_summary_async(accounts: List[dict], scope_key: s
         act = ZEBU._clean_uid(acc.get("zebu_actid") or u)
         async with CONN_MGR.semaphore:
             try:
-                raw = await ZEBU.limits_async(tok, u, act, proxy=acc.get("proxy_url"))
+                raw = await asyncio.wait_for(ZEBU.limits_async(tok, u, act, proxy=acc.get("proxy_url")), timeout=10.0)
                 parsed = _compute_account_funds_from_limits(raw)
                 return key, acc, parsed
             except SessionExpired as se:
-                fresh_tok = await reauth_account_quickauth_async(acc["id"])
+                fresh_tok = await asyncio.wait_for(reauth_account_quickauth_async(acc["id"]), timeout=10.0)
                 if fresh_tok:
                     try:
-                        raw = await ZEBU.limits_async(fresh_tok, u, act, proxy=acc.get("proxy_url"))
+                        raw = await asyncio.wait_for(ZEBU.limits_async(fresh_tok, u, act, proxy=acc.get("proxy_url")), timeout=10.0)
                         parsed = _compute_account_funds_from_limits(raw)
                         return key, acc, parsed
                     except Exception as retry_e:

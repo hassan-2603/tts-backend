@@ -31,7 +31,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 
 from app.config import CFG, ROOT_DIR
 from app.database import init_models, AsyncSessionLocal
@@ -1391,36 +1391,50 @@ async def midnight_archive_async(now: Optional[datetime] = None) -> Dict[str, An
     today_str = now.date().isoformat()
     now_utc = datetime.now(timezone.utc)
 
-    all_trades = await DB._all_trades()
-    past_dates = sorted({
-        (t.get("exitDate") or t.get("date"))
-        for t in all_trades
-        if not t.get("open") and (t.get("exitDate") or t.get("date")) and (t.get("exitDate") or t.get("date")) < today_str
-    })
+    # Query ONLY unarchived closed past trades (avoids loading entire trades history into RAM on every startup)
+    async with AsyncSessionLocal() as session:
+        unarchived_stmt = select(Trade).where(
+            Trade.is_open == False,  # noqa: E712
+            or_(Trade.is_archived == False, Trade.is_archived.is_(None)),  # noqa: E712
+            or_(
+                Trade.exit_date < today_str,
+                and_(Trade.exit_date.is_(None), Trade.trade_date < today_str),
+            ),
+        )
+        unarchived_rows = (await session.execute(unarchived_stmt)).scalars().all()
+        past_dates = sorted({
+            (tr.exit_date or tr.trade_date)
+            for tr in unarchived_rows
+            if (tr.exit_date or tr.trade_date) and (tr.exit_date or tr.trade_date) < today_str
+        })
+        active_overnight_count = int(
+            (await session.execute(select(func.count()).select_from(Trade).where(Trade.is_open == True))).scalar() or 0  # noqa: E712
+        )
 
-    # Ensure every past trading date has a finalized daily report before archiving
+    # Ensure every past trading date with unarchived trades has a finalized daily report before archiving
     for d_str in past_dates:
         await finalize_eod_async(now=now, target_date=d_str)
 
     archived_trades_count = 0
-    active_overnight_count = 0
 
     async with AsyncSessionLocal() as session:
-        stmt = select(Trade)
-        rows = (await session.execute(stmt)).scalars().all()
-        for tr in rows:
-            if tr.is_open:
-                active_overnight_count += 1
-                continue
-            ex_d = tr.exit_date or tr.trade_date
-            if ex_d and ex_d < today_str:
+        if past_dates:
+            unarchived_stmt2 = select(Trade).where(
+                Trade.is_open == False,  # noqa: E712
+                or_(Trade.is_archived == False, Trade.is_archived.is_(None)),  # noqa: E712
+                or_(
+                    Trade.exit_date < today_str,
+                    and_(Trade.exit_date.is_(None), Trade.trade_date < today_str),
+                ),
+            )
+            rows = (await session.execute(unarchived_stmt2)).scalars().all()
+            for tr in rows:
                 if not getattr(tr, "is_finalized", False):
                     tr.is_finalized = True
                     tr.finalized_at = now_utc
-                if not getattr(tr, "is_archived", False):
-                    tr.is_archived = True
-                    tr.archived_at = now_utc
-                    archived_trades_count += 1
+                tr.is_archived = True
+                tr.archived_at = now_utc
+                archived_trades_count += 1
 
         # Transition finalized DailyAccountReport rows for dates < today_str to ARCHIVED
         rep_stmt = select(DailyAccountReport).where(
@@ -1904,7 +1918,9 @@ async def lifespan(app: FastAPI):
     # so Uvicorn becomes ready immediately and never triggers Render 502 startup timeouts.
     async def _post_startup_init():
         try:
-            await midnight_archive_async(now_ist())
+            now_init = now_ist()
+            await midnight_archive_async(now_init)
+            SCHEDULER.last_midnight_check_date = now_init.date().isoformat()
         except Exception as e:
             log.error(f"Startup recovery notice in lifespan: {e}")
 
@@ -3707,6 +3723,12 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
     """Ultra-fast single-request bootstrap endpoint returning all dashboard state concurrently."""
     t0 = time.perf_counter()
     frm = request.query_params.get("from", "")
+    sem = asyncio.Semaphore(3)
+
+    async def _bounded(coro):
+        async with sem:
+            return await coro
+
     (
         traders_res,
         accounts_res,
@@ -3720,17 +3742,17 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
         violations_res,
         has_older,
     ) = await asyncio.gather(
-        get_traders(user=user),
-        get_accounts(user=user),
-        get_rules(user=user),
-        get_trades(request=request, user=user),
-        get_groups(user=user),
-        get_settings(_=user),
-        get_rulelog(user=user),
-        status(user=user),
-        get_daily_reports(user=user),
-        get_violations(user=user),
-        DB.has_trades_before_async(frm) if frm else asyncio.sleep(0, result=False),
+        _bounded(get_traders(user=user)),
+        _bounded(get_accounts(user=user)),
+        _bounded(get_rules(user=user)),
+        _bounded(get_trades(request=request, user=user)),
+        _bounded(get_groups(user=user)),
+        _bounded(get_settings(_=user)),
+        _bounded(get_rulelog(user=user)),
+        _bounded(status(user=user)),
+        _bounded(get_daily_reports(user=user)),
+        _bounded(get_violations(user=user)),
+        _bounded(DB.has_trades_before_async(frm)) if frm else asyncio.sleep(0, result=False),
     )
     METRICS.record_api_latency((time.perf_counter() - t0) * 1000)
     return {

@@ -44,9 +44,9 @@ class Settings(BaseSettings):
     DATABASE_URL: str = Field(
         default="postgresql+asyncpg://tts:tts_pass@localhost:5432/tts_db"
     )
-    DATABASE_POOL_SIZE: int = Field(default=5)
-    DATABASE_MAX_OVERFLOW: int = Field(default=10)
-    DATABASE_TIMEOUT: int = Field(default=15)
+    DATABASE_POOL_SIZE: int = Field(default=10)
+    DATABASE_MAX_OVERFLOW: int = Field(default=15)
+    DATABASE_TIMEOUT: int = Field(default=20)
     DB_PATH: str = Field(default=str(ROOT_DIR / "tts.db"))  # SQLite fallback / migration source
 
     # Redis (Optional distributed lock/cache)

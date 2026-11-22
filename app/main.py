@@ -3044,7 +3044,7 @@ async def zebu_start(request: Request, n: str = "", account: str = "", fe: str =
         n = generate_link_nonce()
         frontend_target = fe_param or request.headers.get("referer") or request.headers.get("origin") or CFG.FRONTEND_URL
         frontend_target = str(frontend_target).split("?")[0].rstrip("/")
-        if not frontend_target or "onrender.com" in frontend_target or "up.railway.app" in frontend_target or "localhost:8000" in frontend_target or "/auth" in frontend_target:
+        if not frontend_target or "onrender.com" in frontend_target or "up.railway.app" in frontend_target or "trycloudflare.com" in frontend_target or "localhost:8000" in frontend_target or "/auth" in frontend_target:
             frontend_target = CFG.FRONTEND_URL.rstrip("/")
         client_id = acc.get("zebu_client_id") or acc.get("zebu_uid") or CFG.ZEBU_CLIENT_ID
         clean_cid = client_id.strip() if client_id else ""
@@ -3071,7 +3071,7 @@ async def zebu_start(request: Request, n: str = "", account: str = "", fe: str =
     if not d or d.get("exp", 0) < time.time():
         return HTMLResponse("<h3>Link expired. Go back to the dashboard and click Connect Zebu again.</h3>", 400)
 
-    cb_url = "https://tts-backend-production-6975d66d.up.railway.app/auth/zebu/callback"
+    cb_url = "https://device-lenses-beverages-real.trycloudflare.com/auth/zebu/callback"
     if CFG.PUBLIC_URL and "localhost" not in CFG.PUBLIC_URL and "127.0.0.1" not in CFG.PUBLIC_URL:
         cb_url = f"{CFG.PUBLIC_URL.rstrip('/')}/auth/zebu/callback"
     elif "localhost" in str(request.base_url) or "127.0.0.1" in str(request.base_url):
@@ -3109,7 +3109,7 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
             d = {"account": zebu_accs[0]["id"], "exp": time.time() + 900, "frontend_url": CFG.FRONTEND_URL}
 
     target_frontend = (d.get("frontend_url") if d else "") or fe_url or CFG.FRONTEND_URL
-    if not target_frontend or "onrender.com" in target_frontend or "up.railway.app" in target_frontend or "localhost:8000" in target_frontend or "127.0.0.1:8000" in target_frontend or "/auth" in target_frontend:
+    if not target_frontend or "onrender.com" in target_frontend or "up.railway.app" in target_frontend or "trycloudflare.com" in target_frontend or "localhost:8000" in target_frontend or "127.0.0.1:8000" in target_frontend or "/auth" in target_frontend:
         target_frontend = CFG.FRONTEND_URL
     target_url = f"{target_frontend.rstrip('/')}/?linked=true#traders"
 

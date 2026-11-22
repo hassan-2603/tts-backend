@@ -18,35 +18,73 @@ log = logging.getLogger("tts.database")
 Base = declarative_base()
 
 
-def get_db_url() -> str:
-    url = os.environ.get("DATABASE_URL") or CFG.DATABASE_URL
-    # Ensure correct async driver scheme
+def _normalize_pg_url_and_ssl(raw_url: str) -> tuple[str, bool]:
+    """Normalize Postgres URL for asyncpg and detect whether SSL should be enforced."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+    url = (raw_url or "").strip()
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
     elif url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     elif url.startswith("sqlite:///"):
         url = url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
-    return url
+
+    if "postgresql" not in url:
+        return url, False
+
+    parts = urlsplit(url)
+    qs = dict(parse_qsl(parts.query, keep_blank_values=True))
+    sslmode = str(qs.pop("sslmode", "") or "").lower()
+    ssl_param = str(qs.pop("ssl", "") or "").lower()
+    needs_ssl = (
+        sslmode in ("require", "verify-ca", "verify-full", "prefer")
+        or ssl_param in ("true", "1", "require")
+        or "render.com" in (parts.hostname or "").lower()
+    )
+    clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(qs), parts.fragment))
+    return clean_url, needs_ssl
+
+
+def get_db_url() -> str:
+    url = os.environ.get("DATABASE_URL") or CFG.DATABASE_URL
+    clean_url, _ = _normalize_pg_url_and_ssl(url)
+    return clean_url
+
+
+def get_pg_connect_args(url: str = None) -> dict:
+    raw = url or os.environ.get("DATABASE_URL") or CFG.DATABASE_URL
+    _, needs_ssl = _normalize_pg_url_and_ssl(raw)
+    args = {
+        "timeout": 10,
+        "command_timeout": 30,
+    }
+    if needs_ssl:
+        args["ssl"] = "require"
+    return args
 
 
 def create_engine_instance(url: str = None) -> AsyncEngine:
-    db_url = url or get_db_url()
+    raw_url = url or os.environ.get("DATABASE_URL") or CFG.DATABASE_URL
+    db_url, needs_ssl = _normalize_pg_url_and_ssl(raw_url)
     is_sqlite = "sqlite" in db_url
     engine_kwargs = {
         "echo": CFG.DEBUG,
     }
     if not is_sqlite:
+        cargs = {
+            "timeout": 10,
+            "command_timeout": 30,
+        }
+        if needs_ssl:
+            cargs["ssl"] = "require"
         engine_kwargs.update({
             "pool_size": CFG.DATABASE_POOL_SIZE,
             "max_overflow": CFG.DATABASE_MAX_OVERFLOW,
             "pool_timeout": CFG.DATABASE_TIMEOUT,
             "pool_pre_ping": True,
             "pool_recycle": 1800,
-            "connect_args": {
-                "timeout": 10,
-                "command_timeout": 30,
-            },
+            "connect_args": cargs,
         })
     return create_async_engine(db_url, **engine_kwargs)
 

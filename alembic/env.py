@@ -5,7 +5,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 
-from app.database import Base, get_db_url
+from app.database import Base, get_db_url, get_pg_connect_args
 from app import models  # noqa: F401
 
 config = context.config
@@ -42,7 +42,8 @@ async def run_async_migrations() -> None:
     configuration["sqlalchemy.url"] = db_url
     connect_args = {}
     if "postgresql" in db_url:
-        connect_args = {"timeout": 15, "command_timeout": 30}
+        connect_args = get_pg_connect_args()
+        connect_args["timeout"] = 15
     print("Alembic: connecting to database...", flush=True)
     connectable = async_engine_from_config(
         configuration,

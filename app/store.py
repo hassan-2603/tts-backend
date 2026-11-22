@@ -784,11 +784,17 @@ class Store:
             allow_empty=False,
         )
 
-    async def get_positions_async(self, account_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def get_positions_async(
+        self,
+        account_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
         async with AsyncSessionLocal() as session:
             stmt = select(Position)
             if account_id:
                 stmt = stmt.where(Position.account_id == account_id)
+            if since is not None:
+                stmt = stmt.where(Position.updated_at >= since)
             rows = (await session.execute(stmt)).scalars().all()
             return [
                 {
@@ -860,12 +866,14 @@ class Store:
             )
             await session.commit()
 
-    async def get_rule_violations_async(self, account_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def get_rule_violations_async(self, account_id: Optional[str] = None, limit: int = 2000) -> List[Dict[str, Any]]:
         async with AsyncSessionLocal() as session:
             stmt = select(Alert).where(Alert.rule_name.isnot(None))
             if account_id:
                 stmt = stmt.where((Alert.account_id == account_id) | (Alert.trader_id == account_id))
             stmt = stmt.order_by(Alert.created_at.desc())
+            if limit and limit > 0:
+                stmt = stmt.limit(limit)
             rows = (await session.execute(stmt)).scalars().all()
             return [
                 {

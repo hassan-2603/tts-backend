@@ -2600,14 +2600,16 @@ async def delete_traders_bulk(request: Request, _=Depends(admin_only)):
 @app.get("/api/accounts")
 async def get_accounts(user=Depends(current_user)):
     out = []
+    today_ist_date = now_ist().date()
+    today_ist_str = today_ist_date.isoformat()
+    # Filter Position rows to today only in SQL (IST midnight -> UTC minus 1h safety buffer)
+    today_utc_start = datetime(today_ist_date.year, today_ist_date.month, today_ist_date.day, tzinfo=IST).astimezone(timezone.utc) - timedelta(hours=1)
     all_acc, tokens_list, sync_states_map, all_positions = await asyncio.gather(
         DB.get_all_accounts_async(),
         DB._all_tokens(),
         DB.get_all_sync_states_async(),
-        DB.get_positions_async(),
+        DB.get_positions_async(since=today_utc_start),
     )
-    today_ist_date = now_ist().date()
-    today_ist_str = today_ist_date.isoformat()
     # Group today's positions per account and select ONLY the latest snapshot batch (within 5s of max updated_at)
     # while excluding expired contracts (expiry < today_ist_date) so stale rows can NEVER leak into today's P&L.
     today_pos_by_acc: Dict[str, List[Tuple[datetime, dict]]] = {}

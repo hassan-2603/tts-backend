@@ -2309,7 +2309,7 @@ async def get_overview_funds_summary(force: int = 0, user=Depends(current_user))
 
 # ---------------- Health & Metrics Endpoints ----------------
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
 
@@ -2327,7 +2327,7 @@ async def get_metrics(user=Depends(admin_only)):
 
 
 @app.get("/api/health")
-def api_health():
+async def api_health():
     return {"ok": True, "mode": "live", "zebu_configured": bool(CFG.ZEBU_CLIENT_ID and CFG.ZEBU_SECRET_KEY)}
 
 
@@ -2457,11 +2457,18 @@ async def get_raw_account_pnl(aid: str, user=Depends(current_user)):
 # ---------------- API Endpoints (Preserving 100% contracts) ----------------
 @app.post("/api/login")
 async def login(request: Request):
-    client_ip = request.client.host if request.client else "127.0.0.1"
+    xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    client_ip = xff or (request.client.host if request.client else "127.0.0.1")
     check_login_rate_limit(client_ip)
     t0 = time.perf_counter()
     d = await request.json()
-    u = await DB.get_user_async(str(d.get("user", "")))
+    raw_user = str(d.get("user", "")).strip()
+    u = await DB.get_user_async(raw_user)
+    if not u and raw_user:
+        # Case-insensitive username lookup fallback so minor capitalization differences don't block login
+        all_u = await DB.get_all_users_async()
+        low = raw_user.lower()
+        u = next((cand for cand in all_u if str(cand.get("user") or "").strip().lower() == low), None)
     if not u or not check_pw(str(d.get("password", "")), u["pw"]):
         raise HTTPException(401, "Wrong user or password")
 
@@ -3787,6 +3794,11 @@ def get_frontend_dir() -> Path:
     if (ROOT_DIR.parent / "frontend").exists():
         return ROOT_DIR.parent / "frontend"
     return ROOT_DIR / "static"
+
+
+@app.head("/")
+async def index_head():
+    return JSONResponse({"status": "ok"})
 
 
 @app.get("/")

@@ -31,5 +31,4 @@ USER tts
 
 EXPOSE 8000
 
-ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
+CMD ["sh", "-c", "echo '[TTS] Booting on port '${PORT:-8000}; alembic upgrade head || echo '[TTS] Alembic skipped'; echo '[TTS] Starting uvicorn on port '${PORT:-8000}; exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]

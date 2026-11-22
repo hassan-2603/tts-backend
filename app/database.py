@@ -21,7 +21,9 @@ Base = declarative_base()
 def get_db_url() -> str:
     url = os.environ.get("DATABASE_URL") or CFG.DATABASE_URL
     # Ensure correct async driver scheme
-    if url.startswith("postgresql://"):
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     elif url.startswith("sqlite:///"):
         url = url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
@@ -33,7 +35,6 @@ def create_engine_instance(url: str = None) -> AsyncEngine:
     is_sqlite = "sqlite" in db_url
     engine_kwargs = {
         "echo": CFG.DEBUG,
-        "future": True,
     }
     if not is_sqlite:
         engine_kwargs.update({
@@ -41,6 +42,11 @@ def create_engine_instance(url: str = None) -> AsyncEngine:
             "max_overflow": CFG.DATABASE_MAX_OVERFLOW,
             "pool_timeout": CFG.DATABASE_TIMEOUT,
             "pool_pre_ping": True,
+            "pool_recycle": 1800,
+            "connect_args": {
+                "timeout": 10,
+                "command_timeout": 30,
+            },
         })
     return create_async_engine(db_url, **engine_kwargs)
 
@@ -102,14 +108,41 @@ async def init_models(engine: AsyncEngine = None):
             ("alerts", "explanation", "TEXT"),
             ("alerts", "violation_status", "VARCHAR(30) DEFAULT 'ACTIVE'"),
         ]
-        for tbl, col, col_type in migrations:
+        is_pg = eng.dialect.name == "postgresql"
+        existing_cols: set = set()
+        if is_pg:
             try:
-                await conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {col_type}"))
+                res = await conn.execute(
+                    text(
+                        "SELECT table_name, column_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema()"
+                    )
+                )
+                existing_cols = {(r[0], r[1]) for r in res.fetchall()}
+            except Exception as e:
+                log.warning(f"Could not inspect existing PostgreSQL columns: {e}")
+
+        missing = [
+            (tbl, col, col_type)
+            for tbl, col, col_type in migrations
+            if not is_pg or (tbl, col) not in existing_cols
+        ]
+        if is_pg and missing:
+            try:
+                await conn.execute(text("SET LOCAL lock_timeout = '5s'"))
             except Exception:
-                try:
-                    await conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_type}"))
-                except Exception:
-                    pass
+                pass
+
+        for tbl, col, col_type in missing:
+            try:
+                async with conn.begin_nested():
+                    if is_pg:
+                        await conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {col_type}"))
+                    else:
+                        await conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_type}"))
+            except Exception as e:
+                if is_pg:
+                    log.warning(f"Skipped column migration {tbl}.{col}: {e}")
     log.info("Database tables verified/initialized.")
 
 

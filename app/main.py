@@ -1884,18 +1884,21 @@ SCHEDULER = MarketScheduler(
 # ---------------- Lifespan & App Setup ----------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Initialize DB tables and schema migrations
-    await init_models()
+    # 1. Initialize DB tables and schema migrations (bounded timeout so Uvicorn always binds $PORT)
+    async def _init_db_bootstrap():
+        await init_models()
+        admin_u = CFG.ADMIN_USER
+        admin_existing = await DB.get_user_async(admin_u)
+        if not admin_existing:
+            await DB.put_user_async(admin_u, {"user": admin_u, "role": "admin", "pw": hash_pw(CFG.ADMIN_PASSWORD)})
+        settings_existing = await DB._get_setting("main")
+        if not settings_existing:
+            await DB._put_setting("main", DEFAULT_SETTINGS)
 
-    # 2. Ensure initial admin exists
-    admin_u = CFG.ADMIN_USER
-    admin_existing = await DB.get_user_async(admin_u)
-    if not admin_existing:
-        await DB.put_user_async(admin_u, {"user": admin_u, "role": "admin", "pw": hash_pw(CFG.ADMIN_PASSWORD)})
-
-    settings_existing = await DB._get_setting("main")
-    if not settings_existing:
-        await DB._put_setting("main", DEFAULT_SETTINGS)
+    try:
+        await asyncio.wait_for(_init_db_bootstrap(), timeout=25.0)
+    except Exception as e:
+        log.error(f"DB bootstrap warning during startup (continuing so server binds port): {e}")
 
     # 3. Schedule heavy startup recovery, WS streams, scheduler & notification worker in background
     # so Uvicorn becomes ready immediately and never triggers Render 502 startup timeouts.

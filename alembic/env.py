@@ -37,18 +37,25 @@ def do_run_migrations(connection: Connection) -> None:
 
 
 async def run_async_migrations() -> None:
+    db_url = get_db_url()
     configuration = config.get_section(config.config_ini_section) or {}
-    configuration["sqlalchemy.url"] = get_db_url()
+    configuration["sqlalchemy.url"] = db_url
+    connect_args = {}
+    if "postgresql" in db_url:
+        connect_args = {"timeout": 15, "command_timeout": 30}
+    print("Alembic: connecting to database...", flush=True)
     connectable = async_engine_from_config(
         configuration,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args=connect_args,
     )
 
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
 
     await connectable.dispose()
+    print("Alembic: migrations up to date.", flush=True)
 
 
 def run_migrations_online() -> None:

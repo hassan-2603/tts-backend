@@ -3732,11 +3732,20 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
     """Ultra-fast single-request bootstrap endpoint returning all dashboard state concurrently."""
     t0 = time.perf_counter()
     frm = request.query_params.get("from", "")
+    lim_raw = request.query_params.get("limit", "")
+    lim_val = int(lim_raw) if lim_raw.isdigit() else 1000
     sem = asyncio.Semaphore(3)
 
     async def _bounded(coro):
         async with sem:
             return await coro
+
+    async def _bootstrap_trades():
+        rows = await DB._all_trades(from_date=frm if frm else None, limit=lim_val)
+        scope = await _user_allowed_scope_async(user)
+        if scope is not None:
+            rows = [t for t in rows if t.get("account") in scope["accounts"]]
+        return rows
 
     (
         traders_res,
@@ -3754,7 +3763,7 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
         _bounded(get_traders(user=user)),
         _bounded(get_accounts(user=user)),
         _bounded(get_rules(user=user)),
-        _bounded(get_trades(request=request, user=user)),
+        _bounded(_bootstrap_trades()),
         _bounded(get_groups(user=user)),
         _bounded(get_settings(_=user)),
         _bounded(get_rulelog(user=user)),
@@ -3763,6 +3772,8 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
         _bounded(get_violations(user=user)),
         _bounded(DB.has_trades_before_async(frm)) if frm else asyncio.sleep(0, result=False),
     )
+    if len(trades_res) >= lim_val:
+        has_older = True
     METRICS.record_api_latency((time.perf_counter() - t0) * 1000)
     return {
         "user": {"user": user["user"], "role": user["role"]},

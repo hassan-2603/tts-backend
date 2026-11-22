@@ -13,30 +13,33 @@ info()  { printf '[TTS] %s\n' "$*"; }
 # ── Wait for Postgres ─────────────────────────────────────────────────────────
 wait_for_postgres() {
     info "Waiting for PostgreSQL..."
-    for i in $(seq 1 30); do
-        # Try a quick Python asyncpg ping instead of relying on pg_isready
-        python - <<'PYEOF' 2>/dev/null && return 0
-import asyncio, os, asyncpg
+    for i in $(seq 1 15); do
+        python - <<'PYEOF' && return 0
+import asyncio, os, sys, asyncpg
 async def _ping():
-    url = os.environ.get("DATABASE_URL","")
-    # strip driver prefix so asyncpg.connect can use it
+    url = os.environ.get("DATABASE_URL","").strip()
     url = url.replace("postgresql+asyncpg://","postgresql://")
-    conn = await asyncpg.connect(url, timeout=3)
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    conn = await asyncpg.connect(url, timeout=5)
     await conn.close()
-asyncio.run(_ping())
+try:
+    asyncio.run(_ping())
+except Exception as e:
+    print(f"[TTS] PG ping error: {e}", file=sys.stderr)
+    sys.exit(1)
 PYEOF
-        info "  attempt $i/30 – not ready yet, retrying in 1 s..."
+        info "  attempt $i/15 – not ready yet, retrying in 1 s..."
         sleep 1
     done
-    red "PostgreSQL did not become ready in 30 seconds. Aborting."
-    exit 1
+    red "PostgreSQL did not become ready in 15 seconds – continuing startup so health endpoints bind port."
 }
 
 # ── Run Alembic ───────────────────────────────────────────────────────────────
 run_migrations() {
     info "Running Alembic migrations..."
-    alembic upgrade head
-    green "Migrations complete."
+    alembic upgrade head || red "Alembic migration warning (will verify tables in app lifespan)."
+    green "Migrations step complete."
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -52,6 +55,16 @@ case "$DB_URL" in
         ;;
 esac
 
-# Hand off to the command passed to docker run / compose
+# Hand off to the command passed to docker run / Railway Start Command
+if [ "$#" -eq 0 ]; then
+    set -- uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}" --workers 1
+fi
 info "Starting: $*"
-exec "$@"
+case "$*" in
+    *"&&"*|*"||"*|*";"*|*'$PORT'*)
+        exec sh -c "$*"
+        ;;
+    *)
+        exec "$@"
+        ;;
+esac

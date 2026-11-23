@@ -2906,6 +2906,30 @@ async def get_accounts(user=Depends(current_user)):
     return out
 
 
+@app.post("/api/accounts/reconnect-all")
+async def reconnect_all_accounts_endpoint(_=Depends(admin_only)):
+    """Master reconnect: starts reconnecting every Zebu account one by one in the background
+    (returns immediately so proxy timeouts never occur even with 50+ accounts)."""
+    if not _RECONNECT_ALL_STATUS.get("running"):
+        all_accs = await DB.get_all_accounts_async()
+        zebu_cnt = sum(1 for a in all_accs if (a.get("broker") or "") == "Zebu")
+        _RECONNECT_ALL_STATUS.update({
+            "running": True,
+            "processed": 0,
+            "total": zebu_cnt,
+            "connected": 0,
+            "skipped": 0,
+            "failed": 0,
+        })
+        asyncio.create_task(reconnect_all_zebu_accounts_async(reason="manual"))
+    return {"ok": True, "started": True, **_RECONNECT_ALL_STATUS}
+
+
+@app.get("/api/accounts/reconnect-all/status")
+async def reconnect_all_accounts_status(_=Depends(admin_only)):
+    return {"ok": True, **_RECONNECT_ALL_STATUS}
+
+
 @app.put("/api/accounts/{aid}")
 async def put_account(aid: str, request: Request, _=Depends(admin_only)):
     d = await request.json()
@@ -2976,30 +3000,6 @@ def _extract_zebu_config_patch(acc: dict, data: dict) -> dict:
         "proxy_url": acc.get("proxy_url"),
     }
     return patch
-
-
-@app.post("/api/accounts/reconnect-all")
-async def reconnect_all_accounts_endpoint(_=Depends(admin_only)):
-    """Master reconnect: starts reconnecting every Zebu account one by one in the background
-    (returns immediately so proxy timeouts never occur even with 50+ accounts)."""
-    if not _RECONNECT_ALL_STATUS.get("running"):
-        all_accs = await DB.get_all_accounts_async()
-        zebu_cnt = sum(1 for a in all_accs if (a.get("broker") or "") == "Zebu")
-        _RECONNECT_ALL_STATUS.update({
-            "running": True,
-            "processed": 0,
-            "total": zebu_cnt,
-            "connected": 0,
-            "skipped": 0,
-            "failed": 0,
-        })
-        asyncio.create_task(reconnect_all_zebu_accounts_async(reason="manual"))
-    return {"ok": True, "started": True, **_RECONNECT_ALL_STATUS}
-
-
-@app.get("/api/accounts/reconnect-all/status")
-async def reconnect_all_accounts_status(_=Depends(admin_only)):
-    return {"ok": True, **_RECONNECT_ALL_STATUS}
 
 
 @app.post("/api/accounts/{aid}/zebu-config")

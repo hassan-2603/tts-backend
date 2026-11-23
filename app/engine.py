@@ -11,9 +11,11 @@ Features:
 """
 import re
 from collections import defaultdict
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Dict, List, Optional, Tuple, Any
+
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 MONTHS = {m: i for i, m in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
 
@@ -222,15 +224,17 @@ def parse_ts(*vals) -> Optional[datetime]:
         if not v:
             continue
         if isinstance(v, datetime):
-            return v.replace(tzinfo=None)
+            if v.tzinfo is not None:
+                return v.astimezone(_IST).replace(tzinfo=None)
+            return v
         v_str = str(v).strip()
         if not v_str or v_str.startswith("01-01-1980"):
             continue
-        # Handle epoch seconds (e.g. ordenttm "1607706811")
+        # Handle epoch seconds (e.g. ordenttm "1607706811") strictly in IST (never server local timezone)
         if v_str.isdigit() and len(v_str) in (10, 13):
             try:
                 epoch = int(v_str) / (1000.0 if len(v_str) == 13 else 1.0)
-                d = datetime.fromtimestamp(epoch)
+                d = datetime.fromtimestamp(epoch, tz=_IST)
                 if d.year > 2000:
                     return d.replace(tzinfo=None)
             except (ValueError, OSError):

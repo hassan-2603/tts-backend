@@ -2902,9 +2902,9 @@ async def get_accounts(user=Depends(current_user)):
             rpnl_sum += r_val
             urmtom_sum += u_val
             raw_p = pos.get("raw_payload")
-            row_pos_pnl, row_tot_mtm = compute_mynt_position_row_pnl(raw_p) if isinstance(raw_p, dict) else (None, None)
-            pos_pnl_sum += row_pos_pnl if row_pos_pnl is not None else (r_val + u_val)
-            tot_mtm_sum += row_tot_mtm if row_tot_mtm is not None else (r_val + u_val)
+            row_booked_pnl, row_open_mtm = compute_mynt_position_row_pnl(raw_p) if isinstance(raw_p, dict) else (None, None)
+            pos_pnl_sum += row_booked_pnl if row_booked_pnl is not None else r_val
+            tot_mtm_sum += row_open_mtm if row_open_mtm is not None else u_val
             row_cnt += 1
         broker_pnl_by_acc[p_aid] = {
             "rpnl": rpnl_sum,

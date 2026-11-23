@@ -115,8 +115,58 @@ class ValidatedPositionSnapshot:
     unrealized_mtm: Optional[Decimal]
     mtm_valid: bool
     mtm_error: Optional[str]
+    position_pnl: Optional[Decimal] = None
+    total_mtm: Optional[Decimal] = None
     open_positions: Dict[str, OpenPositionState] = field(default_factory=dict)
     raw_audit_rows: List[dict] = field(default_factory=list)
+
+
+def compute_mynt_position_row_pnl(row: dict) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    """Exact MYNT by Zebu Positions page calculation from a raw PositionBook row.
+
+    Returns (position_pnl, total_mtm):
+      - total_mtm    = rpnl + urmtom  (exact MYNT 'Total MTM')
+      - position_pnl = exact MYNT 'Position P&L' / 'Total P&L':
+          For carry-forward rows (cfbuyqty > 0 or cfsellqty > 0) with upldprc > 0:
+            (cfsellqty * upldprc * prcftr + daysellamt)
+            - (cfbuyqty * upldprc * prcftr + daybuyamt)
+            + (netqty * lp * prcftr)
+          For pure intraday rows (cfbuyqty == 0 and cfsellqty == 0):
+            rpnl + urmtom
+    """
+    if not isinstance(row, dict):
+        return None, None
+    rpnl_dec = _parse_decimal_strict(row.get("rpnl"))
+    urmtom_dec = _parse_decimal_strict(row.get("urmtom"))
+    netqty_dec = _parse_decimal_strict(row.get("netqty")) or Decimal("0")
+    netavgprc_dec = _parse_decimal_strict(row.get("netavgprc"))
+    lp_dec = _parse_decimal_strict(row.get("lp")) or Decimal("0")
+
+    raw_prcftr = row.get("prcftr")
+    if raw_prcftr is not None and str(raw_prcftr).strip() != "":
+        prcftr_dec = _parse_decimal_strict(raw_prcftr) or Decimal("1")
+    else:
+        prcftr_dec = Decimal("1")
+
+    if urmtom_dec is None and netavgprc_dec is not None:
+        urmtom_dec = netqty_dec * (lp_dec - netavgprc_dec) * prcftr_dec
+
+    total_mtm = (rpnl_dec + urmtom_dec) if (rpnl_dec is not None and urmtom_dec is not None) else None
+
+    cfbuy_qty = _parse_decimal_strict(row.get("cfbuyqty")) or Decimal("0")
+    cfsell_qty = _parse_decimal_strict(row.get("cfsellqty")) or Decimal("0")
+    upldprc = _parse_decimal_strict(row.get("upldprc")) or Decimal("0")
+    daybuy_amt = _parse_decimal_strict(row.get("daybuyamt")) or Decimal("0")
+    daysell_amt = _parse_decimal_strict(row.get("daysellamt")) or Decimal("0")
+
+    if (cfbuy_qty > Decimal("0") or cfsell_qty > Decimal("0")) and upldprc > Decimal("0"):
+        orig_buy_amt = cfbuy_qty * upldprc * prcftr_dec + daybuy_amt
+        orig_sell_amt = cfsell_qty * upldprc * prcftr_dec + daysell_amt
+        position_pnl = (orig_sell_amt - orig_buy_amt) + (netqty_dec * lp_dec * prcftr_dec)
+    else:
+        position_pnl = total_mtm
+
+    return position_pnl, total_mtm
 
 
 @dataclass
@@ -185,6 +235,8 @@ def validate_and_aggregate_position_book(
                     unrealized_mtm=Decimal("0.00"),
                     mtm_valid=True,
                     mtm_error=None,
+                    position_pnl=Decimal("0.00"),
+                    total_mtm=Decimal("0.00"),
                     open_positions={},
                     raw_audit_rows=[],
                 )
@@ -222,6 +274,8 @@ def validate_and_aggregate_position_book(
     realized_sum = Decimal("0")
     realized_valid = True
     realized_error: Optional[str] = None
+    position_pnl_sum = Decimal("0")
+    total_mtm_sum = Decimal("0")
 
     mtm_sum = Decimal("0")
     mtm_valid = True
@@ -326,6 +380,13 @@ def validate_and_aggregate_position_book(
                 mtm_valid = False
                 mtm_error = f"Missing or invalid urmtom/price fields on {exch}:{tsym or token}"
 
+        # Exact MYNT Position P&L & Total MTM per row
+        row_pos_pnl, row_tot_mtm = compute_mynt_position_row_pnl(row)
+        if row_pos_pnl is not None and realized_valid:
+            position_pnl_sum += row_pos_pnl
+        if row_tot_mtm is not None and mtm_valid:
+            total_mtm_sum += row_tot_mtm
+
         # Track open positions (netqty != 0) for live WebSocket Touchline MTM updates
         if netqty_dec is not None and netqty_dec != Decimal("0"):
             scrip_key = f"{exch}|{token}" if token else ""
@@ -362,6 +423,8 @@ def validate_and_aggregate_position_book(
         unrealized_mtm=_quantize_money(mtm_sum) if mtm_valid else None,
         mtm_valid=mtm_valid,
         mtm_error=mtm_error,
+        position_pnl=_quantize_money(position_pnl_sum) if realized_valid else None,
+        total_mtm=_quantize_money(total_mtm_sum) if (realized_valid and mtm_valid) else None,
         open_positions=open_positions,
         raw_audit_rows=audit_rows,
     )
@@ -682,7 +745,13 @@ class FinancialSummaryService:
             total_mtm += pos.live_urmtom
 
         if all_valid:
-            entry.live_mtm_override = _quantize_money(total_mtm)
+            base_urmtom = snap.unrealized_mtm or Decimal("0")
+            mtm_delta = total_mtm - base_urmtom
+            base_total_mtm = snap.total_mtm if snap.total_mtm is not None else ((snap.realized_pnl or Decimal("0")) + base_urmtom)
+            base_pos_pnl = snap.position_pnl if snap.position_pnl is not None else base_total_mtm
+            live_total_mtm = _quantize_money(base_total_mtm + mtm_delta)
+            live_pos_pnl = _quantize_money(base_pos_pnl + mtm_delta)
+            entry.live_mtm_override = live_total_mtm
             if self.ws_hub:
                 await self.ws_hub.broadcast({
                     "type": "financial_summary_updated",
@@ -691,14 +760,14 @@ class FinancialSummaryService:
                     "uid": entry.uid,
                     "actid": entry.actid,
                     "mtm": {
-                        "value": str(entry.live_mtm_override),
+                        "value": str(live_total_mtm),
                         "status": "LIVE",
                         "source": "zebu_websocket_touchline",
                         "last_feed_at": _fmt_iso_utc(now_utc),
                         "last_feed_ist": _fmt_ist_display(now_utc),
                     },
                     "pnl": {
-                        "value": str(snap.realized_pnl) if snap.realized_pnl is not None else None,
+                        "value": str(live_pos_pnl) if snap.realized_valid else None,
                         "status": "LIVE" if snap.realized_valid else "UNAVAILABLE",
                     },
                 })
@@ -809,8 +878,12 @@ class FinancialSummaryService:
         # Case 2: We have a previously verified snapshot, but the latest refresh failed -> STALE
         if has_error or overall_status in ("REAUTH_REQUIRED", "NOT_LINKED"):
             stale_status = "REAUTH_REQUIRED" if (overall_status == "REAUTH_REQUIRED" or entry.last_error_type == "SESSION_EXPIRED") else "STALE"
-            pnl_val = str(snap.realized_pnl) if snap.realized_valid and snap.realized_pnl is not None else None
-            mtm_dec = entry.live_mtm_override if entry.live_mtm_override is not None else snap.unrealized_mtm
+            base_mtm = snap.total_mtm if snap.total_mtm is not None else snap.unrealized_mtm
+            base_pnl = snap.position_pnl if snap.position_pnl is not None else snap.realized_pnl
+            mtm_dec = entry.live_mtm_override if entry.live_mtm_override is not None else base_mtm
+            mtm_delta = (mtm_dec - base_mtm) if (mtm_dec is not None and base_mtm is not None) else Decimal("0")
+            pnl_dec = _quantize_money(base_pnl + mtm_delta) if base_pnl is not None else None
+            pnl_val = str(pnl_dec) if snap.realized_valid and pnl_dec is not None else None
             mtm_val = str(mtm_dec) if snap.mtm_valid and mtm_dec is not None else None
             return {
                 "account_id": entry.account_id,
@@ -821,15 +894,15 @@ class FinancialSummaryService:
                 "source": "zebu_position_book_cached",
                 "read_only": True,
                 "pnl": {
-                    "label": "P&L",
-                    "subtitle": "Realized P&L",
+                    "label": "Position P&L",
+                    "subtitle": "Total P&L",
                     "value": pnl_val,
                     "status": stale_status if pnl_val is not None else "UNAVAILABLE",
                     "error": entry.last_error or snap.realized_error,
                 },
                 "mtm": {
-                    "label": "MTM",
-                    "subtitle": "Unrealized Mark-to-Market",
+                    "label": "Total MTM",
+                    "subtitle": "Day MTM",
                     "value": mtm_val,
                     "status": stale_status if mtm_val is not None else "UNAVAILABLE",
                     "error": entry.last_error or snap.mtm_error,
@@ -850,7 +923,11 @@ class FinancialSummaryService:
 
         # Case 3: Verified fresh snapshot (independent card validation + live feed freshness check)
         feed_stale = self._is_feed_stale(entry)
-        mtm_dec = entry.live_mtm_override if (entry.live_mtm_override is not None and not feed_stale) else snap.unrealized_mtm
+        base_mtm = snap.total_mtm if snap.total_mtm is not None else snap.unrealized_mtm
+        base_pnl = snap.position_pnl if snap.position_pnl is not None else snap.realized_pnl
+        mtm_dec = entry.live_mtm_override if (entry.live_mtm_override is not None and not feed_stale) else base_mtm
+        mtm_delta = (mtm_dec - base_mtm) if (mtm_dec is not None and base_mtm is not None) else Decimal("0")
+        pnl_dec = _quantize_money(base_pnl + mtm_delta) if base_pnl is not None else None
         mtm_source = "zebu_websocket_touchline" if (entry.live_mtm_override is not None and not feed_stale) else "zebu_position_book"
 
         pnl_status = "LIVE" if snap.realized_valid else "UNAVAILABLE"
@@ -876,15 +953,15 @@ class FinancialSummaryService:
             "source": mtm_source,
             "read_only": True,
             "pnl": {
-                "label": "P&L",
-                "subtitle": "Realized P&L",
-                "value": str(snap.realized_pnl) if snap.realized_valid and snap.realized_pnl is not None else None,
+                "label": "Position P&L",
+                "subtitle": "Total P&L",
+                "value": str(pnl_dec) if snap.realized_valid and pnl_dec is not None else None,
                 "status": pnl_status,
                 "error": snap.realized_error,
             },
             "mtm": {
-                "label": "MTM",
-                "subtitle": "Unrealized Mark-to-Market",
+                "label": "Total MTM",
+                "subtitle": "Day MTM",
                 "value": str(mtm_dec) if snap.mtm_valid and mtm_dec is not None else None,
                 "status": mtm_status,
                 "error": ("Live price feed stale — waiting for fresh tick" if feed_stale else snap.mtm_error),

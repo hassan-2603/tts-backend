@@ -63,7 +63,7 @@ from app.zebu import ZebuClient, SessionExpired, ZebuError
 from app.alerts import Alerter
 from app.notifications import NotificationEngine, verify_whatsapp_signature
 from app.connection_manager import ConnectionManager
-from app.financial_summary import FinancialSummaryService
+from app.financial_summary import FinancialSummaryService, compute_mynt_position_row_pnl
 from app.scheduler import MarketScheduler, now_ist, IST
 from app.metrics import METRICS
 from app import engine
@@ -2889,18 +2889,28 @@ async def get_accounts(user=Depends(current_user)):
         seen_keys: set[str] = set()
         rpnl_sum = Decimal("0")
         urmtom_sum = Decimal("0")
+        pos_pnl_sum = Decimal("0")
+        tot_mtm_sum = Decimal("0")
         row_cnt = 0
         for dt, pos in latest_batch:
             ckey = f"{str(pos.get('exch') or 'NFO').upper()}|{str(pos.get('tsym') or '').strip()}|{str(pos.get('product') or 'MIS').upper()}"
             if ckey in seen_keys:
                 continue
             seen_keys.add(ckey)
-            rpnl_sum += Decimal(str(pos.get("realized_pnl") or 0))
-            urmtom_sum += Decimal(str(pos.get("unrealized_pnl") or 0))
+            r_val = Decimal(str(pos.get("realized_pnl") or 0))
+            u_val = Decimal(str(pos.get("unrealized_pnl") or 0))
+            rpnl_sum += r_val
+            urmtom_sum += u_val
+            raw_p = pos.get("raw_payload")
+            row_pos_pnl, row_tot_mtm = compute_mynt_position_row_pnl(raw_p) if isinstance(raw_p, dict) else (None, None)
+            pos_pnl_sum += row_pos_pnl if row_pos_pnl is not None else (r_val + u_val)
+            tot_mtm_sum += row_tot_mtm if row_tot_mtm is not None else (r_val + u_val)
             row_cnt += 1
         broker_pnl_by_acc[p_aid] = {
             "rpnl": rpnl_sum,
             "urmtom": urmtom_sum,
+            "position_pnl": pos_pnl_sum,
+            "total_mtm": tot_mtm_sum,
             "count": row_cnt,
             "updated_at": max_upd.isoformat(),
         }
@@ -2953,6 +2963,8 @@ async def get_accounts(user=Depends(current_user)):
             "broker_rpnl": float(b_agg["rpnl"]) if b_agg else None,
             "broker_urmtom": float(b_agg["urmtom"]) if b_agg else None,
             "broker_total_pnl": float(b_agg["rpnl"] + b_agg["urmtom"]) if b_agg else None,
+            "broker_position_pnl": float(b_agg["position_pnl"]) if b_agg else None,
+            "broker_total_mtm": float(b_agg["total_mtm"]) if b_agg else None,
             "broker_positions_count": b_agg["count"] if b_agg else 0,
             "broker_pos_updated_at": b_agg["updated_at"] if b_agg else None,
         })

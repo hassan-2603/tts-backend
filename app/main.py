@@ -1922,16 +1922,22 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
             "processed": 0,
             "total": len(zebu_accs),
             "connected": 0,
+            "synced": 0,
             "skipped": 0,
             "failed": 0,
             "already_linked": 0,
             "current": "",
         })
 
-        for idx, acc in enumerate(zebu_accs, 1):
+        synced = 0
+        processed_cnt = 0
+        reconn_sem = asyncio.Semaphore(6)
+
+        async def _reconnect_one(acc: dict):
+            nonlocal connected, synced, skipped, failed, already_linked, processed_cnt
             aid = acc["id"]
             name = acc.get("name") or aid
-            _RECONNECT_ALL_STATUS["current"] = aid
+
             # Skip accounts that are already linked — only reconnect disconnected / expired accounts
             td_cur = tok_by_acc.get(aid) or {}
             l_state = _link_state_from_doc(td_cur)
@@ -1943,88 +1949,103 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
             )
             if is_already_linked:
                 already_linked += 1
+                processed_cnt += 1
                 results.append({"account_id": aid, "name": name, "status": "already_linked"})
                 _RECONNECT_ALL_STATUS.update({
-                    "processed": idx,
+                    "processed": processed_cnt,
                     "connected": connected,
+                    "synced": synced,
                     "skipped": skipped + failed,
                     "failed": failed,
                     "already_linked": already_linked,
                 })
-                continue
+                return
 
-            try:
-                creds = await DB.get_account_credentials_async(aid)
-                if not creds or not (
-                    creds.get("zebu_uid")
-                    and creds.get("zebu_factor2")
-                    and creds.get("zebu_password")
-                    and (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY)
-                ):
-                    skipped += 1
-                    results.append({"account_id": aid, "name": name, "status": "skipped", "reason": "Incomplete credentials"})
-                    _RECONNECT_ALL_STATUS.update({"processed": idx, "connected": connected, "skipped": skipped + failed, "failed": failed})
-                    continue
+            async with reconn_sem:
+                _RECONNECT_ALL_STATUS["current"] = aid
+                try:
+                    creds = await DB.get_account_credentials_async(aid)
+                    if not creds or not (
+                        creds.get("zebu_uid")
+                        and creds.get("zebu_factor2")
+                        and creds.get("zebu_password")
+                        and (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY)
+                    ):
+                        skipped += 1
+                        results.append({"account_id": aid, "name": name, "status": "skipped", "reason": "Incomplete credentials"})
+                        return
 
-                uid = ZEBU._clean_uid(creds["zebu_uid"])
-                vc = (creds.get("zebu_vc") or "").strip() or f"{uid}_U"
-                api_secret = (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY or "").strip()
-                res = await asyncio.wait_for(
-                    ZEBU.quick_auth_async(
-                        uid=uid,
-                        password=creds["zebu_password"],
-                        factor2=creds["zebu_factor2"],
-                        vc=vc,
-                        api_secret=api_secret,
-                        proxy=creds.get("proxy_url"),
-                    ),
-                    timeout=15.0,
-                )
-                susertoken = str(res.get("susertoken") or "").strip()
-                if not susertoken:
-                    failed += 1
-                    results.append({"account_id": aid, "name": name, "status": "skipped", "reason": "No token returned"})
-                    _RECONNECT_ALL_STATUS.update({"processed": idx, "connected": connected, "skipped": skipped + failed, "failed": failed})
-                    continue
+                    uid = ZEBU._clean_uid(creds["zebu_uid"])
+                    vc = (creds.get("zebu_vc") or "").strip() or f"{uid}_U"
+                    api_secret = (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY or "").strip()
+                    res = await asyncio.wait_for(
+                        ZEBU.quick_auth_async(
+                            uid=uid,
+                            password=creds["zebu_password"],
+                            factor2=creds["zebu_factor2"],
+                            vc=vc,
+                            api_secret=api_secret,
+                            proxy=creds.get("proxy_url"),
+                        ),
+                        timeout=15.0,
+                    )
+                    susertoken = str(res.get("susertoken") or "").strip()
+                    if not susertoken:
+                        failed += 1
+                        results.append({"account_id": aid, "name": name, "status": "skipped", "reason": "No token returned"})
+                        return
 
-                clean_uid = ZEBU._clean_uid(res.get("uid") or uid)
-                clean_actid = ZEBU._clean_uid(res.get("actid") or creds.get("zebu_actid") or clean_uid)
-                cliname = str(res.get("uname") or res.get("cliname") or name).strip()
-                ZEBU.register_token_mode(susertoken, "quickauth")
-                now_utc = datetime.now(timezone.utc)
-                await DB.put_token_async(aid, {
-                    "access_token": susertoken,
-                    "auth_mode": "quickauth",
-                    "expires_at": time.time() + 86400 * 3650,
-                    "linked_at": now_utc,
-                    "cliname": cliname,
-                    "status": "Linked",
-                    "last_sync_at": now_utc,
-                    "sync_message": f"Reconnected ({reason})",
-                })
-                await DB.put_sync_state_async(aid, {
-                    "status": "LINKED",
-                    "is_stale": False,
-                    "last_error": None,
-                })
-                if CFG.RUN_WORKER_IN_PROCESS:
+                    cliname = str(res.get("uname") or res.get("cliname") or name).strip()
+                    ZEBU.register_token_mode(susertoken, "quickauth")
+                    now_utc = datetime.now(timezone.utc)
+                    await DB.put_token_async(aid, {
+                        "access_token": susertoken,
+                        "auth_mode": "quickauth",
+                        "expires_at": time.time() + 86400 * 3650,
+                        "linked_at": now_utc,
+                        "cliname": cliname,
+                        "status": "Linked",
+                        "last_sync_at": now_utc,
+                        "sync_message": f"Reconnected ({reason})",
+                    })
+                    await DB.put_sync_state_async(aid, {
+                        "status": "LINKED",
+                        "is_stale": False,
+                        "last_error": None,
+                    })
+                    fresh_acc = await DB.get_account_async(aid) or acc
+                    if CFG.RUN_WORKER_IN_PROCESS:
+                        try:
+                            await _ensure_account_ws_stream(fresh_acc, susertoken, auth_mode="quickauth")
+                        except Exception as wse:
+                            log.warning(f"WS stream notice after reconnect for {aid}: {wse}")
+
+                    connected += 1
+                    sync_note = "connected"
                     try:
-                        fresh_acc = await DB.get_account_async(aid) or acc
-                        await _ensure_account_ws_stream(fresh_acc, susertoken, auth_mode="quickauth")
-                    except Exception as wse:
-                        log.warning(f"WS stream notice after reconnect for {aid}: {wse}")
+                        sync_res = await asyncio.wait_for(poll_account_async(fresh_acc, now_ist(), force=True), timeout=15.0)
+                        synced += 1
+                        sync_note = str(sync_res)[:120]
+                    except Exception as se:
+                        log.warning(f"Post-reconnect sync notice for {aid}: {se}")
+                    results.append({"account_id": aid, "name": name, "status": "connected", "sync": sync_note})
+                except Exception as e:
+                    failed += 1
+                    err_msg = str(e)[:180]
+                    log.warning(f"Reconnect-all skipped {aid} ({name}): {err_msg}")
+                    results.append({"account_id": aid, "name": name, "status": "skipped", "reason": err_msg})
+                finally:
+                    processed_cnt += 1
+                    _RECONNECT_ALL_STATUS.update({
+                        "processed": processed_cnt,
+                        "connected": connected,
+                        "synced": synced,
+                        "skipped": skipped + failed,
+                        "failed": failed,
+                        "already_linked": already_linked,
+                    })
 
-                connected += 1
-                results.append({"account_id": aid, "name": name, "status": "connected"})
-            except Exception as e:
-                failed += 1
-                err_msg = str(e)[:180]
-                log.warning(f"Reconnect-all skipped {aid} ({name}): {err_msg}")
-                results.append({"account_id": aid, "name": name, "status": "skipped", "reason": err_msg})
-
-            _RECONNECT_ALL_STATUS.update({"processed": idx, "connected": connected, "skipped": skipped + failed, "failed": failed})
-            # Gentle throttle between accounts so Zebu QuickAuth never rate-limits
-            await asyncio.sleep(0.35)
+        await asyncio.gather(*[_reconnect_one(a) for a in zebu_accs])
 
         summary = {
             "ok": True,
@@ -2035,6 +2056,8 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
             "processed": len(zebu_accs),
             "total": len(zebu_accs),
             "connected": connected,
+            "synced": synced,
+            "already_linked": already_linked,
             "skipped": skipped + failed,
             "failed": failed,
             "results": results,

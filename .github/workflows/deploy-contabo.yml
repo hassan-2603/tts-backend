@@ -1,0 +1,30 @@
+name: Auto-Deploy TTS Backend to Contabo VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ secrets.CONTABO_HOST != '' }}
+    steps:
+      - name: Deploy & restart tts.service on Contabo
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.CONTABO_HOST }}
+          username: ${{ secrets.CONTABO_USER || 'root' }}
+          password: ${{ secrets.CONTABO_PASSWORD }}
+          port: 22
+          script: |
+            set -e
+            cd /opt/tts-backend
+            git fetch origin main
+            git reset --hard origin/main
+            /opt/tts-backend/venv/bin/pip install -r requirements.txt -q
+            /opt/tts-backend/venv/bin/alembic upgrade head || true
+            systemctl restart tts.service
+            sleep 2
+            systemctl is-active tts.service

@@ -2159,22 +2159,44 @@ async def _fetch_overview_funds_summary_async(accounts: List[dict], scope_key: s
         if key not in unique_accounts:
             unique_accounts[key] = a
 
-    # Resolve tokens concurrently (1 batch DB query instead of N sequential round-trips)
-    all_tok_map = await DB._all_tokens()
+    # Resolve tokens from 1 single batch DB query (avoids 47 concurrent DB sessions & fixes list-vs-dict bug)
+    all_tok_list = await DB._all_tokens()
+    tok_by_acc: Dict[str, dict] = {t["account"]: t for t in all_tok_list if t.get("account")}
+    now_ts = time.time()
 
-    async def _resolve_tok(key: str, a: dict):
-        tok = await token_for_account_async(a["id"])
-        if not tok:
-            td = all_tok_map.get(a["id"]) or {}
-            if td.get("status") in ("Login expired", "REAUTH_REQUIRED") or (a.get("zebu_password_enc") and a.get("zebu_factor2_enc")):
+    linked: List[Tuple[str, dict, str]] = []
+    reauth_candidates: List[Tuple[str, dict]] = []
+    for key, a in unique_accounts.items():
+        aid = a["id"]
+        uid = (a.get("zebu_uid") or "").strip().upper()
+        td = tok_by_acc.get(aid) or (tok_by_acc.get(uid) if uid else None)
+        tok = None
+        if td and td.get("access_token"):
+            st = td.get("status") or "Linked"
+            exp = td.get("expires_at")
+            if st not in ("Not linked", "Disconnected", "Login expired", "REAUTH_REQUIRED") and (not exp or float(exp) >= now_ts):
+                tok = td["access_token"]
+                ZEBU.register_token_mode(tok, td.get("auth_mode") or "oauth")
+        if tok:
+            linked.append((key, a, tok))
+        elif td and td.get("status") in ("Login expired", "REAUTH_REQUIRED"):
+            reauth_candidates.append((key, a))
+
+    if reauth_candidates:
+        reauth_sem = asyncio.Semaphore(5)
+
+        async def _try_reauth(key: str, a: dict):
+            async with reauth_sem:
                 try:
-                    tok = await asyncio.wait_for(reauth_account_quickauth_async(a["id"]), timeout=15.0)
+                    t_new = await asyncio.wait_for(reauth_account_quickauth_async(a["id"]), timeout=15.0)
+                    return (key, a, t_new) if t_new else None
                 except Exception:
-                    tok = None
-        return (key, a, tok) if tok else None
+                    return None
 
-    resolved_list = await asyncio.gather(*[_resolve_tok(k, a) for k, a in unique_accounts.items()])
-    linked: List[Tuple[str, dict, str]] = [item for item in resolved_list if item is not None]
+        reauth_res = await asyncio.gather(*[_try_reauth(k, a) for k, a in reauth_candidates])
+        for item in reauth_res:
+            if item is not None:
+                linked.append(item)
 
     async def _fetch_one(key: str, acc: dict, tok: str):
         u = ZEBU._clean_uid(acc.get("zebu_uid"))

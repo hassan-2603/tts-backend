@@ -181,6 +181,24 @@ async def init_models(engine: AsyncEngine = None):
             except Exception as e:
                 if is_pg:
                     log.warning(f"Skipped column migration {tbl}.{col}: {e}")
+
+        # Widen trades.entry_order_id / exit_order_id to TEXT so multi-fill comma-separated order IDs never overflow VARCHAR(100)
+        if is_pg:
+            try:
+                res_w = await conn.execute(
+                    text(
+                        "SELECT column_name, data_type FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() AND table_name = 'trades' "
+                        "AND column_name IN ('entry_order_id', 'exit_order_id')"
+                    )
+                )
+                for col_name, dtype in res_w.fetchall():
+                    if str(dtype).lower() != "text":
+                        async with conn.begin_nested():
+                            await conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+                            await conn.execute(text(f"ALTER TABLE trades ALTER COLUMN {col_name} TYPE TEXT"))
+            except Exception as e:
+                log.warning(f"Skipped widening trades order_id columns: {e}")
     log.info("Database tables verified/initialized.")
 
 

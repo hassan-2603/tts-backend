@@ -44,8 +44,8 @@ class Settings(BaseSettings):
     DATABASE_URL: str = Field(
         default="postgresql+asyncpg://tts:tts_pass@localhost:5432/tts_db"
     )
-    DATABASE_POOL_SIZE: int = Field(default=10)
-    DATABASE_MAX_OVERFLOW: int = Field(default=15)
+    DATABASE_POOL_SIZE: int = Field(default=25)
+    DATABASE_MAX_OVERFLOW: int = Field(default=25)
     DATABASE_TIMEOUT: int = Field(default=20)
     DB_PATH: str = Field(default=str(ROOT_DIR / "tts.db"))  # SQLite fallback / migration source
 
@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     # Concurrency & Sync Timing
     MAX_CONCURRENT_ACCOUNTS: int = Field(default=50)
     ACCOUNT_SYNC_WORKERS: int = Field(default=10)
-    POLL_SECONDS: int = Field(default=15)
+    POLL_SECONDS: int = Field(default=45)
     MARKET_OPEN: str = Field(default="09:15")
     MARKET_CLOSE: str = Field(default="15:30")
     EOD_FINALIZE_TIME: str = Field(default="15:45")

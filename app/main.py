@@ -2503,20 +2503,21 @@ async def get_overview_funds_summary(force: int = 0, user=Depends(current_user))
         task = asyncio.create_task(_fetch_overview_funds_summary_async(allowed, scope_key))
         _FUNDS_INFLIGHT[scope_key] = task
     try:
-        res = await asyncio.wait_for(asyncio.shield(task), timeout=22.0)
+        # Keep wait strictly under Vercel's ~10s rewrite proxy timeout so Chrome never gets "Failed to fetch"
+        res = await asyncio.wait_for(asyncio.shield(task), timeout=6.5)
     except asyncio.TimeoutError:
         prev = cached or _FUNDS_LAST_VERIFIED.get(scope_key)
         if prev and prev.get("available_funds") is not None:
             return {**prev, "status": "STALE", "cache_hit": True}
         return {
-            "status": "UNAVAILABLE",
+            "status": "LOADING",
             "available_funds": None,
             "utilized_funds": None,
             "accounts_linked": len(allowed),
             "accounts_succeeded": 0,
             "accounts_failed": 0,
             "accounts": [],
-            "error": "Still fetching Zebu Limits in background — refresh in a few seconds",
+            "error": "Fetching Zebu Limits…",
             "cache_hit": False,
         }
     finally:

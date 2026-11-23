@@ -125,9 +125,9 @@ async def init_models(engine: AsyncEngine = None):
             ("trades", "unrealized_pnl", "NUMERIC(14, 2)"),
             ("trades", "net_pnl", "NUMERIC(14, 2)"),
             ("trades", "pnl_source", "VARCHAR(30)"),
-            ("trades", "parent_trade_id", "VARCHAR(120)"),
-            ("trades", "entry_order_id", "VARCHAR(100)"),
-            ("trades", "exit_order_id", "VARCHAR(100)"),
+            ("trades", "parent_trade_id", "TEXT"),
+            ("trades", "entry_order_id", "TEXT"),
+            ("trades", "exit_order_id", "TEXT"),
             ("trades", "is_finalized", "BOOLEAN DEFAULT FALSE"),
             ("trades", "finalized_at", "TIMESTAMP WITH TIME ZONE"),
             ("trades", "is_archived", "BOOLEAN DEFAULT FALSE"),
@@ -138,11 +138,11 @@ async def init_models(engine: AsyncEngine = None):
             ("daily_sync_records", "finalized", "BOOLEAN DEFAULT FALSE"),
             ("daily_sync_records", "archived", "BOOLEAN DEFAULT FALSE"),
             ("trading_rules", "account_id", "VARCHAR(100)"),
-            ("alerts", "order_id", "VARCHAR(100)"),
+            ("alerts", "order_id", "TEXT"),
             ("alerts", "trade_date", "VARCHAR(20)"),
             ("alerts", "trade_time", "VARCHAR(20)"),
-            ("alerts", "configured_condition", "VARCHAR(250)"),
-            ("alerts", "observed_value", "VARCHAR(250)"),
+            ("alerts", "configured_condition", "TEXT"),
+            ("alerts", "observed_value", "TEXT"),
             ("alerts", "explanation", "TEXT"),
             ("alerts", "violation_status", "VARCHAR(30) DEFAULT 'ACTIVE'"),
         ]
@@ -182,23 +182,35 @@ async def init_models(engine: AsyncEngine = None):
                 if is_pg:
                     log.warning(f"Skipped column migration {tbl}.{col}: {e}")
 
-        # Widen trades.entry_order_id / exit_order_id to TEXT so multi-fill comma-separated order IDs never overflow VARCHAR(100)
+        # Widen variable-length order ID / rule text columns to TEXT so long multi-fill values never overflow VARCHAR
         if is_pg:
+            widen_targets = [
+                ("trades", "entry_order_id"),
+                ("trades", "exit_order_id"),
+                ("trades", "parent_trade_id"),
+                ("position_lots", "order_id"),
+                ("alerts", "order_id"),
+                ("alerts", "configured_condition"),
+                ("alerts", "observed_value"),
+                ("alerts", "title"),
+            ]
             try:
                 res_w = await conn.execute(
                     text(
-                        "SELECT column_name, data_type FROM information_schema.columns "
-                        "WHERE table_schema = current_schema() AND table_name = 'trades' "
-                        "AND column_name IN ('entry_order_id', 'exit_order_id')"
+                        "SELECT table_name, column_name, data_type FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name IN ('trades', 'position_lots', 'alerts')"
                     )
                 )
-                for col_name, dtype in res_w.fetchall():
-                    if str(dtype).lower() != "text":
+                col_types = {(r[0], r[1]): str(r[2]).lower() for r in res_w.fetchall()}
+                for tbl_name, col_name in widen_targets:
+                    dtype = col_types.get((tbl_name, col_name))
+                    if dtype and dtype != "text":
                         async with conn.begin_nested():
                             await conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-                            await conn.execute(text(f"ALTER TABLE trades ALTER COLUMN {col_name} TYPE TEXT"))
+                            await conn.execute(text(f"ALTER TABLE {tbl_name} ALTER COLUMN {col_name} TYPE TEXT"))
             except Exception as e:
-                log.warning(f"Skipped widening trades order_id columns: {e}")
+                log.warning(f"Skipped widening TEXT columns: {e}")
     log.info("Database tables verified/initialized.")
 
 

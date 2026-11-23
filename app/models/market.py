@@ -128,7 +128,7 @@ class Trade(Base):
     charges = Column(Numeric(12, 2), nullable=False, default=0.0)
     charges_estimated = Column(Boolean, nullable=False, default=True)
     hedged = Column(Boolean, nullable=False, default=False)
-    parent_trade_id = Column(String(120), nullable=True, index=True)
+    parent_trade_id = Column(Text, nullable=True, index=True)
     entry_order_id = Column(Text, nullable=True)
     exit_order_id = Column(Text, nullable=True)
     is_finalized = Column(Boolean, nullable=False, default=False, index=True)
@@ -184,7 +184,7 @@ class PositionLot(Base):
     remaining_qty = Column(Numeric(12, 2), nullable=False, index=True)
     entry_price = Column(Numeric(12, 4), nullable=False)
     entry_time = Column(DateTime(timezone=True), nullable=False, index=True)
-    order_id = Column(String(100), nullable=False)
+    order_id = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
     __table_args__ = (

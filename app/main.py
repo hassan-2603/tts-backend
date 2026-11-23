@@ -4023,7 +4023,10 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
         async with sem:
             return await coro
 
-    today_str = now_ist().date().isoformat()
+    now_local = now_ist()
+    # Zebu PositionBook does not reset until ~08:30-09:00 IST; between 00:00 and 08:59 IST
+    # it still holds the previous trading session, so align prior_pnl cutoff to avoid double-counting.
+    today_str = (now_local.date() - timedelta(days=1)).isoformat() if now_local.hour < 9 else now_local.date().isoformat()
     scope = await _user_allowed_scope_async(user)
     allowed_acc_ids = list(scope["accounts"]) if scope is not None else None
 

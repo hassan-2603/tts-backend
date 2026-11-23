@@ -1905,9 +1905,12 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
     async with _RECONNECT_ALL_LOCK:
         all_accs = await DB.get_all_accounts_async()
         zebu_accs = [a for a in all_accs if (a.get("broker") or "") == "Zebu"]
+        all_tok_list = await DB._all_tokens()
+        tok_by_acc: Dict[str, dict] = {t["account"]: t for t in all_tok_list if t.get("account")}
         connected = 0
         skipped = 0
         failed = 0
+        already_linked = 0
         results: List[Dict[str, Any]] = []
         _RECONNECT_ALL_STATUS.update({
             "running": True,
@@ -1917,6 +1920,7 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
             "connected": 0,
             "skipped": 0,
             "failed": 0,
+            "already_linked": 0,
             "current": "",
         })
 
@@ -1924,6 +1928,27 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
             aid = acc["id"]
             name = acc.get("name") or aid
             _RECONNECT_ALL_STATUS["current"] = aid
+            # Skip accounts that are already linked — only reconnect disconnected / expired accounts
+            td_cur = tok_by_acc.get(aid) or {}
+            l_state = _link_state_from_doc(td_cur)
+            ws_st = CONN_MGR.get_account_state(aid).status
+            is_already_linked = (
+                (l_state == "Linked" and ws_st != "REAUTH_REQUIRED")
+                if reason == "manual"
+                else (l_state == "Linked" and ws_st == "REAL-TIME")
+            )
+            if is_already_linked:
+                already_linked += 1
+                results.append({"account_id": aid, "name": name, "status": "already_linked"})
+                _RECONNECT_ALL_STATUS.update({
+                    "processed": idx,
+                    "connected": connected,
+                    "skipped": skipped + failed,
+                    "failed": failed,
+                    "already_linked": already_linked,
+                })
+                continue
+
             try:
                 creds = await DB.get_account_credentials_async(aid)
                 if not creds or not (

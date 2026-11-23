@@ -4023,9 +4023,12 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
         async with sem:
             return await coro
 
+    today_str = now_ist().date().isoformat()
+    scope = await _user_allowed_scope_async(user)
+    allowed_acc_ids = list(scope["accounts"]) if scope is not None else None
+
     async def _bootstrap_trades():
         rows = await DB._all_trades(from_date=frm if frm else None, limit=lim_val)
-        scope = await _user_allowed_scope_async(user)
         if scope is not None:
             rows = [t for t in rows if t.get("account") in scope["accounts"]]
         return rows
@@ -4042,6 +4045,7 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
         daily_reports_res,
         violations_res,
         has_older,
+        ov_sql,
     ) = await asyncio.gather(
         _bounded(get_traders(user=user)),
         _bounded(get_accounts(user=user)),
@@ -4054,9 +4058,43 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
         _bounded(get_daily_reports(user=user)),
         _bounded(get_violations(user=user)),
         _bounded(DB.has_trades_before_async(frm)) if frm else asyncio.sleep(0, result=False),
+        _bounded(DB.get_overview_pnl_totals_async(today_str, allowed_acc_ids)),
     )
     if len(trades_res) >= lim_val:
         has_older = True
+
+    # Combine exact MYNT Position P&L across all accounts for today + full SQL historical P&L for all-time
+    today_closed_by_acc = ov_sql.get("today_closed_by_acc") or {}
+    pnl_today_dec = Decimal("0")
+    pnl_today_mtm_dec = Decimal("0")
+    active_accs_today = 0
+    for acc_item in accounts_res:
+        aid_k = acc_item.get("id")
+        b_pos = acc_item.get("broker_position_pnl")
+        b_mtm = acc_item.get("broker_total_mtm")
+        if b_pos is not None:
+            pnl_today_dec += Decimal(str(b_pos))
+            if b_mtm is not None:
+                pnl_today_mtm_dec += Decimal(str(b_mtm))
+            active_accs_today += 1
+        elif aid_k in today_closed_by_acc:
+            pnl_today_dec += today_closed_by_acc[aid_k]
+            active_accs_today += 1
+
+    prior_pnl_dec = ov_sql.get("prior_pnl") or Decimal("0")
+    pnl_all_time_dec = prior_pnl_dec + pnl_today_dec
+    today_trades_cnt = int(ov_sql.get("today_trades_count") or 0)
+    total_trading_days = int(ov_sql.get("prior_days") or 0) + (1 if (today_trades_cnt > 0 or active_accs_today > 0) else 0)
+    overview_pnl = {
+        "pnl_today": float(engine._q2(pnl_today_dec)),
+        "pnl_today_mtm": float(engine._q2(pnl_today_mtm_dec)),
+        "pnl_all_time": float(engine._q2(pnl_all_time_dec)),
+        "today_trades": today_trades_cnt,
+        "active_accounts_today": active_accs_today,
+        "total_accounts": len(accounts_res),
+        "trading_days": total_trading_days,
+    }
+
     METRICS.record_api_latency((time.perf_counter() - t0) * 1000)
     return {
         "user": {"user": user["user"], "role": user["role"]},
@@ -4071,6 +4109,7 @@ async def bootstrap_dashboard(request: Request, user=Depends(current_user)):
         "status": status_res,
         "dailyReports": daily_reports_res,
         "violations": violations_res,
+        "overviewPnl": overview_pnl,
     }
 
 

@@ -9,7 +9,7 @@ import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple, Union
-from sqlalchemy import select, delete as sa_delete, update as sa_update, insert as sa_insert
+from sqlalchemy import select, delete as sa_delete, update as sa_update, insert as sa_insert, func
 from sqlalchemy.orm import Session as SyncSession
 
 from app.database import AsyncSessionLocal, async_engine, Base
@@ -1299,6 +1299,67 @@ class Store:
                 (Trade.is_open == False) & (Trade.trade_date < cutoff_date) & ((Trade.exit_date == None) | (Trade.exit_date < cutoff_date))
             ).limit(1)
             return (await session.execute(stmt)).scalar_one_or_none() is not None
+
+    async def get_overview_pnl_totals_async(
+        self,
+        today_str: str,
+        allowed_accounts: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Exact SQL aggregation of all-time & today closed-trade P&L across all accounts (no 1,000-row or 30-day cap)."""
+        async with AsyncSessionLocal() as session:
+            eff_date = func.coalesce(Trade.exit_date, Trade.trade_date)
+            pnl_col = func.coalesce(Trade.realized_pnl, Trade.pnl, 0)
+
+            acc_filter = Trade.account_id.in_(allowed_accounts) if allowed_accounts is not None else True
+
+            prior_stmt = (
+                select(
+                    func.coalesce(func.sum(pnl_col), 0),
+                    func.count(func.distinct(eff_date)),
+                )
+                .where(
+                    (Trade.is_open == False)
+                    & (eff_date < today_str)
+                    & acc_filter
+                )
+            )
+            prior_row = (await session.execute(prior_stmt)).one()
+            prior_pnl = Decimal(str(prior_row[0] or 0))
+            prior_days = int(prior_row[1] or 0)
+
+            today_acc_stmt = (
+                select(
+                    Trade.account_id,
+                    func.coalesce(func.sum(pnl_col), 0),
+                )
+                .where(
+                    (Trade.is_open == False)
+                    & (eff_date == today_str)
+                    & acc_filter
+                )
+                .group_by(Trade.account_id)
+            )
+            today_closed_by_acc = {
+                str(r[0]): Decimal(str(r[1] or 0))
+                for r in (await session.execute(today_acc_stmt)).all()
+                if r[0] is not None
+            }
+
+            today_cnt_stmt = (
+                select(func.count(Trade.id))
+                .where(
+                    ((Trade.trade_date == today_str) | (Trade.exit_date == today_str))
+                    & acc_filter
+                )
+            )
+            today_trades_count = int((await session.execute(today_cnt_stmt)).scalar() or 0)
+
+            return {
+                "prior_pnl": prior_pnl,
+                "prior_days": prior_days,
+                "today_closed_by_acc": today_closed_by_acc,
+                "today_trades_count": today_trades_count,
+            }
 
     async def _all_trades(
         self,

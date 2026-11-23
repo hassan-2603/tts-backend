@@ -2159,29 +2159,39 @@ async def _fetch_overview_funds_summary_async(accounts: List[dict], scope_key: s
         if key not in unique_accounts:
             unique_accounts[key] = a
 
-    linked: List[Tuple[str, dict, str]] = []
-    for key, a in unique_accounts.items():
+    # Resolve tokens concurrently (1 batch DB query instead of N sequential round-trips)
+    all_tok_map = await DB._all_tokens()
+
+    async def _resolve_tok(key: str, a: dict):
         tok = await token_for_account_async(a["id"])
         if not tok:
-            td = await DB.get_token_async(a["id"])
-            if (td or {}).get("status") in ("Login expired", "REAUTH_REQUIRED"):
-                tok = await reauth_account_quickauth_async(a["id"])
-        if tok:
-            linked.append((key, a, tok))
+            td = all_tok_map.get(a["id"]) or {}
+            if td.get("status") in ("Login expired", "REAUTH_REQUIRED") or (a.get("zebu_password_enc") and a.get("zebu_factor2_enc")):
+                try:
+                    tok = await asyncio.wait_for(reauth_account_quickauth_async(a["id"]), timeout=15.0)
+                except Exception:
+                    tok = None
+        return (key, a, tok) if tok else None
+
+    resolved_list = await asyncio.gather(*[_resolve_tok(k, a) for k, a in unique_accounts.items()])
+    linked: List[Tuple[str, dict, str]] = [item for item in resolved_list if item is not None]
 
     async def _fetch_one(key: str, acc: dict, tok: str):
         u = ZEBU._clean_uid(acc.get("zebu_uid"))
         act = ZEBU._clean_uid(acc.get("zebu_actid") or u)
         async with CONN_MGR.semaphore:
             try:
-                raw = await asyncio.wait_for(ZEBU.limits_async(tok, u, act, proxy=acc.get("proxy_url")), timeout=10.0)
+                raw = await asyncio.wait_for(ZEBU.limits_async(tok, u, act, proxy=acc.get("proxy_url")), timeout=20.0)
                 parsed = _compute_account_funds_from_limits(raw)
                 return key, acc, parsed
             except SessionExpired as se:
-                fresh_tok = await asyncio.wait_for(reauth_account_quickauth_async(acc["id"]), timeout=10.0)
+                try:
+                    fresh_tok = await asyncio.wait_for(reauth_account_quickauth_async(acc["id"]), timeout=15.0)
+                except Exception:
+                    fresh_tok = None
                 if fresh_tok:
                     try:
-                        raw = await asyncio.wait_for(ZEBU.limits_async(fresh_tok, u, act, proxy=acc.get("proxy_url")), timeout=10.0)
+                        raw = await asyncio.wait_for(ZEBU.limits_async(fresh_tok, u, act, proxy=acc.get("proxy_url")), timeout=20.0)
                         parsed = _compute_account_funds_from_limits(raw)
                         return key, acc, parsed
                     except Exception as retry_e:

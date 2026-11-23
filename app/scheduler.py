@@ -110,6 +110,7 @@ class MarketScheduler:
         self._task: Optional[asyncio.Task] = None
         self.last_poll_time = 0.0
         self.last_eod_retry_time = 0.0
+        self.last_keepalive_reconnect_time = 0.0
         self.last_midnight_check_date: Optional[str] = None
         self.last_morning_reconnect_date: Optional[str] = None
 
@@ -150,30 +151,34 @@ class MarketScheduler:
                     await self.midnight_archive_fn(now)
                     self.last_midnight_check_date = today_str
 
-                # 1b. Automatic Daily 08:45 AM IST Reconnect for all Zebu accounts (weekdays, once per day)
-                if (
-                    weekday
-                    and self.morning_reconnect_fn
-                    and self.last_morning_reconnect_date != today_str
-                    and "08:45" <= hm <= "09:14"
-                ):
-                    log.info(f"Triggering scheduled 08:45 AM IST daily reconnect for {today_str} at {hm} IST")
-                    self.last_morning_reconnect_date = today_str
-                    try:
-                        await self.morning_reconnect_fn(now)
-                    except Exception as mre:
-                        log.error(f"Scheduled 08:45 AM reconnect error: {mre}", exc_info=True)
+                # 1b. Self-healing keep-linked reconnect: never let previously linked accounts stay expired
+                # (runs at 08:45 AM daily and every 5 minutes if any non-manually-disconnected account expired)
+                if self.morning_reconnect_fn:
+                    if weekday and self.last_morning_reconnect_date != today_str and "08:45" <= hm <= "09:14":
+                        log.info(f"Triggering scheduled 08:45 AM IST daily reconnect for {today_str} at {hm} IST")
+                        self.last_morning_reconnect_date = today_str
+                        self.last_keepalive_reconnect_time = time.time()
+                        try:
+                            await self.morning_reconnect_fn(now)
+                        except Exception as mre:
+                            log.error(f"Scheduled 08:45 AM reconnect error: {mre}", exc_info=True)
+                    elif time.time() - self.last_keepalive_reconnect_time >= 300:
+                        self.last_keepalive_reconnect_time = time.time()
+                        try:
+                            await self.morning_reconnect_fn(now)
+                        except Exception as mre:
+                            log.debug(f"Keepalive reconnect check error: {mre}")
 
-                # 2. Live Market Hours Polling (09:15 to 15:30 IST on weekdays)
+                # 2. Live Market & MCX Hours Polling (09:15 to 23:54 IST on weekdays — locks at 23:55 IST)
                 market_open = CFG.MARKET_OPEN or "09:15"
-                market_close = CFG.MARKET_CLOSE or "15:30"
-                if weekday and market_open <= hm <= market_close:
+                calendar_lock_time = "23:55"
+                if weekday and market_open <= hm < calendar_lock_time:
                     if time.time() - self.last_poll_time >= CFG.POLL_SECONDS:
-                        log.info(f"Triggering scheduled market-hours poll at {hm} IST")
+                        log.info(f"Triggering scheduled live poll at {hm} IST")
                         await self.poll_fn()
                         self.last_poll_time = time.time()
 
-                # 3. End-of-Day Finalization & Daily Summary (after 15:30 IST)
+                # 3. End-of-Day Finalization & Calendar Lock (strictly at 23:55 IST)
                 if inspect.iscoroutinefunction(self.get_settings_fn):
                     s = await self.get_settings_fn()
                 elif callable(self.get_settings_fn):
@@ -183,7 +188,7 @@ class MarketScheduler:
                     s = {}
                 s = s or {}
                 summary_time = s.get("alerts", {}).get("summaryTime", "15:35")
-                eod_time = getattr(CFG, "EOD_FINALIZE_TIME", "15:45") or "15:45"
+                eod_time = "23:55"
 
                 from app.models import DailySyncRecord, DailyAccountReport
 

@@ -446,12 +446,19 @@ async def token_for_account_async(acc_id: str) -> Optional[str]:
                 bs = (await session.execute(match_stmt)).scalars().first()
         if not bs or not bs.access_token_enc:
             return None
-        if bs.status in ("Not linked", "Disconnected", "Login expired", "REAUTH_REQUIRED"):
+        if bs.status in ("Not linked", "Disconnected"):
             return None
         exp = ensure_utc(bs.expires_at)
-        if exp and exp < datetime.now(timezone.utc):
-            bs.status = "Login expired"
-            await session.commit()
+        if bs.status in ("Login expired", "REAUTH_REQUIRED") or (exp and exp < datetime.now(timezone.utc)):
+            # Auto-renew expired session using saved QuickAuth credentials so accounts stay linked until manually disconnected
+            try:
+                creds = await DB.get_account_credentials_async(acc_id)
+                if creds and creds.get("zebu_uid") and creds.get("zebu_factor2") and creds.get("zebu_password") and (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY):
+                    res_qa = await authenticate_zebu_quickauth_async(acc_id, force=True)
+                    if res_qa and res_qa.get("ok") and res_qa.get("token"):
+                        return res_qa["token"]
+            except Exception as _re:
+                log.debug(f"Auto-renew token skipped for {acc_id}: {_re}")
             return None
         tok_plain = decrypt_token(bs.access_token_enc)
         if tok_plain:
@@ -722,6 +729,18 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
 
         # 2. Fallback: attempt OAuth refresh_token exchange if available
         ref_tok = (tok_doc or {}).get("refresh_token")
+        # Try silent QuickAuth re-login first so linked accounts stay linked forever until manually disconnected
+        if not _auth_retried:
+            try:
+                creds = await DB.get_account_credentials_async(aid)
+                if creds and creds.get("zebu_uid") and creds.get("zebu_factor2") and creds.get("zebu_password") and (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY):
+                    qa_res = await authenticate_zebu_quickauth_async(aid, force=True)
+                    if qa_res and qa_res.get("ok"):
+                        log.info(f"Automatically re-authenticated QuickAuth session for account {aid}")
+                        return await poll_account_async(acc, now, force=force, reconcile_today=reconcile_today, _auth_retried=True)
+            except Exception as _qae:
+                log.debug(f"Auto QuickAuth retry failed for {aid}: {_qae}")
+
         refreshed = None
         if ref_tok and not _auth_retried:
             refreshed = await ZEBU.refresh_token_async(
@@ -1234,7 +1253,7 @@ async def finalize_eod_async(now: Optional[datetime] = None, target_date: Option
         sync_ok = True
         sync_note = "verified_from_database"
         tok = await token_for_account_async(aid)
-        if acc.get("broker", "Zebu") == "Zebu" and acc.get("zebu_uid") and tok and day_str == now.date().isoformat() and now.hour < 21:
+        if acc.get("broker", "Zebu") == "Zebu" and acc.get("zebu_uid") and tok and day_str == now.date().isoformat() and (now.hour < 23 or (now.hour == 23 and now.minute <= 59)):
             try:
                 sync_res = await poll_account_async(acc, now)
                 sync_note = f"zebu_eod_sync: {sync_res}"
@@ -1938,8 +1957,15 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
             aid = acc["id"]
             name = acc.get("name") or aid
 
-            # Skip accounts that are already linked — only reconnect disconnected / expired accounts
+            # Skip accounts that are already linked or were manually disconnected (when auto-reconnecting)
             td_cur = tok_by_acc.get(aid) or {}
+            if reason != "manual":
+                cur_st_doc = (await DB.get_sync_state_async(aid)) or {}
+                if td_cur.get("status") == "Disconnected" or (not td_cur and cur_st_doc.get("status") == "DISCONNECTED"):
+                    skipped += 1
+                    processed_cnt += 1
+                    results.append({"account_id": aid, "name": name, "status": "manually_disconnected"})
+                    return
             l_state = _link_state_from_doc(td_cur)
             ws_st = CONN_MGR.get_account_state(aid).status
             is_already_linked = (

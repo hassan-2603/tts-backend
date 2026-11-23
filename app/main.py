@@ -1886,12 +1886,153 @@ async def get_settings_dict() -> dict:
     return merged
 
 
+_RECONNECT_ALL_LOCK = asyncio.Lock()
+_RECONNECT_ALL_STATUS: Dict[str, Any] = {"running": False, "processed": 0, "total": 0, "connected": 0, "skipped": 0, "failed": 0}
+
+
+async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Reconnect every Zebu account one by one using saved QuickAuth credentials.
+    Skips any account with missing/changed/invalid credentials without stopping the rest.
+    """
+    now = now or now_ist()
+    today_str = now.date().isoformat()
+    if reason == "scheduled_0845":
+        prev_st = (await DB._get_status("morning_reconnect")) or {}
+        if prev_st.get("date") == today_str:
+            log.info(f"08:45 AM reconnect already completed for {today_str}; skipping duplicate run.")
+            return {"ok": True, "reason": reason, "already_ran": True, "date": today_str}
+
+    async with _RECONNECT_ALL_LOCK:
+        all_accs = await DB.get_all_accounts_async()
+        zebu_accs = [a for a in all_accs if (a.get("broker") or "") == "Zebu"]
+        connected = 0
+        skipped = 0
+        failed = 0
+        results: List[Dict[str, Any]] = []
+        _RECONNECT_ALL_STATUS.update({
+            "running": True,
+            "reason": reason,
+            "processed": 0,
+            "total": len(zebu_accs),
+            "connected": 0,
+            "skipped": 0,
+            "failed": 0,
+            "current": "",
+        })
+
+        for idx, acc in enumerate(zebu_accs, 1):
+            aid = acc["id"]
+            name = acc.get("name") or aid
+            _RECONNECT_ALL_STATUS["current"] = aid
+            try:
+                creds = await DB.get_account_credentials_async(aid)
+                if not creds or not (
+                    creds.get("zebu_uid")
+                    and creds.get("zebu_factor2")
+                    and creds.get("zebu_password")
+                    and (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY)
+                ):
+                    skipped += 1
+                    results.append({"account_id": aid, "name": name, "status": "skipped", "reason": "Incomplete credentials"})
+                    _RECONNECT_ALL_STATUS.update({"processed": idx, "connected": connected, "skipped": skipped + failed, "failed": failed})
+                    continue
+
+                uid = ZEBU._clean_uid(creds["zebu_uid"])
+                vc = (creds.get("zebu_vc") or "").strip() or f"{uid}_U"
+                api_secret = (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY or "").strip()
+                res = await asyncio.wait_for(
+                    ZEBU.quick_auth_async(
+                        uid=uid,
+                        password=creds["zebu_password"],
+                        factor2=creds["zebu_factor2"],
+                        vc=vc,
+                        api_secret=api_secret,
+                        proxy=creds.get("proxy_url"),
+                    ),
+                    timeout=15.0,
+                )
+                susertoken = str(res.get("susertoken") or "").strip()
+                if not susertoken:
+                    failed += 1
+                    results.append({"account_id": aid, "name": name, "status": "skipped", "reason": "No token returned"})
+                    _RECONNECT_ALL_STATUS.update({"processed": idx, "connected": connected, "skipped": skipped + failed, "failed": failed})
+                    continue
+
+                clean_uid = ZEBU._clean_uid(res.get("uid") or uid)
+                clean_actid = ZEBU._clean_uid(res.get("actid") or creds.get("zebu_actid") or clean_uid)
+                cliname = str(res.get("uname") or res.get("cliname") or name).strip()
+                ZEBU.register_token_mode(susertoken, "quickauth")
+                now_utc = datetime.now(timezone.utc)
+                await DB.put_token_async(aid, {
+                    "access_token": susertoken,
+                    "auth_mode": "quickauth",
+                    "expires_at": time.time() + 86400 * 3650,
+                    "linked_at": now_utc,
+                    "cliname": cliname,
+                    "status": "Linked",
+                    "last_sync_at": now_utc,
+                    "sync_message": f"Reconnected ({reason})",
+                })
+                await DB.put_sync_state_async(aid, {
+                    "status": "LINKED",
+                    "is_stale": False,
+                    "last_error": None,
+                })
+                if CFG.RUN_WORKER_IN_PROCESS:
+                    try:
+                        fresh_acc = await DB.get_account_async(aid) or acc
+                        await _ensure_account_ws_stream(fresh_acc, susertoken, auth_mode="quickauth")
+                    except Exception as wse:
+                        log.warning(f"WS stream notice after reconnect for {aid}: {wse}")
+
+                connected += 1
+                results.append({"account_id": aid, "name": name, "status": "connected"})
+            except Exception as e:
+                failed += 1
+                err_msg = str(e)[:180]
+                log.warning(f"Reconnect-all skipped {aid} ({name}): {err_msg}")
+                results.append({"account_id": aid, "name": name, "status": "skipped", "reason": err_msg})
+
+            _RECONNECT_ALL_STATUS.update({"processed": idx, "connected": connected, "skipped": skipped + failed, "failed": failed})
+            # Gentle throttle between accounts so Zebu QuickAuth never rate-limits
+            await asyncio.sleep(0.35)
+
+        summary = {
+            "ok": True,
+            "running": False,
+            "reason": reason,
+            "date": today_str,
+            "at": now.strftime("%Y-%m-%d %H:%M:%S IST"),
+            "processed": len(zebu_accs),
+            "total": len(zebu_accs),
+            "connected": connected,
+            "skipped": skipped + failed,
+            "failed": failed,
+            "results": results,
+        }
+        _RECONNECT_ALL_STATUS.update(summary)
+        if reason == "scheduled_0845":
+            await DB._put_status("morning_reconnect", {"date": today_str, "at": summary["at"], "connected": connected, "skipped": skipped + failed, "total": len(zebu_accs)})
+
+        # Invalidate & refresh Overview funds cache in background
+        _FUNDS_CACHE.clear()
+        _FUNDS_CACHE_MONO.clear()
+        try:
+            asyncio.create_task(_fetch_overview_funds_summary_async(all_accs, "admin"))
+        except Exception:
+            pass
+        asyncio.create_task(WS_HUB.broadcast({"type": "state_updated", "entity": "accounts"}))
+        log.info(f"Reconnect-all ({reason}) finished: {connected}/{len(zebu_accs)} connected, {skipped + failed} skipped.")
+        return summary
+
+
 SCHEDULER = MarketScheduler(
     poll_fn=lambda: poll_all_async("schedule"),
     summary_fn=daily_summary_async,
     get_settings_fn=get_settings_dict,
     finalize_eod_fn=finalize_eod_async,
     midnight_archive_fn=midnight_archive_async,
+    morning_reconnect_fn=lambda dt: reconnect_all_zebu_accounts_async(reason="scheduled_0845", now=dt),
 )
 
 
@@ -1935,6 +2076,8 @@ async def lifespan(app: FastAPI):
                 now_s = now_ist()
                 if (9, 15) <= (now_s.hour, now_s.minute) <= (15, 45):
                     asyncio.create_task(poll_all_async("startup"))
+                # Pre-warm Overview Total Available / Utilized Funds cache in background so Overview loads instantly
+                asyncio.create_task(_fetch_overview_funds_summary_async(all_accounts, "admin"))
             except Exception as e:
                 log.error(f"Startup worker init error: {e}")
 
@@ -2086,7 +2229,7 @@ _FUNDS_CACHE: Dict[str, Dict[str, Any]] = {}
 _FUNDS_CACHE_MONO: Dict[str, float] = {}
 _FUNDS_LAST_VERIFIED: Dict[str, Dict[str, Any]] = {}
 _FUNDS_INFLIGHT: Dict[str, asyncio.Task] = {}
-_FUNDS_CACHE_TTL = 15.0
+_FUNDS_CACHE_TTL = 60.0
 
 
 def _parse_limits_decimal(val: Any, required: bool = False) -> Tuple[Optional[Decimal], bool]:
@@ -2198,26 +2341,17 @@ async def _fetch_overview_funds_summary_async(accounts: List[dict], scope_key: s
             if item is not None:
                 linked.append(item)
 
+    funds_sem = asyncio.Semaphore(20)
+
     async def _fetch_one(key: str, acc: dict, tok: str):
         u = ZEBU._clean_uid(acc.get("zebu_uid"))
         act = ZEBU._clean_uid(acc.get("zebu_actid") or u)
-        async with CONN_MGR.semaphore:
+        async with funds_sem:
             try:
-                raw = await asyncio.wait_for(ZEBU.limits_async(tok, u, act, proxy=acc.get("proxy_url")), timeout=20.0)
+                raw = await asyncio.wait_for(ZEBU.limits_async(tok, u, act, proxy=acc.get("proxy_url")), timeout=12.0)
                 parsed = _compute_account_funds_from_limits(raw)
                 return key, acc, parsed
             except SessionExpired as se:
-                try:
-                    fresh_tok = await asyncio.wait_for(reauth_account_quickauth_async(acc["id"]), timeout=15.0)
-                except Exception:
-                    fresh_tok = None
-                if fresh_tok:
-                    try:
-                        raw = await asyncio.wait_for(ZEBU.limits_async(fresh_tok, u, act, proxy=acc.get("proxy_url")), timeout=20.0)
-                        parsed = _compute_account_funds_from_limits(raw)
-                        return key, acc, parsed
-                    except Exception as retry_e:
-                        return key, acc, {"ok": False, "error": str(retry_e)[:200], "error_type": "BROKER_ERROR"}
                 return key, acc, {"ok": False, "error": f"Session expired: {se}", "error_type": "SESSION_EXPIRED"}
             except Exception as e:
                 return key, acc, {"ok": False, "error": str(e)[:200], "error_type": "BROKER_ERROR"}
@@ -2288,22 +2422,26 @@ async def _fetch_overview_funds_summary_async(accounts: List[dict], scope_key: s
 
     avail_str = str(engine._q2(total_avail))
     util_str = str(engine._q2(total_util))
-    if len(failed_accounts) == 0:
+    if len(failed_accounts) == 0 or scope_key not in _FUNDS_LAST_VERIFIED:
         _FUNDS_LAST_VERIFIED[scope_key] = {
             "available_funds": avail_str,
             "utilized_funds": util_str,
             "last_updated_at": base["last_updated_at"],
             "last_updated_ist": now_ist_str,
         }
-        return {**base, "status": "LIVE", "available_funds": avail_str, "utilized_funds": util_str, "error": None}
-
-    return {
-        **base,
-        "status": "PARTIAL",
-        "available_funds": avail_str,
-        "utilized_funds": util_str,
-        "error": f"{len(failed_accounts)} of {len(linked)} account(s) failed: " + "; ".join(failed_accounts[:4]),
-    }
+    if len(failed_accounts) == 0:
+        out = {**base, "status": "LIVE", "available_funds": avail_str, "utilized_funds": util_str, "error": None}
+    else:
+        out = {
+            **base,
+            "status": "PARTIAL",
+            "available_funds": avail_str,
+            "utilized_funds": util_str,
+            "error": f"{len(failed_accounts)} of {len(linked)} account(s) failed: " + "; ".join(failed_accounts[:4]),
+        }
+    _FUNDS_CACHE[scope_key] = out
+    _FUNDS_CACHE_MONO[scope_key] = time.monotonic()
+    return out
 
 
 @app.get("/api/overview/funds-summary")
@@ -2311,25 +2449,47 @@ async def get_overview_funds_summary(force: int = 0, user=Depends(current_user))
     """READ-ONLY: Aggregates Total Available Funds and Total Utilized Funds from Zebu Limits API
     across every unique linked broker account authorized for the current user."""
     all_acc = await DB.get_all_accounts_async()
-    allowed = []
-    for a in all_acc:
-        try:
-            await _assert_user_can_access_account(user, a)
-            allowed.append(a)
-        except HTTPException:
-            continue
+    scope = await _user_allowed_scope_async(user)
+    if scope is None:
+        allowed = all_acc
+    else:
+        allowed = [a for a in all_acc if a.get("id") in scope["accounts"]]
 
     scope_key = "admin" if user.get("role") == "admin" else f"user:{user.get('user')}"
     now_m = time.monotonic()
-    if not force and scope_key in _FUNDS_CACHE and (now_m - _FUNDS_CACHE_MONO.get(scope_key, 0.0)) < _FUNDS_CACHE_TTL:
-        return {**_FUNDS_CACHE[scope_key], "cache_hit": True}
+    cached = _FUNDS_CACHE.get(scope_key)
+    age = now_m - _FUNDS_CACHE_MONO.get(scope_key, 0.0)
+
+    if not force and cached and cached.get("available_funds") is not None:
+        if age < _FUNDS_CACHE_TTL:
+            return {**cached, "cache_hit": True}
+        # Stale-while-revalidate: return last verified funds immediately (<5ms) & refresh in background
+        existing_task = _FUNDS_INFLIGHT.get(scope_key)
+        if existing_task is None or existing_task.done():
+            _FUNDS_INFLIGHT[scope_key] = asyncio.create_task(_fetch_overview_funds_summary_async(allowed, scope_key))
+        return {**cached, "cache_hit": True}
 
     task = _FUNDS_INFLIGHT.get(scope_key)
     if task is None or task.done():
         task = asyncio.create_task(_fetch_overview_funds_summary_async(allowed, scope_key))
         _FUNDS_INFLIGHT[scope_key] = task
     try:
-        res = await asyncio.shield(task)
+        res = await asyncio.wait_for(asyncio.shield(task), timeout=22.0)
+    except asyncio.TimeoutError:
+        prev = cached or _FUNDS_LAST_VERIFIED.get(scope_key)
+        if prev and prev.get("available_funds") is not None:
+            return {**prev, "status": "STALE", "cache_hit": True}
+        return {
+            "status": "UNAVAILABLE",
+            "available_funds": None,
+            "utilized_funds": None,
+            "accounts_linked": len(allowed),
+            "accounts_succeeded": 0,
+            "accounts_failed": 0,
+            "accounts": [],
+            "error": "Still fetching Zebu Limits in background — refresh in a few seconds",
+            "cache_hit": False,
+        }
     finally:
         if _FUNDS_INFLIGHT.get(scope_key) is task and task.done():
             _FUNDS_INFLIGHT.pop(scope_key, None)
@@ -2816,6 +2976,30 @@ def _extract_zebu_config_patch(acc: dict, data: dict) -> dict:
         "proxy_url": acc.get("proxy_url"),
     }
     return patch
+
+
+@app.post("/api/accounts/reconnect-all")
+async def reconnect_all_accounts_endpoint(_=Depends(admin_only)):
+    """Master reconnect: starts reconnecting every Zebu account one by one in the background
+    (returns immediately so proxy timeouts never occur even with 50+ accounts)."""
+    if not _RECONNECT_ALL_STATUS.get("running"):
+        all_accs = await DB.get_all_accounts_async()
+        zebu_cnt = sum(1 for a in all_accs if (a.get("broker") or "") == "Zebu")
+        _RECONNECT_ALL_STATUS.update({
+            "running": True,
+            "processed": 0,
+            "total": zebu_cnt,
+            "connected": 0,
+            "skipped": 0,
+            "failed": 0,
+        })
+        asyncio.create_task(reconnect_all_zebu_accounts_async(reason="manual"))
+    return {"ok": True, "started": True, **_RECONNECT_ALL_STATUS}
+
+
+@app.get("/api/accounts/reconnect-all/status")
+async def reconnect_all_accounts_status(_=Depends(admin_only)):
+    return {"ok": True, **_RECONNECT_ALL_STATUS}
 
 
 @app.post("/api/accounts/{aid}/zebu-config")

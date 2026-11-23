@@ -97,18 +97,21 @@ class MarketScheduler:
         get_settings_fn: Callable[[], Any],
         finalize_eod_fn: Optional[Callable[[datetime], Coroutine[Any, Any, Any]]] = None,
         midnight_archive_fn: Optional[Callable[[datetime], Coroutine[Any, Any, Any]]] = None,
+        morning_reconnect_fn: Optional[Callable[[datetime], Coroutine[Any, Any, Any]]] = None,
     ):
         self.poll_fn = poll_fn
         self.summary_fn = summary_fn
         self.get_settings_fn = get_settings_fn
         self.finalize_eod_fn = finalize_eod_fn
         self.midnight_archive_fn = midnight_archive_fn
+        self.morning_reconnect_fn = morning_reconnect_fn
         self.lock = DistributedLock()
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self.last_poll_time = 0.0
         self.last_eod_retry_time = 0.0
         self.last_midnight_check_date: Optional[str] = None
+        self.last_morning_reconnect_date: Optional[str] = None
 
     async def start(self):
         if self._running or CFG.DISABLE_SCHEDULER:
@@ -146,6 +149,20 @@ class MarketScheduler:
                     log.info(f"Running midnight / recovery archive check for date < {today_str} IST")
                     await self.midnight_archive_fn(now)
                     self.last_midnight_check_date = today_str
+
+                # 1b. Automatic Daily 08:45 AM IST Reconnect for all Zebu accounts (weekdays, once per day)
+                if (
+                    weekday
+                    and self.morning_reconnect_fn
+                    and self.last_morning_reconnect_date != today_str
+                    and "08:45" <= hm <= "09:14"
+                ):
+                    log.info(f"Triggering scheduled 08:45 AM IST daily reconnect for {today_str} at {hm} IST")
+                    self.last_morning_reconnect_date = today_str
+                    try:
+                        await self.morning_reconnect_fn(now)
+                    except Exception as mre:
+                        log.error(f"Scheduled 08:45 AM reconnect error: {mre}", exc_info=True)
 
                 # 2. Live Market Hours Polling (09:15 to 15:30 IST on weekdays)
                 market_open = CFG.MARKET_OPEN or "09:15"

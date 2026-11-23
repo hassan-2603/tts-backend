@@ -9,9 +9,11 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    if: ${{ secrets.CONTABO_HOST != '' }}
     steps:
       - name: Deploy & restart tts.service on Contabo
+        if: ${{ env.CONTABO_HOST != '' }}
+        env:
+          CONTABO_HOST: ${{ secrets.CONTABO_HOST }}
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.CONTABO_HOST }}

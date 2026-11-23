@@ -879,7 +879,7 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
     acc_fills = await DB._all_fills(account_id=aid)
     recent_fills = [f for f in acc_fills if f.get("_day", "") >= cutoff]
 
-    current_trades = await DB._all_trades()
+    current_trades = await DB._all_trades(from_date=now.date().isoformat(), account_id=aid)
     old_trades = {t["id"]: t for t in current_trades if t.get("account") == aid and t.get("origin") == "zebu"}
     finalized_ids = {tid for tid, t in old_trades.items() if t.get("is_finalized")}
 
@@ -1197,7 +1197,6 @@ async def poll_all_async(reason: str = "schedule", force: bool = False) -> dict:
                 log.error(f"Error during parallel poll: {item}")
 
     await DB._put_status("poll", {"last": now.isoformat(timespec="seconds"), "reason": reason, "results": results})
-    await evaluate_and_record_violations_async(now)
     await notify_expired_async(now, results)
     return results
 
@@ -1542,23 +1541,28 @@ async def get_rules_map_async() -> Dict[str, dict]:
     return res
 
 
-async def evaluate_and_record_violations_async(now: datetime, account_id: Optional[str] = None):
-    """Evaluates rules across active/historical trades, persists structured Red Flags in DB, and dispatches alerts."""
+async def evaluate_and_record_violations_async(
+    now: datetime,
+    account_id: Optional[str] = None,
+    include_historical: bool = False,
+):
+    """Evaluates rules across active trades (or full history on import), persists structured Red Flags in DB, and dispatches alerts."""
     t0 = time.perf_counter()
     today = now.date().isoformat()
     s = (await DB._get_setting("main")) or {}
     alerts_cfg = s.get("alerts") or DEFAULT_SETTINGS["alerts"]
 
-    all_trades = await DB._all_trades()
-    if account_id:
-        all_trades = [t for t in all_trades if t.get("account") == account_id or t.get("trader") == account_id]
+    all_trades = await DB._all_trades(
+        from_date=None if include_historical else today,
+        account_id=account_id,
+    )
     trades_by_id = {t["id"]: t for t in all_trades}
 
     all_traders = await DB._all_traders()
     traders_by_id = {t["id"]: t for t in all_traders}
     rules_map = await get_rules_map_async()
 
-    flags_dict = engine.check_trades(all_trades, rules_map, today_str=today)
+    flags_dict = await asyncio.to_thread(engine.check_trades, all_trades, rules_map, today_str=today)
 
     for tid, fl in flags_dict.items():
         t = trades_by_id.get(tid)
@@ -3674,7 +3678,7 @@ async def import_trades(request: Request, _=Depends(admin_only)):
                 r["qty"] = float(r.get("lots") or 1) * int(r.get("lotSize") or 1)
             items.append((r["id"], r))
         await DB._put_many_trades(items)
-        await evaluate_and_record_violations_async(now_ist())
+        await evaluate_and_record_violations_async(now_ist(), include_historical=True)
         return {"ok": True, "n": len(items)}
     except Exception as e:
         log.exception(f"Import trades error: {e}")

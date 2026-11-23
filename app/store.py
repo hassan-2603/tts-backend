@@ -1304,9 +1304,12 @@ class Store:
         from_date: Optional[str] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
+        account_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         async with AsyncSessionLocal() as session:
             stmt = select(Trade)
+            if account_id:
+                stmt = stmt.where((Trade.account_id == account_id) | (Trade.trader_id == account_id))
             if from_date:
                 # Include open positions regardless of entry date, or trades whose trade_date or exit_date >= from_date
                 stmt = stmt.where(

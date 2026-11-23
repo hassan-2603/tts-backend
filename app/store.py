@@ -811,6 +811,7 @@ class Store:
                     "ltp": float(r.ltp) if r.ltp is not None else None,
                     "realized_pnl": float(r.realized_pnl or 0),
                     "unrealized_pnl": float(r.unrealized_pnl or 0),
+                    "raw_payload": r.raw_payload,
                     "updated_at": r.updated_at.isoformat() if r.updated_at else None,
                 }
                 for r in rows

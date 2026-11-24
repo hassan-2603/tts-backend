@@ -38,27 +38,27 @@ class MockSnapshotBroker:
         self.errors: Dict[str, Exception] = {}
 
     async def position_book_snapshot_async(
-        self, token: str, uid: str, actid: str, proxy=None, timeout=None, retries=2
+        self, token: str, uid: str, actid: str, proxy=None, timeout=None, retries=2, auth_mode=None
     ) -> Tuple[Any, int, float]:
         u = uid.upper()
         if u in self.errors:
             raise self.errors[u]
         return self.position_books.get(u, []), 200, 12.5
 
-    async def position_book_async(self, token: str, uid: str, actid: str, proxy=None) -> List[dict]:
+    async def position_book_async(self, token: str, uid: str, actid: str, proxy=None, auth_mode=None) -> List[dict]:
         u = uid.upper()
         if u in self.errors:
             raise self.errors[u]
         r = self.position_books.get(u, [])
         return r if isinstance(r, list) else []
 
-    async def trade_book_async(self, token: str, uid: str, actid: str, proxy=None) -> List[dict]:
+    async def trade_book_async(self, token: str, uid: str, actid: str, proxy=None, auth_mode=None) -> List[dict]:
         u = uid.upper()
         if u in self.errors:
             raise self.errors[u]
         return list(self.trade_books.get(u, []))
 
-    async def order_book_async(self, token: str, uid: str, proxy=None) -> List[dict]:
+    async def order_book_async(self, token: str, uid: str, proxy=None, auth_mode=None) -> List[dict]:
         u = uid.upper()
         if u in self.errors:
             raise self.errors[u]

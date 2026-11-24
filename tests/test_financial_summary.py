@@ -53,6 +53,7 @@ class MockZebuPositionBook:
         proxy: Optional[str] = None,
         timeout: Optional[float] = None,
         retries: int = 2,
+        auth_mode: Optional[str] = None,
     ) -> Tuple[Any, int, float]:
         u = uid.upper()
         self.call_counts[u] = self.call_counts.get(u, 0) + 1

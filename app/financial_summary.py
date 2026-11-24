@@ -439,7 +439,8 @@ class FinancialSummaryService:
         token_resolver: Optional[Callable[[str], Coroutine[Any, Any, Optional[str]]]] = None,
         link_state_resolver: Optional[Callable[[dict], Coroutine[Any, Any, str]]] = None,
         position_persister: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
-        reauth_resolver: Optional[Callable[[str], Coroutine[Any, Any, Optional[str]]]] = None,
+        reauth_resolver: Optional[Callable[..., Coroutine[Any, Any, Optional[Any]]]] = None,
+        session_resolver: Optional[Callable[[str], Coroutine[Any, Any, Optional[Any]]]] = None,
     ):
         self.zebu = zebu
         self.conn_mgr = conn_mgr
@@ -448,6 +449,7 @@ class FinancialSummaryService:
         self.link_state_resolver = link_state_resolver
         self.position_persister = position_persister
         self.reauth_resolver = reauth_resolver
+        self.session_resolver = session_resolver
 
         # Account-isolated cache keyed by "zebu:<uid>:<actid>:<account_id>"
         self._cache: Dict[str, AccountFinancialCacheEntry] = {}
@@ -513,18 +515,38 @@ class FinancialSummaryService:
         entry = self._get_or_create_entry(aid, uid, actid)
         entry.trader_id = acc.get("trader") or entry.trader_id
 
-        # Resolve token securely server-side
-        token = await self.token_resolver(aid) if self.token_resolver else None
+        # Resolve token + auth_mode securely server-side via centralized SessionManager
+        token: Optional[str] = None
+        auth_mode: Optional[str] = None
+        if self.session_resolver:
+            sess_info = await self.session_resolver(aid)
+            if sess_info:
+                token = getattr(sess_info, "token", None)
+                auth_mode = getattr(sess_info, "auth_mode", None)
+        elif self.token_resolver:
+            token = await self.token_resolver(aid)
+
         if not token or not uid:
             lstate = await self.link_state_resolver(acc) if self.link_state_resolver else "Not linked"
-            if lstate in ("Login expired", "REAUTH_REQUIRED"):
-                entry.last_error_type = "SESSION_EXPIRED"
-                entry.last_error = "Zebu session expired — re-authorization required"
-                log.warning("FinancialSummary token expired: account=%s uid=%s", aid, uid)
-                return self._build_response(entry, acc, overall_status="REAUTH_REQUIRED", cache_hit=False)
-            entry.last_error_type = "NOT_LINKED"
-            entry.last_error = "Account is not linked to Zebu"
-            return self._build_response(entry, acc, overall_status="NOT_LINKED", cache_hit=False)
+            if lstate in ("Login expired", "REAUTH_REQUIRED", "RECONNECT_REQUIRED"):
+                # Attempt one coordinated recovery if auto-reauth is enabled
+                if self.reauth_resolver and uid:
+                    try:
+                        rec = await self.reauth_resolver(aid, failed_token=None, reason="financial_summary")
+                        if rec:
+                            token = getattr(rec, "token", rec) if not isinstance(rec, str) else rec
+                            auth_mode = getattr(rec, "auth_mode", auth_mode) if not isinstance(rec, str) else auth_mode
+                    except Exception:
+                        pass
+            if not token or not uid:
+                if lstate in ("Login expired", "REAUTH_REQUIRED", "RECONNECT_REQUIRED", "AUTH_BLOCKED"):
+                    entry.last_error_type = "SESSION_EXPIRED"
+                    entry.last_error = "Zebu session expired — re-authorization required"
+                    log.warning("FinancialSummary token expired: account=%s uid=%s", aid, uid)
+                    return self._build_response(entry, acc, overall_status="REAUTH_REQUIRED", cache_hit=False)
+                entry.last_error_type = "NOT_LINKED"
+                entry.last_error = "Account is not linked to Zebu"
+                return self._build_response(entry, acc, overall_status="NOT_LINKED", cache_hit=False)
 
         # Serve recent verified snapshot within short TTL unless forced
         now_mono = time.monotonic()
@@ -562,7 +584,7 @@ class FinancialSummaryService:
             return self._build_response(entry, acc, overall_status=None, cache_hit=False)
 
         task = asyncio.create_task(
-            self._fetch_and_validate_position_book(entry, acc, token, ensure_ws_cb=ensure_ws_cb)
+            self._fetch_and_validate_position_book(entry, acc, token, ensure_ws_cb=ensure_ws_cb, auth_mode=auth_mode)
         )
         self._in_flight[entry.cache_key] = task
         try:
@@ -578,8 +600,9 @@ class FinancialSummaryService:
         entry: AccountFinancialCacheEntry,
         acc: dict,
         token: str,
-        ensure_ws_cb: Optional[Callable[[dict, str], Coroutine[Any, Any, None]]] = None,
+        ensure_ws_cb: Optional[Callable[..., Coroutine[Any, Any, None]]] = None,
         _retried_auth: bool = False,
+        auth_mode: Optional[str] = None,
     ):
         aid = entry.account_id
         uid = entry.uid
@@ -595,6 +618,7 @@ class FinancialSummaryService:
                 uid=uid,
                 actid=actid,
                 proxy=proxy_url,
+                auth_mode=auth_mode,
             )
             entry.last_latency_ms = elapsed_ms
 
@@ -654,11 +678,13 @@ class FinancialSummaryService:
         except SessionExpired as se:
             if not _retried_auth and self.reauth_resolver:
                 try:
-                    fresh_tok = await self.reauth_resolver(aid)
+                    rec = await self.reauth_resolver(aid, failed_token=token, reason="financial_summary")
+                    fresh_tok = getattr(rec, "token", rec) if (rec and not isinstance(rec, str)) else rec
+                    fresh_mode = getattr(rec, "auth_mode", auth_mode) if (rec and not isinstance(rec, str)) else auth_mode
                     if fresh_tok:
-                        log.info("PositionBook auto-reauthenticated via QuickAuth for account=%s; retrying", aid)
+                        log.info("PositionBook recovered session via SessionManager for account=%s; retrying", aid)
                         await self._fetch_and_validate_position_book(
-                            entry, acc, fresh_tok, ensure_ws_cb=ensure_ws_cb, _retried_auth=True
+                            entry, acc, fresh_tok, ensure_ws_cb=ensure_ws_cb, _retried_auth=True, auth_mode=fresh_mode
                         )
                         return
                 except Exception as re_err:

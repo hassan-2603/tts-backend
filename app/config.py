@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     ZEBU_CLIENT_ID: str = Field(default="")
     ZEBU_SECRET_KEY: str = Field(default="")
     ZEBU_TIMEOUT: float = Field(default=20.0)
+    ZEBU_AUTO_REAUTH_ON_SESSION_EXPIRED: bool = Field(default=True)
+    ZEBU_REAUTH_COOLDOWN_SECONDS: int = Field(default=60)
+    ZEBU_REAUTH_BACKOFF_MAX_SECONDS: int = Field(default=1800)
+    ZEBU_REAUTH_EXTERNAL_CONFLICT_COOLDOWN_SECONDS: int = Field(default=180)
 
     # Concurrency & Sync Timing
     MAX_CONCURRENT_ACCOUNTS: int = Field(default=50)

@@ -15,11 +15,26 @@ import json
 import logging
 import random
 from datetime import datetime, timezone
-from typing import Callable, Coroutine, Dict, Optional, Any
+from typing import Callable, Coroutine, Dict, Optional, Any, Tuple
 import websockets
 import websockets.asyncio.client as _ws_modern
 
 log = logging.getLogger("tts.ws")
+
+_GENUINE_WS_AUTH_PHRASES = (
+    "invalid session",
+    "session expired",
+    "invalid token",
+    "token expired",
+    "invalid susertoken",
+    "invalid key",
+    "unauthorized",
+)
+
+
+def _is_genuine_ws_auth_failure(emsg: str) -> bool:
+    low = (emsg or "").strip().lower()
+    return any(p in low for p in _GENUINE_WS_AUTH_PHRASES)
 
 
 class ZebuWebSocketClient:
@@ -34,6 +49,7 @@ class ZebuWebSocketClient:
         on_touchline_update: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
         on_status_change: Optional[Callable[[str, str], Coroutine[Any, Any, None]]] = None,
         auth_mode: str = "oauth",
+        on_auth_failure: Optional[Callable[[str, str], Coroutine[Any, Any, Optional[Tuple[str, str]]]]] = None,
     ):
         self.ws_url = ws_url
         self.account_id = account_id
@@ -44,6 +60,7 @@ class ZebuWebSocketClient:
         self.on_order_update = on_order_update
         self.on_touchline_update = on_touchline_update
         self.on_status_change = on_status_change
+        self.on_auth_failure = on_auth_failure
 
         self._running = False
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
@@ -167,15 +184,27 @@ class ZebuWebSocketClient:
                     ack = json.loads(ack_raw) if isinstance(ack_raw, str) else json.loads(ack_raw.decode("utf-8"))
 
                     if ack.get("t") not in ("ak", "ck") or str(ack.get("s", "")).upper() != "OK":
-                        emsg = str(ack.get("emsg") or ack.get("s") or "Authentication failed")
-                        low = emsg.lower()
-                        log.warning(f"OAuth WebSocket handshake failed for {self.account_id}: {emsg}")
-                        if any(k in low for k in ("invalid", "expired", "unauth", "session", "token", "not_ok")):
-                            await self._set_status("REAUTH_REQUIRED", f"OAuth WS auth failed: {emsg}")
+                        emsg = str(ack.get("emsg") or ack.get("s") or "Handshake failed")
+                        log.warning(f"WebSocket handshake failed for {self.account_id}: {emsg}")
+                        if _is_genuine_ws_auth_failure(emsg):
+                            if self.on_auth_failure:
+                                try:
+                                    recovered = await self.on_auth_failure(self.account_id, self.token)
+                                    if recovered and recovered[0]:
+                                        self.token, self.auth_mode = recovered[0], (recovered[1] or self.auth_mode).strip().lower()
+                                        log.info(f"WebSocket recovered fresh token via SessionManager for {self.account_id}; reconnecting")
+                                        retry_delay = 1.0
+                                        continue
+                                except Exception as re_err:
+                                    log.warning(f"WebSocket centralized recovery failed for {self.account_id}: {re_err}")
+                            await self._set_status("REAUTH_REQUIRED", f"WS auth failed: {emsg}")
                             self._running = False
                             return
-                        await self._set_status("DEGRADED", f"Handshake failed: {emsg}")
-                        await asyncio.sleep(retry_delay)
+                        # Transient / ambiguous handshake failure (including generic Not_Ok): back off & retry without false REAUTH_REQUIRED
+                        await self._set_status("DEGRADED", f"Transient handshake failure: {emsg}")
+                        jitter = random.uniform(0.5, 1.5)
+                        await asyncio.sleep(min(retry_delay * jitter, max_delay))
+                        retry_delay = min(retry_delay * 2, max_delay)
                         continue
 
                     # 3. Connection Established

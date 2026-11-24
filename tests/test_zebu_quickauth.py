@@ -193,18 +193,22 @@ def isolated_app(tmp_path, monkeypatch):
     engine_test = create_async_engine(f"sqlite+aiosqlite:///{db_file.as_posix()}", future=True)
     session_factory = async_sessionmaker(bind=engine_test, class_=AsyncSession, expire_on_commit=False)
 
+    monkeypatch.setattr(db_mod, "async_engine", engine_test)
     monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
 
     import app.store as store_mod
     monkeypatch.setattr(store_mod, "AsyncSessionLocal", session_factory)
+
+    import app.session_manager as sm_mod
+    monkeypatch.setattr(sm_mod, "AsyncSessionLocal", session_factory)
 
     import app.main as main_mod
     monkeypatch.setattr(main_mod, "AsyncSessionLocal", session_factory)
     monkeypatch.setattr(main_mod.CFG, "RUN_WORKER_IN_PROCESS", False)
 
     # Reset caches/locks between tests
-    main_mod._quickauth_locks.clear()
-    main_mod._quickauth_last_ok.clear()
+    main_mod.SESSION_MGR._uid_locks.clear()
+    main_mod.SESSION_MGR._trackers.clear()
     main_mod._FUNDS_CACHE.clear()
     main_mod._FUNDS_CACHE_MONO.clear()
     main_mod._FUNDS_LAST_VERIFIED.clear()
@@ -316,7 +320,7 @@ def test_connect_and_sync_full_data_parity_and_restart_persistence(isolated_app,
         main_mod.ZEBU.register_token_mode("suser_live_tok_1", "quickauth")
         return {"stat": "Ok", "susertoken": "suser_live_tok_1", "uname": "TRADER ONE", "actid": "47000S19"}
 
-    async def fake_trade_book(tok, uid, actid=None, proxy=None):
+    async def fake_trade_book(tok, uid, actid=None, proxy=None, auth_mode=None):
         assert main_mod.ZEBU.get_token_mode(tok) == "quickauth"
         return [
             {
@@ -331,7 +335,7 @@ def test_connect_and_sync_full_data_parity_and_restart_persistence(isolated_app,
             },
         ]
 
-    async def fake_pos_book(tok, uid, actid=None, proxy=None):
+    async def fake_pos_book(tok, uid, actid=None, proxy=None, auth_mode=None):
         assert main_mod.ZEBU.get_token_mode(tok) == "quickauth"
         return [
             {
@@ -346,18 +350,18 @@ def test_connect_and_sync_full_data_parity_and_restart_persistence(isolated_app,
             },
         ]
 
-    async def fake_pos_snapshot(token, uid, actid=None, proxy=None):
+    async def fake_pos_snapshot(token, uid, actid=None, proxy=None, auth_mode=None):
         assert main_mod.ZEBU.get_token_mode(token) == "quickauth"
         rows = await fake_pos_book(token, uid, actid, proxy)
         return rows, json.dumps(rows), 12.0
 
-    async def fake_order_book(tok, uid, proxy=None):
+    async def fake_order_book(tok, uid, proxy=None, auth_mode=None):
         return [{"norenordno": "O1", "status": "COMPLETE", "tsym": "NIFTY26NOV26C24500", "exch": "NFO", "trantype": "B", "qty": "75", "avgprc": "120.00"}]
 
-    async def fake_sec_info(tok, uid, exch, token, proxy=None):
+    async def fake_sec_info(tok, uid, exch, token, proxy=None, auth_mode=None):
         return {"stat": "Ok", "exch": exch, "token": token, "exd": "26-NOV-2026", "tsym": "NIFTY26NOV26C24500"}
 
-    async def fake_limits(tok, uid, actid=None, proxy=None):
+    async def fake_limits(tok, uid, actid=None, proxy=None, auth_mode=None):
         assert main_mod.ZEBU.get_token_mode(tok) == "quickauth"
         return {"stat": "Ok", "cash": "500000.00", "brkcollamt": "50000.00", "payin": "0.00", "payout": "0.00", "marginused": "125000.00"}
 
@@ -431,13 +435,13 @@ def test_auto_reauth_on_session_expired_and_concurrent_dedup(isolated_app, monke
         main_mod.ZEBU.register_token_mode(tok, "quickauth")
         return {"stat": "Ok", "susertoken": tok, "uname": "TRADER ONE", "actid": uid}
 
-    async def fake_limits(tok, uid, actid=None, proxy=None):
+    async def fake_limits(tok, uid, actid=None, proxy=None, auth_mode=None):
         limits_calls["n"] += 1
         if tok == "expired_tok":
             raise SessionExpired("Session Expired : Invalid Session Key")
         return {"stat": "Ok", "cash": "300000.00", "marginused": "50000.00"}
 
-    async def fake_pos_snapshot(token, uid, actid=None, proxy=None):
+    async def fake_pos_snapshot(token, uid, actid=None, proxy=None, auth_mode=None):
         pos_calls["n"] += 1
         if token == "expired_tok":
             raise SessionExpired("Session Expired : Invalid Session Key")
@@ -465,8 +469,8 @@ def test_auto_reauth_on_session_expired_and_concurrent_dedup(isolated_app, monke
         await main_mod.DB.put_token_async("AC-01", {
             "access_token": "expired_tok",
             "auth_mode": "quickauth",
-            "status": "Linked",
-            "expires_at": time.time() + 3600,
+            "status": "Login expired",
+            "expires_at": time.time() - 60,
         })
 
         # 1. Concurrent auth deduplication (5 concurrent calls -> 1 QuickAuth broker request)
@@ -478,7 +482,7 @@ def test_auto_reauth_on_session_expired_and_concurrent_dedup(isolated_app, monke
         assert all(r["access_token"] == "fresh_qa_tok_1" for r in results)
 
         # 2. Reset token to expired_tok and clear cooldown -> test Limits auto-reauth
-        main_mod._quickauth_last_ok.clear()
+        main_mod.SESSION_MGR._trackers.clear()
         await main_mod.DB.put_token_async("AC-01", {
             "access_token": "expired_tok",
             "auth_mode": "quickauth",
@@ -492,7 +496,7 @@ def test_auto_reauth_on_session_expired_and_concurrent_dedup(isolated_app, monke
         assert limits_calls["n"] == 2  # 1st expired -> reauth -> 2nd succeeded
 
         # 3. Reset token to expired_tok -> test FinancialSummary auto-reauth
-        main_mod._quickauth_last_ok.clear()
+        main_mod.SESSION_MGR._trackers.clear()
         main_mod.FIN_SUMMARY.clear_account("AC-01")
         await main_mod.DB.put_token_async("AC-01", {
             "access_token": "expired_tok",
@@ -535,16 +539,16 @@ def test_multi_account_isolation_partial_failure(isolated_app, monkeypatch):
         main_mod.ZEBU.register_token_mode(tok, "quickauth")
         return {"stat": "Ok", "susertoken": tok, "uname": "TRADER TWO", "actid": uid}
 
-    async def fake_trade_book(tok, uid, actid=None, proxy=None):
+    async def fake_trade_book(tok, uid, actid=None, proxy=None, auth_mode=None):
         return []
 
-    async def fake_pos_book(tok, uid, actid=None, proxy=None):
+    async def fake_pos_book(tok, uid, actid=None, proxy=None, auth_mode=None):
         return []
 
-    async def fake_order_book(tok, uid, proxy=None):
+    async def fake_order_book(tok, uid, proxy=None, auth_mode=None):
         return []
 
-    async def fake_limits(tok, uid, actid=None, proxy=None):
+    async def fake_limits(tok, uid, actid=None, proxy=None, auth_mode=None):
         return {"stat": "Ok", "cash": "100000.00", "marginused": "10000.00"}
 
     monkeypatch.setattr(main_mod.ZEBU, "quick_auth_async", fake_quick_auth)

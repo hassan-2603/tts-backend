@@ -126,7 +126,7 @@ def test_03_poll_integration_getsecurityinfo_persistence_expired_and_api_failure
     sec_mode = {"fail_expired": False}
     sec_calls = []
 
-    async def mock_trade_book(token, uid, actid, proxy=None):
+    async def mock_trade_book(token, uid, actid, proxy=None, auth_mode=None):
         return [
             {"norenordno": "W1", "flid": "F1", "exch": "NFO", "token": "60001", "tsym": "NIFTY19NOV26C24500", "trantype": "B", "flqty": "25", "flprc": "100", "ls": "25", "prd": "I", "fltm": "18-11-2026 09:30:00"},
             {"norenordno": "W2", "flid": "F2", "exch": "NFO", "token": "60001", "tsym": "NIFTY19NOV26C24500", "trantype": "S", "flqty": "25", "flprc": "110", "ls": "25", "prd": "I", "fltm": "18-11-2026 09:45:00"},
@@ -134,13 +134,13 @@ def test_03_poll_integration_getsecurityinfo_persistence_expired_and_api_failure
             {"norenordno": "U2", "flid": "F4", "exch": "NFO", "token": "99999", "tsym": "UNKNOWN26NOV100CE", "trantype": "S", "flqty": "10", "flprc": "55", "ls": "10", "prd": "I", "fltm": "18-11-2026 10:15:00"},
         ]
 
-    async def mock_pos_book(token, uid, actid, proxy=None):
+    async def mock_pos_book(token, uid, actid, proxy=None, auth_mode=None):
         return []
 
-    async def mock_order_book(token, uid, proxy=None):
+    async def mock_order_book(token, uid, proxy=None, auth_mode=None):
         return []
 
-    async def mock_security_info(token, uid, exch, sym_token, proxy=None):
+    async def mock_security_info(token, uid, exch, sym_token, proxy=None, auth_mode=None):
         sec_calls.append((exch, str(sym_token)))
         if str(sym_token) == "60001":
             if sec_mode["fail_expired"]:

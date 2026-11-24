@@ -374,21 +374,10 @@ class ZebuClient:
         secret_key: str = "",
         proxy: Optional[str] = None,
     ) -> Optional[dict]:
-        """Attempts official OAuth refresh_token exchange via GenAcsTok if supported by Zebu."""
-        if not refresh_token:
-            return None
-        try:
-            r = await self.exchange_code_async(
-                code=refresh_token,
-                uid=uid,
-                client_id=client_id,
-                secret_key=secret_key,
-                proxy=proxy,
-            )
-            if isinstance(r, dict) and r.get("access_token"):
-                return r
-        except Exception as e:
-            log.debug(f"Token refresh attempt failed for {uid}: {e}")
+        """Zebu MYNT does not document a refresh_token grant for QuickAuth susertokens or GenAcsTok.
+        Do not pass refresh_token into GenAcsTok as a substitute for an undocumented endpoint."""
+        if refresh_token:
+            log.debug("Skipping refresh_token_async for %s: Zebu refresh_token endpoint is not officially documented.", uid)
         return None
 
     # ---------- Low Level Async Request with Exponential Backoff ----------
@@ -415,8 +404,12 @@ class ZebuClient:
         for attempt in range(retries + 1):
             try:
                 resp = await client.post(f"{self.base}/{api_prefix}/{endpoint}", content=body, headers=headers)
+                if resp.status_code == 401:
+                    raise SessionExpired(f"{endpoint}: HTTP 401 Unauthorized (session expired or invalid)")
                 if resp.status_code == 429:
                     raise RateLimitError("Zebu API Rate limit exceeded")
+                if resp.status_code >= 500:
+                    raise ZebuError(f"{endpoint}: HTTP {resp.status_code} server error")
                 try:
                     data = resp.json()
                 except ValueError:
@@ -427,7 +420,15 @@ class ZebuClient:
                     low = emsg.lower()
                     if "no data" in low or "no record" in low or "empty" in low or "not found" in low:
                         return []
-                    if "session" in low or ("invalid" in low and "key" in low) or "token expired" in low:
+                    if (
+                        "session expired" in low
+                        or "invalid session" in low
+                        or "invalid susertoken" in low
+                        or "token expired" in low
+                        or "invalid token" in low
+                        or ("invalid" in low and "key" in low)
+                        or "unauthorized" in low
+                    ):
                         raise SessionExpired(emsg)
                     raise ZebuError(f"{endpoint}: {emsg}")
 
@@ -569,68 +570,69 @@ class ZebuClient:
         return s[:-2] if s.endswith("_U") else s
 
     # ---------- Async Read Calls ----------
-    async def client_details_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None) -> dict:
+    async def client_details_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None, auth_mode: Optional[str] = None) -> dict:
         u = self._clean_uid(uid)
         a = self._clean_uid(actid) or u
-        return await self._post_async("ClientDetails", {"uid": u, "actid": a}, token, proxy=proxy)
+        return await self._post_async("ClientDetails", {"uid": u, "actid": a}, token, proxy=proxy, auth_mode=auth_mode)
 
-    async def trade_book_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None) -> List[dict]:
+    async def trade_book_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None, auth_mode: Optional[str] = None) -> List[dict]:
         u = self._clean_uid(uid)
         a = self._clean_uid(actid) or u
-        r = await self._post_async("TradeBook", {"uid": u, "actid": a}, token, proxy=proxy)
+        r = await self._post_async("TradeBook", {"uid": u, "actid": a}, token, proxy=proxy, auth_mode=auth_mode)
         return r if isinstance(r, list) else []
 
-    async def order_book_async(self, token: str, uid: str, proxy: Optional[str] = None) -> List[dict]:
+    async def order_book_async(self, token: str, uid: str, proxy: Optional[str] = None, auth_mode: Optional[str] = None) -> List[dict]:
         u = self._clean_uid(uid)
-        r = await self._post_async("OrderBook", {"uid": u}, token, proxy=proxy)
+        r = await self._post_async("OrderBook", {"uid": u}, token, proxy=proxy, auth_mode=auth_mode)
         return r if isinstance(r, list) else []
 
-    async def single_order_history_async(self, token: str, uid: str, norenordno: str, proxy: Optional[str] = None) -> List[dict]:
+    async def single_order_history_async(self, token: str, uid: str, norenordno: str, proxy: Optional[str] = None, auth_mode: Optional[str] = None) -> List[dict]:
         """Official Zebu SingleOrdHist endpoint: returns complete lifecycle transitions of an order."""
         u = self._clean_uid(uid)
         if not norenordno:
             return []
-        r = await self._post_async("SingleOrdHist", {"uid": u, "norenordno": str(norenordno)}, token, proxy=proxy)
+        r = await self._post_async("SingleOrdHist", {"uid": u, "norenordno": str(norenordno)}, token, proxy=proxy, auth_mode=auth_mode)
         return r if isinstance(r, list) else []
 
-    async def position_book_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None) -> List[dict]:
+    async def position_book_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None, auth_mode: Optional[str] = None) -> List[dict]:
         u = self._clean_uid(uid)
         a = self._clean_uid(actid) or u
-        r = await self._post_async("PositionBook", {"uid": u, "actid": a}, token, proxy=proxy)
+        r = await self._post_async("PositionBook", {"uid": u, "actid": a}, token, proxy=proxy, auth_mode=auth_mode)
         return r if isinstance(r, list) else []
 
-    async def limits_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None) -> dict:
-        """Official Zebu Funds & Limits endpoint (READ-ONLY): POST /NorenWClientAPI/Limits.
+    async def limits_async(self, token: str, uid: str, actid: str, proxy: Optional[str] = None, auth_mode: Optional[str] = None) -> dict:
+        """Official Zebu Funds & Limits endpoint (READ-ONLY): POST /NorenWClientAPI/Limits or NorenWClientTP/Limits.
         Returns the raw dict; raises ZebuError on malformed/non-OK responses (never coerces to zero)."""
         u = self._clean_uid(uid)
         a = self._clean_uid(actid) or u
-        r = await self._post_async("Limits", {"uid": u, "actid": a}, token, proxy=proxy)
+        r = await self._post_async("Limits", {"uid": u, "actid": a}, token, proxy=proxy, auth_mode=auth_mode)
         if not isinstance(r, dict):
             raise ZebuError(f"Limits: unexpected response type {type(r).__name__}")
         if str(r.get("stat", "")).strip().lower() != "ok":
             raise ZebuError(f"Limits: stat={r.get('stat')!r} emsg={r.get('emsg', '')}")
         return r
 
-    async def tp_series_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], st: int, et: int, intrv: str = "1", proxy: Optional[str] = None) -> List[dict]:
+    async def tp_series_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], st: int, et: int, intrv: str = "1", proxy: Optional[str] = None, auth_mode: Optional[str] = None) -> List[dict]:
         u = self._clean_uid(uid)
         r = await self._post_async(
             "TPSeries",
             {"uid": u, "exch": exch, "token": str(sym_token), "st": str(st), "et": str(et), "intrv": intrv},
             token,
             proxy=proxy,
+            auth_mode=auth_mode,
         )
         return r if isinstance(r, list) else []
 
-    async def index_list_async(self, token: str, uid: str, exch: str = "NSE", proxy: Optional[str] = None) -> List[dict]:
+    async def index_list_async(self, token: str, uid: str, exch: str = "NSE", proxy: Optional[str] = None, auth_mode: Optional[str] = None) -> List[dict]:
         u = self._clean_uid(uid)
-        r = await self._post_async("GetIndexList", {"uid": u, "exch": exch}, token, proxy=proxy)
+        r = await self._post_async("GetIndexList", {"uid": u, "exch": exch}, token, proxy=proxy, auth_mode=auth_mode)
         return (r or {}).get("values", []) if isinstance(r, dict) else []
 
-    async def quote_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], proxy: Optional[str] = None) -> dict:
+    async def quote_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], proxy: Optional[str] = None, auth_mode: Optional[str] = None) -> dict:
         u = self._clean_uid(uid)
-        return await self._post_async("GetQuotes", {"uid": u, "exch": exch, "token": str(sym_token)}, token, proxy=proxy)
+        return await self._post_async("GetQuotes", {"uid": u, "exch": exch, "token": str(sym_token)}, token, proxy=proxy, auth_mode=auth_mode)
 
-    async def security_info_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], proxy: Optional[str] = None) -> dict:
+    async def security_info_async(self, token: str, uid: str, exch: str, sym_token: Union[str, int], proxy: Optional[str] = None, auth_mode: Optional[str] = None) -> dict:
         """Official Zebu GetSecurityInfo endpoint (READ-ONLY): POST /NorenWClientAPI/GetSecurityInfo.
         Returns static contract metadata including exact broker-provided expiry date (`exd`)."""
         u = self._clean_uid(uid)
@@ -638,7 +640,7 @@ class ZebuClient:
         tok_s = str(sym_token or "").strip()
         if not exch_u or not tok_s:
             return {}
-        r = await self._post_async("GetSecurityInfo", {"uid": u, "exch": exch_u, "token": tok_s}, token, proxy=proxy)
+        r = await self._post_async("GetSecurityInfo", {"uid": u, "exch": exch_u, "token": tok_s}, token, proxy=proxy, auth_mode=auth_mode)
         return r if isinstance(r, dict) else {}
 
     # ---------- Sync Read Calls (Backward Compatibility) ----------

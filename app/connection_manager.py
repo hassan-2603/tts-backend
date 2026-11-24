@@ -94,6 +94,7 @@ class ConnectionManager:
         on_touchline: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
         on_status_change: Optional[Callable[[str, str], Coroutine[Any, Any, None]]] = None,
         auth_mode: str = "oauth",
+        on_auth_failure: Optional[Callable[[str, str], Coroutine[Any, Any, Optional[Any]]]] = None,
     ):
         """Attaches and starts a real-time WebSocket connection for an account."""
         state = self.get_account_state(account_id)
@@ -162,6 +163,7 @@ class ConnectionManager:
             on_touchline_update=_on_touchline_update,
             on_status_change=_on_status_change,
             auth_mode=norm_mode,
+            on_auth_failure=on_auth_failure,
         )
         state.ws_client = ws_client
         await ws_client.start()

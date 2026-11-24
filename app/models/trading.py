@@ -48,7 +48,7 @@ class Account(Base):
     zebu_actid = Column(String(100), nullable=True)
     zebu_client_id = Column(String(100), nullable=True)
     zebu_vc = Column(String(100), nullable=True)
-    zebu_secret_key = Column(String(200), nullable=True)
+    zebu_secret_key = Column(Text, nullable=True)  # Encrypted (backward-compatible with legacy plaintext)
     zebu_factor2_enc = Column(Text, nullable=True)  # Encrypted PAN or DOB
     zebu_password_enc = Column(Text, nullable=True)  # Encrypted Zebu password
     proxy_url = Column(String(300), nullable=True)

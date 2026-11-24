@@ -59,7 +59,7 @@ class SimulatedBrokerState:
         self.spot_price: float = 51800.0
         self.sync_call_counts: Dict[str, int] = {}
 
-    async def trade_book_async(self, token: str, uid: str, actid: str, proxy=None) -> List[dict]:
+    async def trade_book_async(self, token: str, uid: str, actid: str, proxy=None, auth_mode=None) -> List[dict]:
         u = uid.upper()
         self.sync_call_counts[u] = self.sync_call_counts.get(u, 0) + 1
         if u in self.expired_uids or token == "EXPIRED_TOK":
@@ -68,7 +68,7 @@ class SimulatedBrokerState:
             raise ZebuError("TradeBook network error: Broker gateway timeout")
         return list(self.trade_books.get(u, []))
 
-    async def position_book_async(self, token: str, uid: str, actid: str, proxy=None) -> List[dict]:
+    async def position_book_async(self, token: str, uid: str, actid: str, proxy=None, auth_mode=None) -> List[dict]:
         u = uid.upper()
         if u in self.expired_uids or token == "EXPIRED_TOK":
             raise SessionExpired("Session Expired : Invalid Session Key")
@@ -76,7 +76,7 @@ class SimulatedBrokerState:
             raise ZebuError("PositionBook network error: Broker gateway timeout")
         return list(self.position_books.get(u, []))
 
-    async def order_book_async(self, token: str, uid: str, proxy=None) -> List[dict]:
+    async def order_book_async(self, token: str, uid: str, proxy=None, auth_mode=None) -> List[dict]:
         u = uid.upper()
         if u in self.expired_uids or token == "EXPIRED_TOK":
             raise SessionExpired("Session Expired : Invalid Session Key")

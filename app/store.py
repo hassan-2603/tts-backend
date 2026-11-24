@@ -196,7 +196,7 @@ class Store:
                 "has_zebu_secret_key": bool(getattr(acc, "zebu_secret_key", None)),
                 "has_zebu_factor2": bool(getattr(acc, "zebu_factor2_enc", None)),
                 "has_zebu_password": bool(getattr(acc, "zebu_password_enc", None)),
-                "zebu_secret_key": getattr(acc, "zebu_secret_key", None),
+                "zebu_secret_key": decrypt_token(getattr(acc, "zebu_secret_key", None)),
                 "proxy_url": getattr(acc, "proxy_url", None),
                 "group_id": acc.group_id,
             }
@@ -220,7 +220,7 @@ class Store:
                 "zebu_uid": clean_uid,
                 "zebu_actid": (acc.zebu_actid or clean_uid).strip().upper(),
                 "zebu_vc": vc,
-                "zebu_secret_key": (getattr(acc, "zebu_secret_key", None) or "").strip(),
+                "zebu_secret_key": (decrypt_token(getattr(acc, "zebu_secret_key", None)) or "").strip(),
                 "zebu_factor2": (decrypt_token(getattr(acc, "zebu_factor2_enc", None)) or "").strip(),
                 "zebu_password": decrypt_token(getattr(acc, "zebu_password_enc", None)) or "",
                 "proxy_url": getattr(acc, "proxy_url", None),
@@ -243,7 +243,7 @@ class Store:
                     "has_zebu_secret_key": bool(getattr(a, "zebu_secret_key", None)),
                     "has_zebu_factor2": bool(getattr(a, "zebu_factor2_enc", None)),
                     "has_zebu_password": bool(getattr(a, "zebu_password_enc", None)),
-                    "zebu_secret_key": getattr(a, "zebu_secret_key", None),
+                    "zebu_secret_key": decrypt_token(getattr(a, "zebu_secret_key", None)),
                     "proxy_url": getattr(a, "proxy_url", None),
                     "group_id": a.group_id,
                 }
@@ -267,7 +267,7 @@ class Store:
                     if v_vc:
                         acc.zebu_vc = v_vc
                 if "zebu_secret_key" in doc and str(doc.get("zebu_secret_key") or "").strip():
-                    acc.zebu_secret_key = str(doc["zebu_secret_key"]).strip()
+                    acc.zebu_secret_key = encrypt_token(str(doc["zebu_secret_key"]).strip())
                 if "zebu_factor2" in doc and str(doc.get("zebu_factor2") or "").strip():
                     acc.zebu_factor2_enc = encrypt_token(str(doc["zebu_factor2"]).strip())
                 if "zebu_password" in doc and str(doc.get("zebu_password") or "") != "":
@@ -285,7 +285,7 @@ class Store:
                     zebu_actid=doc.get("zebu_actid"),
                     zebu_client_id=doc.get("zebu_client_id") or doc.get("zebu_uid"),
                     zebu_vc=str(doc.get("zebu_vc") or "").strip() or None,
-                    zebu_secret_key=str(doc.get("zebu_secret_key") or "").strip() or None,
+                    zebu_secret_key=encrypt_token(str(doc["zebu_secret_key"]).strip()) if str(doc.get("zebu_secret_key") or "").strip() else None,
                     zebu_factor2_enc=encrypt_token(str(doc["zebu_factor2"]).strip()) if str(doc.get("zebu_factor2") or "").strip() else None,
                     zebu_password_enc=encrypt_token(str(doc["zebu_password"])) if str(doc.get("zebu_password") or "") != "" else None,
                     proxy_url=doc.get("proxy_url"),
@@ -333,8 +333,11 @@ class Store:
             stmt = select(BrokerSession).where(BrokerSession.account_id == aid)
             bs = (await session.execute(stmt)).scalar_one_or_none()
             exp_dt = None
-            if doc.get("expires_at"):
-                exp_dt = datetime.fromtimestamp(doc["expires_at"], tz=timezone.utc) if isinstance(doc["expires_at"], (int, float)) else None
+            if doc.get("expires_at") is not None:
+                if isinstance(doc["expires_at"], datetime):
+                    exp_dt = doc["expires_at"] if doc["expires_at"].tzinfo else doc["expires_at"].replace(tzinfo=timezone.utc)
+                elif isinstance(doc["expires_at"], (int, float)):
+                    exp_dt = datetime.fromtimestamp(doc["expires_at"], tz=timezone.utc)
 
             linked_dt = None
             if doc.get("linked_at"):
@@ -363,7 +366,7 @@ class Store:
                     bs.refresh_token_enc = ref_token_enc
                 if doc.get("auth_mode"):
                     bs.auth_mode = str(doc["auth_mode"]).strip().lower()
-                if exp_dt is not None:
+                if "expires_at" in doc:
                     bs.expires_at = exp_dt
                 if linked_dt is not None:
                     bs.linked_at = linked_dt
@@ -1762,7 +1765,7 @@ class Store:
                     "access_token": decrypt_token(bs.access_token_enc),
                     "refresh_token": decrypt_token(bs.refresh_token_enc),
                     "auth_mode": getattr(bs, "auth_mode", None) or "oauth",
-                    "expires_at": bs.expires_at.timestamp() if bs.expires_at else None,
+                    "expires_at": (bs.expires_at.replace(tzinfo=timezone.utc) if bs.expires_at.tzinfo is None else bs.expires_at).timestamp() if bs.expires_at else None,
                     "linked_at": bs.linked_at.isoformat() if bs.linked_at else None,
                     "last_sync_at": bs.last_sync_at.isoformat() if getattr(bs, "last_sync_at", None) else None,
                     "cliname": bs.cliname,

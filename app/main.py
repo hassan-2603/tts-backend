@@ -64,6 +64,7 @@ from app.alerts import Alerter
 from app.notifications import NotificationEngine, verify_whatsapp_signature
 from app.connection_manager import ConnectionManager
 from app.financial_summary import FinancialSummaryService, compute_mynt_position_row_pnl
+from app.session_manager import BrokerSessionManager, BrokerSessionInfo
 from app.scheduler import MarketScheduler, now_ist, IST
 from app.metrics import METRICS
 from app import engine
@@ -77,6 +78,7 @@ ZEBU = ZebuClient(CFG.ZEBU_BASE_URL, CFG.ZEBU_CLIENT_ID, CFG.ZEBU_SECRET_KEY, ti
 ALERT = Alerter(dict(os.environ))
 NOTIF = NotificationEngine()
 CONN_MGR = ConnectionManager(ZEBU)
+SESSION_MGR = BrokerSessionManager(db=DB, zebu=ZEBU, conn_mgr=CONN_MGR, now_ist_fn=now_ist)
 
 DEFAULT_SETTINGS = {
     "dataSource": "live",
@@ -361,6 +363,14 @@ async def _ensure_account_ws_stream(acc: dict, token: str, auth_mode: Optional[s
     async def _on_status_change(new_status: str, _msg: str, account_id=aid, a=acc):
         await FIN_SUMMARY.on_ws_status_change(account_id, new_status, acc=a)
 
+    async def _on_ws_auth_failure(account_id: str, failed_tok: str):
+        rec = await SESSION_MGR.recover_expired_session(
+            account_id, failed_token=failed_tok, reason="ws_auth_failure"
+        )
+        if rec and rec.token:
+            return (rec.token, rec.auth_mode)
+        return None
+
     await CONN_MGR.register_account_stream(
         account_id=aid,
         uid=uid,
@@ -370,7 +380,11 @@ async def _ensure_account_ws_stream(acc: dict, token: str, auth_mode: Optional[s
         on_touchline=_on_touchline,
         on_status_change=_on_status_change,
         auth_mode=resolved_mode,
+        on_auth_failure=_on_ws_auth_failure,
     )
+
+
+SESSION_MGR.ws_sync_cb = _ensure_account_ws_stream
 
 
 async def _user_allowed_scope_async(user: dict) -> Optional[Dict[str, set]]:
@@ -427,186 +441,25 @@ def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
 
 
 async def token_for_account_async(acc_id: str) -> Optional[str]:
-    """Returns valid access token for the account (checking both account.id and zebu_uid)."""
-    async with AsyncSessionLocal() as session:
-        stmt = select(BrokerSession).where(BrokerSession.account_id == acc_id)
-        bs = (await session.execute(stmt)).scalar_one_or_none()
-        if not bs or not bs.access_token_enc:
-            acc_stmt = select(Account).where((Account.id == acc_id) | (Account.zebu_uid == acc_id))
-            cur_acc = (await session.execute(acc_stmt)).scalars().first()
-            if cur_acc and cur_acc.zebu_uid:
-                match_stmt = (
-                    select(BrokerSession)
-                    .join(Account, Account.id == BrokerSession.account_id)
-                    .where(
-                        (Account.zebu_uid == cur_acc.zebu_uid) | (BrokerSession.account_id == cur_acc.zebu_uid),
-                        BrokerSession.access_token_enc.isnot(None),
-                    )
-                )
-                bs = (await session.execute(match_stmt)).scalars().first()
-        if not bs or not bs.access_token_enc:
-            return None
-        if bs.status in ("Not linked", "Disconnected"):
-            return None
-        exp = ensure_utc(bs.expires_at)
-        if bs.status in ("Login expired", "REAUTH_REQUIRED") or (exp and exp < datetime.now(timezone.utc)):
-            # Auto-renew expired session using saved QuickAuth credentials so accounts stay linked until manually disconnected
-            try:
-                creds = await DB.get_account_credentials_async(acc_id)
-                if creds and creds.get("zebu_uid") and creds.get("zebu_factor2") and creds.get("zebu_password") and (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY):
-                    res_qa = await authenticate_zebu_quickauth_async(acc_id, force=True)
-                    if res_qa and res_qa.get("ok") and res_qa.get("token"):
-                        return res_qa["token"]
-            except Exception as _re:
-                log.debug(f"Auto-renew token skipped for {acc_id}: {_re}")
-            return None
-        tok_plain = decrypt_token(bs.access_token_enc)
-        if tok_plain:
-            ZEBU.register_token_mode(tok_plain, getattr(bs, "auth_mode", None) or "oauth")
-        return tok_plain
-
-
-# Per-account locks & cooldown timestamps to prevent concurrent duplicate QuickAuth logins
-_quickauth_locks: Dict[str, asyncio.Lock] = {}
-_quickauth_last_ok: Dict[str, float] = {}
-
-
-def _get_quickauth_lock(aid: str) -> asyncio.Lock:
-    lk = _quickauth_locks.get(aid)
-    if lk is None:
-        lk = asyncio.Lock()
-        _quickauth_locks[aid] = lk
-    return lk
+    """Returns valid access token for the account via centralized BrokerSessionManager
+    without triggering unsolicited QuickAuth calls."""
+    sess = await SESSION_MGR.get_valid_session(acc_id)
+    return sess.token if sess else None
 
 
 async def authenticate_zebu_quickauth_async(aid: str, force: bool = False) -> Dict[str, Any]:
-    """Authenticates an account server-side via official Zebu NorenWClientTP/QuickAuth.
-
-    - Uses per-account locking to prevent concurrent duplicate logins.
-    - Reuses freshly authenticated sessions unless `force=True`.
-    - Persists encrypted `susertoken` in `broker_sessions` with `auth_mode='quickauth'`.
-    - Updates any account rows sharing the same `zebu_uid` and starts the WebSocket stream.
-    """
-    lock = _get_quickauth_lock(aid)
-    async with lock:
-        if not force and (time.monotonic() - _quickauth_last_ok.get(aid, 0.0)) < 30.0:
-            existing_tok = await token_for_account_async(aid)
-            if existing_tok:
-                tok_doc = await DB.get_token_async(aid)
-                return {
-                    "ok": True,
-                    "access_token": existing_tok,
-                    "cliname": (tok_doc or {}).get("cliname"),
-                    "auth_mode": (tok_doc or {}).get("auth_mode") or "quickauth",
-                    "reused": True,
-                }
-
-        creds = await DB.get_account_credentials_async(aid)
-        if not creds:
-            raise ZebuError(f"Account '{aid}' not found")
-
-        uid = creds.get("zebu_uid") or ""
-        vc = creds.get("zebu_vc") or (f"{uid}_U" if uid else "")
-        factor2 = creds.get("zebu_factor2") or ""
-        api_secret = creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY or ""
-        password = creds.get("zebu_password") or ""
-        proxy_url = creds.get("proxy_url")
-
-        missing = []
-        if not uid:
-            missing.append("Zebu User ID (UID)")
-        if not vc:
-            missing.append("Vendor Code (VC)")
-        if not factor2:
-            missing.append("Two Factor (PAN or DOB)")
-        if not api_secret:
-            missing.append("Secret App Key")
-        if not password:
-            missing.append("Password")
-        if missing:
-            raise ZebuError(f"Missing Zebu QuickAuth credentials: {', '.join(missing)}")
-
-        res = await ZEBU.quick_auth_async(
-            uid=uid,
-            password=password,
-            factor2=factor2,
-            vc=vc,
-            api_secret=api_secret,
-            proxy=proxy_url,
-        )
-
-        susertoken = str(res["susertoken"]).strip()
-        clean_uid = ZEBU._clean_uid(res.get("uid") or uid)
-        clean_actid = ZEBU._clean_uid(res.get("actid") or creds.get("zebu_actid") or clean_uid)
-        cliname = res.get("uname") or res.get("cliname") or res.get("dname") or None
-
-        ZEBU.register_token_mode(susertoken, "quickauth")
-
-        doc = {
-            "access_token": susertoken,
-            "refresh_token": None,
-            "auth_mode": "quickauth",
-            "expires_at": time.time() + 86400 * 3650,
-            "linked_at": now_ist().isoformat(timespec="seconds"),
-            "status": "Linked",
-            "ws_status": "REAL-TIME",
-            "cliname": cliname,
-            "sync_message": "Connected via Zebu QuickAuth",
-        }
-        await DB.put_token_async(aid, doc)
-
-        all_acc = await DB.get_all_accounts_async()
-        for a_row in all_acc:
-            if a_row["id"] == aid or (clean_uid and ZEBU._clean_uid(a_row.get("zebu_uid")) == clean_uid):
-                await DB.put_token_async(a_row["id"], doc)
-                await DB.put_sync_state_async(a_row["id"], {
-                    "status": "LIVE",
-                    "is_stale": False,
-                    "last_error": None,
-                    "consecutive_failures": 0,
-                    "circuit_open": False,
-                })
-                st_obj = CONN_MGR.get_account_state(a_row["id"])
-                st_obj.record_success()
-                st_obj.status = "REAL-TIME"
-
-        acc_updated = await DB.get_account_async(aid)
-        if acc_updated:
-            acc_updated["zebu_uid"] = clean_uid
-            acc_updated["zebu_actid"] = clean_actid
-            await DB.put_account_async(aid, acc_updated)
-            await _ensure_account_ws_stream(acc_updated, susertoken, auth_mode="quickauth")
-
-        _quickauth_last_ok[aid] = time.monotonic()
-        log.info("Zebu QuickAuth succeeded for account=%s uid=%s actid=%s", aid, clean_uid, clean_actid)
-        return {
-            "ok": True,
-            "access_token": susertoken,
-            "cliname": cliname,
-            "auth_mode": "quickauth",
-            "uid": clean_uid,
-            "actid": clean_actid,
-            "reused": False,
-        }
+    """Delegates to centralized BrokerSessionManager.authenticate_once() (single-flight per zebu_uid)."""
+    return await SESSION_MGR.authenticate_once(aid, reason="manual", force=force)
 
 
-async def reauth_account_quickauth_async(aid: str) -> Optional[str]:
-    """Best-effort automatic QuickAuth reauthentication when a session expires.
-    Returns fresh susertoken on success, or None if QuickAuth credentials are not saved or login fails."""
-    try:
-        creds = await DB.get_account_credentials_async(aid)
-        if not creds or not (
-            creds.get("zebu_uid")
-            and creds.get("zebu_factor2")
-            and creds.get("zebu_password")
-            and (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY)
-        ):
-            return None
-        res = await authenticate_zebu_quickauth_async(aid, force=True)
-        return res.get("access_token") if res and res.get("ok") else None
-    except Exception as e:
-        log.warning("Automatic QuickAuth reauthentication failed for account=%s: %s", aid, e)
-        return None
+async def reauth_account_quickauth_async(
+    aid: str,
+    failed_token: Optional[str] = None,
+    reason: str = "session_expired",
+) -> Optional[str]:
+    """Best-effort coordinated recovery via BrokerSessionManager when a session genuinely expires."""
+    rec = await SESSION_MGR.recover_expired_session(aid, failed_token=failed_token, reason=reason)
+    return rec.token if rec else None
 
 
 async def any_token_async() -> Tuple[Optional[str], Optional[str]]:
@@ -672,20 +525,17 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
     await DB.put_sync_state_async(aid, {"last_sync_start": now_utc})
 
     tok_doc = await DB.get_token_async(aid)
-    tok = await token_for_account_async(aid)
-    if not tok:
+    sess = await SESSION_MGR.get_valid_session(aid)
+    if not sess:
         status_str = (tok_doc or {}).get("status") or "Not linked"
-        # Auto-reauthenticate via saved QuickAuth credentials when session expired or forced
-        if not _auth_retried and (status_str in ("Login expired", "REAUTH_REQUIRED") or force):
-            fresh_tok = await reauth_account_quickauth_async(aid)
-            if fresh_tok:
-                tok = fresh_tok
-                tok_doc = await DB.get_token_async(aid)
-    if not tok:
+        # One coordinated recovery attempt via SessionManager if session expired (never for manually disconnected)
+        if not _auth_retried and status_str in ("Login expired", "REAUTH_REQUIRED", "RECONNECT_REQUIRED"):
+            sess = await SESSION_MGR.recover_expired_session(aid, failed_token=None, reason="poll_precheck")
+    if not sess:
         status_str = (tok_doc or {}).get("status") or "Not linked"
-        if status_str in ("Login expired", "REAUTH_REQUIRED"):
+        if status_str in ("Login expired", "REAUTH_REQUIRED", "RECONNECT_REQUIRED", "AUTH_BLOCKED"):
             await DB.put_sync_state_async(aid, {
-                "status": "REAUTH_REQUIRED",
+                "status": "AUTH_BLOCKED" if status_str == "AUTH_BLOCKED" else "REAUTH_REQUIRED",
                 "is_stale": True,
                 "last_error": "Session expired — reauthorization required",
             })
@@ -693,19 +543,21 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
         await DB.put_sync_state_async(aid, {"status": "DISCONNECTED", "is_stale": False})
         return "not_linked"
 
+    tok = sess.token
+    auth_mode = sess.auth_mode
     uid, actid = acc.get("zebu_uid"), acc.get("zebu_actid") or acc.get("zebu_uid")
     proxy_url = acc.get("proxy_url")
 
     try:
         # Fetch TradeBook, PositionBook, and OrderBook concurrently from actual broker API
         fills_res, positions_res, orders_res = await asyncio.gather(
-            ZEBU.trade_book_async(tok, uid, actid, proxy=proxy_url),
-            ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url),
-            ZEBU.order_book_async(tok, uid, proxy=proxy_url),
+            ZEBU.trade_book_async(tok, uid, actid, proxy=proxy_url, auth_mode=auth_mode),
+            ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url, auth_mode=auth_mode),
+            ZEBU.order_book_async(tok, uid, proxy=proxy_url, auth_mode=auth_mode),
             return_exceptions=True,
         )
-        # Check if primary endpoints (TradeBook or PositionBook) raised SessionExpired
-        for r in (fills_res, positions_res):
+        # Check ALL three endpoints (including OrderBook) for genuine SessionExpired
+        for r in (fills_res, positions_res, orders_res):
             if isinstance(r, SessionExpired):
                 raise r
 
@@ -720,61 +572,21 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
         orders = orders_res if isinstance(orders_res, list) else []
 
     except SessionExpired as se:
-        # 1. Attempt automatic QuickAuth reauthentication using saved credentials (once per sync)
+        # Single coordinated recovery path via BrokerSessionManager (zero duplicate QuickAuth calls)
         if not _auth_retried:
-            fresh_tok = await reauth_account_quickauth_async(aid)
-            if fresh_tok:
-                log.info(f"Automatically reauthenticated account {aid} via Zebu QuickAuth; retrying sync")
+            recovered = await SESSION_MGR.recover_expired_session(
+                aid, failed_token=tok, reason="poll_session_expired"
+            )
+            if recovered and recovered.token:
+                log.info(f"Recovered expired session for account {aid} via SessionManager; retrying sync")
                 return await poll_account_async(acc, now, force=force, reconcile_today=reconcile_today, _auth_retried=True)
 
-        # 2. Fallback: attempt OAuth refresh_token exchange if available
-        ref_tok = (tok_doc or {}).get("refresh_token")
-        # Try silent QuickAuth re-login first so linked accounts stay linked forever until manually disconnected
-        if not _auth_retried:
-            try:
-                creds = await DB.get_account_credentials_async(aid)
-                if creds and creds.get("zebu_uid") and creds.get("zebu_factor2") and creds.get("zebu_password") and (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY):
-                    qa_res = await authenticate_zebu_quickauth_async(aid, force=True)
-                    if qa_res and qa_res.get("ok"):
-                        log.info(f"Automatically re-authenticated QuickAuth session for account {aid}")
-                        return await poll_account_async(acc, now, force=force, reconcile_today=reconcile_today, _auth_retried=True)
-            except Exception as _qae:
-                log.debug(f"Auto QuickAuth retry failed for {aid}: {_qae}")
-
-        refreshed = None
-        if ref_tok and not _auth_retried:
-            refreshed = await ZEBU.refresh_token_async(
-                refresh_token=ref_tok,
-                uid=uid or "",
-                client_id=acc.get("zebu_client_id") or uid or CFG.ZEBU_CLIENT_ID,
-                secret_key=acc.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY,
-                proxy=proxy_url,
-            )
-        if refreshed and refreshed.get("access_token"):
-            log.info(f"Automatically refreshed expired token for account {aid}")
-            await DB.put_token_async(aid, {
-                "access_token": refreshed["access_token"],
-                "refresh_token": refreshed.get("refresh_token") or ref_tok,
-                "auth_mode": "oauth",
-                "status": "Linked",
-                "last_sync_at": now_utc,
-                "sync_message": "Token auto-refreshed",
-            })
-            return await poll_account_async(acc, now, force=force, reconcile_today=reconcile_today, _auth_retried=True)
-
         log.warning(f"Zebu session expired for account {aid}: {se}")
-        await DB.put_token_async(aid, {
-            "status": "Login expired",
-            "ws_status": "REAUTH_REQUIRED",
-            "sync_message": f"Session expired: {se}",
-        })
-        await DB.put_sync_state_async(aid, {
-            "status": "REAUTH_REQUIRED",
-            "is_stale": True,
-            "last_error": f"Broker session expired: {se}. Please re-authorize account.",
-        })
-        conn_st = CONN_MGR.get_account_state(aid)
-        conn_st.status = "REAUTH_REQUIRED"
+        cur_sync_st = (await DB.get_sync_state_async(aid)) or {}
+        if str(cur_sync_st.get("status") or "").upper() not in ("AUTH_BLOCKED", "STALE"):
+            await SESSION_MGR.invalidate_session_state(
+                aid, status="REAUTH_REQUIRED", error_msg=f"Broker session expired: {se}"
+            )
         raise SessionExpired(str(se))
 
     except Exception as e:
@@ -1994,63 +1806,28 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
             async with reconn_sem:
                 _RECONNECT_ALL_STATUS["current"] = aid
                 try:
-                    creds = await DB.get_account_credentials_async(aid)
-                    if not creds or not (
-                        creds.get("zebu_uid")
-                        and creds.get("zebu_factor2")
-                        and creds.get("zebu_password")
-                        and (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY)
-                    ):
-                        skipped += 1
-                        results.append({"account_id": aid, "name": name, "status": "skipped", "reason": "Incomplete credentials"})
+                    # Lightweight keepalive / morning health check: NEVER calls QuickAuth on valid sessions!
+                    if reason != "manual":
+                        hc = await SESSION_MGR.health_check_session(aid, recover_if_expired=True)
+                        if hc == "valid":
+                            already_linked += 1
+                            results.append({"account_id": aid, "name": name, "status": "already_linked"})
+                        elif hc == "recovered":
+                            connected += 1
+                            results.append({"account_id": aid, "name": name, "status": "connected", "sync": "recovered"})
+                        else:
+                            skipped += 1
+                            results.append({"account_id": aid, "name": name, "status": "skipped", "reason": hc})
                         return
 
-                    uid = ZEBU._clean_uid(creds["zebu_uid"])
-                    vc = (creds.get("zebu_vc") or "").strip() or f"{uid}_U"
-                    api_secret = (creds.get("zebu_secret_key") or CFG.ZEBU_SECRET_KEY or "").strip()
-                    res = await asyncio.wait_for(
-                        ZEBU.quick_auth_async(
-                            uid=uid,
-                            password=creds["zebu_password"],
-                            factor2=creds["zebu_factor2"],
-                            vc=vc,
-                            api_secret=api_secret,
-                            proxy=creds.get("proxy_url"),
-                        ),
-                        timeout=15.0,
-                    )
-                    susertoken = str(res.get("susertoken") or "").strip()
-                    if not susertoken:
+                    auth_res = await SESSION_MGR.authenticate_once(aid, reason="manual", force=False)
+                    if not auth_res or not auth_res.get("ok"):
                         failed += 1
-                        results.append({"account_id": aid, "name": name, "status": "skipped", "reason": "No token returned"})
+                        results.append({"account_id": aid, "name": name, "status": "skipped", "reason": "Auth returned not ok"})
                         return
-
-                    cliname = str(res.get("uname") or res.get("cliname") or name).strip()
-                    ZEBU.register_token_mode(susertoken, "quickauth")
-                    now_utc = datetime.now(timezone.utc)
-                    await DB.put_token_async(aid, {
-                        "access_token": susertoken,
-                        "auth_mode": "quickauth",
-                        "expires_at": time.time() + 86400 * 3650,
-                        "linked_at": now_utc,
-                        "cliname": cliname,
-                        "status": "Linked",
-                        "last_sync_at": now_utc,
-                        "sync_message": f"Reconnected ({reason})",
-                    })
-                    await DB.put_sync_state_async(aid, {
-                        "status": "LINKED",
-                        "is_stale": False,
-                        "last_error": None,
-                    })
-                    fresh_acc = await DB.get_account_async(aid) or acc
-                    if CFG.RUN_WORKER_IN_PROCESS:
-                        try:
-                            await _ensure_account_ws_stream(fresh_acc, susertoken, auth_mode="quickauth")
-                        except Exception as wse:
-                            log.warning(f"WS stream notice after reconnect for {aid}: {wse}")
 
                     connected += 1
+                    fresh_acc = await DB.get_account_async(aid) or acc
                     sync_note = "connected"
                     try:
                         sync_res = await asyncio.wait_for(poll_account_async(fresh_acc, now_ist(), force=True), timeout=15.0)
@@ -2063,11 +1840,6 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
                     failed += 1
                     err_msg = str(e)[:180]
                     log.warning(f"Reconnect-all skipped {aid} ({name}): {err_msg}")
-                    if any(w in err_msg.lower() for w in ("blocked", "invalid password", "invalid input", "invalid app key", "wrong")):
-                        try:
-                            await DB.put_sync_state_async(aid, {"status": "AUTH_BLOCKED", "is_stale": True, "last_error": err_msg})
-                        except Exception:
-                            pass
                     results.append({"account_id": aid, "name": name, "status": "skipped", "reason": err_msg})
                 finally:
                     processed_cnt += 1
@@ -2156,10 +1928,7 @@ async def lifespan(app: FastAPI):
             try:
                 await CONN_MGR.start()
                 all_accounts = await DB.get_all_accounts_async()
-                for acc in all_accounts:
-                    tok = await token_for_account_async(acc["id"])
-                    if tok and acc.get("zebu_uid"):
-                        await _ensure_account_ws_stream(acc, tok)
+                await SESSION_MGR.restore_sessions_on_startup(all_accounts)
                 now_s = now_ist()
                 if (9, 15) <= (now_s.hour, now_s.minute) <= (15, 45):
                     asyncio.create_task(poll_all_async("startup"))
@@ -2276,7 +2045,8 @@ FIN_SUMMARY = FinancialSummaryService(
     token_resolver=token_for_account_async,
     link_state_resolver=link_state,
     position_persister=DB.replace_account_positions_snapshot_async,
-    reauth_resolver=reauth_account_quickauth_async,
+    reauth_resolver=SESSION_MGR.recover_expired_session,
+    session_resolver=SESSION_MGR.get_valid_session,
 )
 
 
@@ -2394,22 +2164,24 @@ async def _fetch_overview_funds_summary_async(accounts: List[dict], scope_key: s
     tok_by_acc: Dict[str, dict] = {t["account"]: t for t in all_tok_list if t.get("account")}
     now_ts = time.time()
 
-    linked: List[Tuple[str, dict, str]] = []
+    linked: List[Tuple[str, dict, str, str]] = []
     reauth_candidates: List[Tuple[str, dict]] = []
     for key, a in unique_accounts.items():
         aid = a["id"]
         uid = (a.get("zebu_uid") or "").strip().upper()
         td = tok_by_acc.get(aid) or (tok_by_acc.get(uid) if uid else None)
         tok = None
+        mode = "oauth"
         if td and td.get("access_token"):
             st = td.get("status") or "Linked"
             exp = td.get("expires_at")
-            if st not in ("Not linked", "Disconnected", "Login expired", "REAUTH_REQUIRED") and (not exp or float(exp) >= now_ts):
+            if st not in ("Not linked", "Disconnected", "Login expired", "REAUTH_REQUIRED", "RECONNECT_REQUIRED", "AUTH_BLOCKED") and (not exp or float(exp) >= now_ts):
                 tok = td["access_token"]
-                ZEBU.register_token_mode(tok, td.get("auth_mode") or "oauth")
+                mode = (td.get("auth_mode") or "oauth").strip().lower()
+                ZEBU.register_token_mode(tok, mode)
         if tok:
-            linked.append((key, a, tok))
-        elif td and td.get("status") in ("Login expired", "REAUTH_REQUIRED"):
+            linked.append((key, a, tok, mode))
+        elif td and td.get("status") in ("Login expired", "REAUTH_REQUIRED", "RECONNECT_REQUIRED"):
             reauth_candidates.append((key, a))
 
     if reauth_candidates:
@@ -2418,8 +2190,11 @@ async def _fetch_overview_funds_summary_async(accounts: List[dict], scope_key: s
         async def _try_reauth(key: str, a: dict):
             async with reauth_sem:
                 try:
-                    t_new = await asyncio.wait_for(reauth_account_quickauth_async(a["id"]), timeout=15.0)
-                    return (key, a, t_new) if t_new else None
+                    rec = await asyncio.wait_for(
+                        SESSION_MGR.recover_expired_session(a["id"], failed_token=None, reason="overview_funds"),
+                        timeout=15.0,
+                    )
+                    return (key, a, rec.token, rec.auth_mode) if (rec and rec.token) else None
                 except Exception:
                     return None
 
@@ -2430,20 +2205,30 @@ async def _fetch_overview_funds_summary_async(accounts: List[dict], scope_key: s
 
     funds_sem = asyncio.Semaphore(20)
 
-    async def _fetch_one(key: str, acc: dict, tok: str):
+    async def _fetch_one(key: str, acc: dict, tok: str, mode: str):
         u = ZEBU._clean_uid(acc.get("zebu_uid"))
         act = ZEBU._clean_uid(acc.get("zebu_actid") or u)
         async with funds_sem:
             try:
-                raw = await asyncio.wait_for(ZEBU.limits_async(tok, u, act, proxy=acc.get("proxy_url")), timeout=12.0)
+                raw = await asyncio.wait_for(ZEBU.limits_async(tok, u, act, proxy=acc.get("proxy_url"), auth_mode=mode), timeout=12.0)
                 parsed = _compute_account_funds_from_limits(raw)
                 return key, acc, parsed
             except SessionExpired as se:
+                rec = await SESSION_MGR.recover_expired_session(acc["id"], failed_token=tok, reason="overview_funds")
+                if rec and rec.token:
+                    try:
+                        raw2 = await asyncio.wait_for(
+                            ZEBU.limits_async(rec.token, u, act, proxy=acc.get("proxy_url"), auth_mode=rec.auth_mode),
+                            timeout=12.0,
+                        )
+                        return key, acc, _compute_account_funds_from_limits(raw2)
+                    except Exception as e2:
+                        return key, acc, {"ok": False, "error": str(e2)[:200], "error_type": "BROKER_ERROR"}
                 return key, acc, {"ok": False, "error": f"Session expired: {se}", "error_type": "SESSION_EXPIRED"}
             except Exception as e:
                 return key, acc, {"ok": False, "error": str(e)[:200], "error_type": "BROKER_ERROR"}
 
-    results = await asyncio.gather(*[_fetch_one(k, a, t) for k, a, t in linked])
+    results = await asyncio.gather(*[_fetch_one(k, a, t, m) for k, a, t, m in linked])
 
     total_avail = Decimal("0")
     total_util = Decimal("0")
@@ -3314,39 +3099,21 @@ async def save_manual_token(aid: str, request: Request, _=Depends(admin_only)):
     except Exception as e:
         log.warning(f"Token validation note for {aid}: {e}")
 
-    doc = {
-        "access_token": final_token,
-        "refresh_token": refresh_token,
-        "expires_at": time.time() + exp_in,
-        "linked_at": now_ist().isoformat(timespec="seconds"),
-        "status": "Linked",
-        "ws_status": "REAL-TIME",
-        "cliname": cliname,
-        "sync_message": "Connected to Zebu",
-    }
-    await DB.put_token_async(aid, doc)
-    # Also update any other account row sharing the same zebu_uid (e.g. AC-01 and 47000S19) and clear any old expired/stale flags
-    all_acc = await DB.get_all_accounts_async()
-    for a_row in all_acc:
-        if a_row["id"] == aid or (clean_uid and (a_row.get("zebu_uid") or "").upper() == clean_uid):
-            await DB.put_token_async(a_row["id"], doc)
-            await DB.put_sync_state_async(a_row["id"], {
-                "status": "LIVE",
-                "is_stale": False,
-                "last_error": None,
-                "consecutive_failures": 0,
-                "circuit_open": False,
-            })
-            st_obj = CONN_MGR.get_account_state(a_row["id"])
-            st_obj.record_success()
-            st_obj.status = "REAL-TIME"
-    acc["zebu_uid"] = clean_uid
-    acc["zebu_actid"] = clean_actid
-    await DB.put_account_async(aid, acc)
-
-    await _ensure_account_ws_stream(acc, final_token)
+    info = await SESSION_MGR.register_session(
+        account_id=aid,
+        token=final_token,
+        auth_mode="oauth",
+        uid=clean_uid,
+        actid=clean_actid,
+        cliname=cliname,
+        refresh_token=refresh_token,
+        expires_at=None,
+        sync_message="Connected to Zebu",
+        sync_ws=True,
+    )
+    acc = (await DB.get_account_async(aid)) or acc
     asyncio.create_task(poll_account_async(acc, now_ist()))
-    return {"ok": True, "cliname": doc.get("cliname")}
+    return {"ok": True, "cliname": info.cliname}
 
 
 @app.get("/auth/zebu/start")
@@ -3418,31 +3185,26 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
                 d = LINK_NONCE_MAP.get(latest_nonce.nonce) or {"account": latest_nonce.account_id, "exp": exp_ts}
                 n = latest_nonce.nonce
 
-    if not d or not d.get("account"):
-        all_acc = await DB.get_all_accounts_async()
-        zebu_accs = [a for a in all_acc if a.get("broker") == "Zebu"]
-        if zebu_accs:
-            d = {"account": zebu_accs[0]["id"], "exp": time.time() + 900, "frontend_url": CFG.FRONTEND_URL}
+    if not d or not d.get("account") or d.get("exp", 0) < time.time():
+        target_frontend = (d.get("frontend_url") if d else "") or fe_url or CFG.FRONTEND_URL
+        target_url = f"{target_frontend.rstrip('/')}/?linked=false#traders"
+        return HTMLResponse(
+            f"<h3>Link session expired or invalid state nonce. Refusing to link without verified account state. "
+            f"<a href='{target_url}'>Return to dashboard</a></h3>",
+            400,
+        )
 
     target_frontend = (d.get("frontend_url") if d else "") or fe_url or CFG.FRONTEND_URL
     if not target_frontend or "api.arthnetra.in" in target_frontend or "onrender.com" in target_frontend or "up.railway.app" in target_frontend or "trycloudflare.com" in target_frontend or "localhost:8000" in target_frontend or "127.0.0.1:8000" in target_frontend or "/auth" in target_frontend:
         target_frontend = CFG.FRONTEND_URL
     target_url = f"{target_frontend.rstrip('/')}/?linked=true#traders"
 
-    if not d or not d.get("account"):
-        return HTMLResponse(f"<h3>Link session expired. <a href='{target_url}'>Click here to return to dashboard</a></h3>", 400)
     if not code:
         return HTMLResponse(f"<h3>Zebu did not return a code. <a href='{target_url}'>Click here to return to dashboard</a></h3>", 400)
 
     acc = await DB.get_account_async(d["account"])
     if not acc:
-        all_acc = await DB.get_all_accounts_async()
-        zebu_accs = [a for a in all_acc if a.get("broker") == "Zebu"]
-        if zebu_accs:
-            acc = zebu_accs[0]
-            d["account"] = acc["id"]
-        else:
-            return HTMLResponse(f"<h3>No Zebu account found to link. <a href='{target_url}'>Return to dashboard</a></h3>", 404)
+        return HTMLResponse(f"<h3>Account '{d['account']}' not found. <a href='{target_url}'>Return to dashboard</a></h3>", 404)
     uid = (acc.get("zebu_uid") if acc else "") or (acc.get("zebu_actid") if acc else "")
     uid = uid.strip().upper()
     client_id = d.get("client_id") or acc.get("zebu_client_id") or uid or CFG.ZEBU_CLIENT_ID
@@ -3503,41 +3265,20 @@ async def zebu_callback(request: Request, code: str = "", state: str = ""):
     except Exception as ex:
         log.warning(f"Zebu callback ClientDetails note for {acc['id']}: {ex}")
 
-    exp_in = 86400 * 3650
-
-    doc = {
-        "access_token": tok["access_token"],
-        "refresh_token": tok.get("refresh_token"),
-        "expires_at": time.time() + exp_in,
-        "linked_at": now_ist().isoformat(timespec="seconds"),
-        "status": "Linked",
-        "ws_status": "REAL-TIME",
-        "cliname": cliname,
-        "sync_message": "Connected to Zebu",
-    }
-    await DB.put_token_async(d["account"], doc)
-    # Also update any other account row sharing the same zebu_uid (e.g. AC-01 and 47000S19) and clear any old expired/stale flags
-    all_acc = await DB.get_all_accounts_async()
-    for a_row in all_acc:
-        if a_row["id"] == acc["id"] or (clean_uid and (a_row.get("zebu_uid") or "").upper() == clean_uid):
-            await DB.put_token_async(a_row["id"], doc)
-            await DB.put_sync_state_async(a_row["id"], {
-                "status": "LIVE",
-                "is_stale": False,
-                "last_error": None,
-                "consecutive_failures": 0,
-                "circuit_open": False,
-            })
-            st_obj = CONN_MGR.get_account_state(a_row["id"])
-            st_obj.record_success()
-            st_obj.status = "REAL-TIME"
-    acc["zebu_uid"] = clean_uid
-    acc["zebu_actid"] = clean_actid
-    await DB.put_account_async(acc["id"], acc)
+    await SESSION_MGR.register_session(
+        account_id=d["account"],
+        token=tok["access_token"],
+        auth_mode="oauth",
+        uid=clean_uid,
+        actid=clean_actid,
+        cliname=cliname,
+        refresh_token=tok.get("refresh_token"),
+        expires_at=None,
+        sync_message="Connected to Zebu (OAuth)",
+        sync_ws=True,
+    )
     await DB._delete_link_nonce(n)
     LINK_NONCE_MAP.pop(n, None)
-
-    await _ensure_account_ws_stream(acc, doc["access_token"])
 
     asyncio.create_task(poll_all_async("linked"))
 

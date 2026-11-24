@@ -32,7 +32,7 @@ class MockLimitsBroker:
         self.errors: Dict[str, Exception] = {}
         self.call_counts: Dict[str, int] = {}
 
-    async def limits_async(self, token: str, uid: str, actid: str, proxy=None) -> dict:
+    async def limits_async(self, token: str, uid: str, actid: str, proxy=None, auth_mode=None) -> dict:
         u = uid.upper()
         self.call_counts[u] = self.call_counts.get(u, 0) + 1
         if u in self.errors:

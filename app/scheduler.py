@@ -151,23 +151,23 @@ class MarketScheduler:
                     await self.midnight_archive_fn(now)
                     self.last_midnight_check_date = today_str
 
-                # 1b. Self-healing keep-linked reconnect: never let previously linked accounts stay expired
-                # (runs at 08:45 AM daily and every 5 minutes if any non-manually-disconnected account expired)
+                # 1b. Controlled Morning Health Check (08:45 AM IST) & Lightweight 5-min Health Check
+                # NEVER calls QuickAuth on accounts whose existing session is valid!
                 if self.morning_reconnect_fn:
                     if weekday and self.last_morning_reconnect_date != today_str and "08:45" <= hm <= "09:14":
-                        log.info(f"Triggering scheduled 08:45 AM IST daily reconnect for {today_str} at {hm} IST")
+                        log.info(f"Triggering scheduled 08:45 AM IST morning session health check for {today_str} at {hm} IST")
                         self.last_morning_reconnect_date = today_str
                         self.last_keepalive_reconnect_time = time.time()
                         try:
                             await self.morning_reconnect_fn(now)
                         except Exception as mre:
-                            log.error(f"Scheduled 08:45 AM reconnect error: {mre}", exc_info=True)
+                            log.error(f"Scheduled 08:45 AM health check error: {mre}", exc_info=True)
                     elif time.time() - self.last_keepalive_reconnect_time >= 300:
                         self.last_keepalive_reconnect_time = time.time()
                         try:
                             await self.morning_reconnect_fn(now)
                         except Exception as mre:
-                            log.debug(f"Keepalive reconnect check error: {mre}")
+                            log.debug(f"Keepalive health check error: {mre}")
 
                 # 2. Live Market & MCX Hours Polling (09:15 to 23:54 IST on weekdays — locks at 23:55 IST)
                 market_open = CFG.MARKET_OPEN or "09:15"

@@ -38,21 +38,21 @@ class MockBrokerMulti:
         self.errors: Dict[str, Exception] = {}
         self.calls: Dict[str, int] = {}
 
-    async def trade_book_async(self, token: str, uid: str, actid: str, proxy=None) -> List[dict]:
+    async def trade_book_async(self, token: str, uid: str, actid: str, proxy=None, auth_mode=None) -> List[dict]:
         u = uid.upper()
         self.calls[f"tb:{u}"] = self.calls.get(f"tb:{u}", 0) + 1
         if u in self.errors:
             raise self.errors[u]
         return list(self.trade_books.get(u, []))
 
-    async def position_book_async(self, token: str, uid: str, actid: str, proxy=None) -> List[dict]:
+    async def position_book_async(self, token: str, uid: str, actid: str, proxy=None, auth_mode=None) -> List[dict]:
         u = uid.upper()
         self.calls[f"pb:{u}"] = self.calls.get(f"pb:{u}", 0) + 1
         if u in self.errors:
             raise self.errors[u]
         return list(self.position_books.get(u, []))
 
-    async def order_book_async(self, token: str, uid: str, proxy=None) -> List[dict]:
+    async def order_book_async(self, token: str, uid: str, proxy=None, auth_mode=None) -> List[dict]:
         u = uid.upper()
         if u in self.errors:
             raise self.errors[u]

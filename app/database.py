@@ -185,6 +185,7 @@ async def init_models(engine: AsyncEngine = None):
         # Widen variable-length order ID / rule text columns to TEXT so long multi-fill values never overflow VARCHAR
         if is_pg:
             widen_targets = [
+                ("accounts", "zebu_secret_key"),
                 ("trades", "entry_order_id"),
                 ("trades", "exit_order_id"),
                 ("trades", "parent_trade_id"),
@@ -199,7 +200,7 @@ async def init_models(engine: AsyncEngine = None):
                     text(
                         "SELECT table_name, column_name, data_type FROM information_schema.columns "
                         "WHERE table_schema = current_schema() "
-                        "AND table_name IN ('trades', 'position_lots', 'alerts')"
+                        "AND table_name IN ('accounts', 'trades', 'position_lots', 'alerts')"
                     )
                 )
                 col_types = {(r[0], r[1]): str(r[2]).lower() for r in res_w.fetchall()}

@@ -1957,22 +1957,26 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
             aid = acc["id"]
             name = acc.get("name") or aid
 
-            # Skip accounts that are already linked or were manually disconnected (when auto-reconnecting)
+            # Skip accounts that are already linked, manually disconnected, or blocked/invalid-creds (when auto-reconnecting)
             td_cur = tok_by_acc.get(aid) or {}
             if reason != "manual":
                 cur_st_doc = (await DB.get_sync_state_async(aid)) or {}
-                if td_cur.get("status") == "Disconnected" or (not td_cur and cur_st_doc.get("status") == "DISCONNECTED"):
+                cur_st_val = str(cur_st_doc.get("status") or "").upper()
+                cur_err_low = str(cur_st_doc.get("last_error") or "").lower()
+                if (
+                    td_cur.get("status") == "Disconnected"
+                    or (not td_cur and cur_st_val == "DISCONNECTED")
+                    or cur_st_val == "AUTH_BLOCKED"
+                    or any(w in cur_err_low for w in ("blocked", "invalid password", "invalid input", "invalid app key"))
+                ):
                     skipped += 1
                     processed_cnt += 1
-                    results.append({"account_id": aid, "name": name, "status": "manually_disconnected"})
+                    results.append({"account_id": aid, "name": name, "status": "skipped_protected"})
                     return
             l_state = _link_state_from_doc(td_cur)
             ws_st = CONN_MGR.get_account_state(aid).status
-            is_already_linked = (
-                (l_state == "Linked" and ws_st != "REAUTH_REQUIRED")
-                if reason == "manual"
-                else (l_state == "Linked" and ws_st == "REAL-TIME")
-            )
+            # Never re-call QuickAuth on an already-linked account just because idle WS closed after market hours
+            is_already_linked = (l_state == "Linked" and ws_st != "REAUTH_REQUIRED")
             if is_already_linked:
                 already_linked += 1
                 processed_cnt += 1
@@ -2059,6 +2063,11 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
                     failed += 1
                     err_msg = str(e)[:180]
                     log.warning(f"Reconnect-all skipped {aid} ({name}): {err_msg}")
+                    if any(w in err_msg.lower() for w in ("blocked", "invalid password", "invalid input", "invalid app key", "wrong")):
+                        try:
+                            await DB.put_sync_state_async(aid, {"status": "AUTH_BLOCKED", "is_stale": True, "last_error": err_msg})
+                        except Exception:
+                            pass
                     results.append({"account_id": aid, "name": name, "status": "skipped", "reason": err_msg})
                 finally:
                     processed_cnt += 1

@@ -2110,7 +2110,7 @@ SCHEDULER = MarketScheduler(
     get_settings_fn=get_settings_dict,
     finalize_eod_fn=finalize_eod_async,
     midnight_archive_fn=midnight_archive_async,
-    morning_reconnect_fn=lambda dt: reconnect_all_zebu_accounts_async(reason="scheduled_0845", now=dt),
+    morning_reconnect_fn=lambda dt: reconnect_all_zebu_accounts_async(reason="keepalive", now=dt),
 )
 
 

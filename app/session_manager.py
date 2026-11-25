@@ -600,8 +600,9 @@ class BrokerSessionManager:
                 })
                 return None
             if "cooldown" in low or "external mynt login conflict" in low:
+                # Keep session STALE (not REAUTH_REQUIRED) during cooldown so valid sessions are never disconnected
                 await self.db.put_sync_state_async(account_id, {
-                    "status": "REAUTH_REQUIRED",
+                    "status": "STALE",
                     "is_stale": True,
                     "last_error": err_s[:260],
                 })

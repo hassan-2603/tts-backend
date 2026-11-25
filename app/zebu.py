@@ -425,7 +425,13 @@ class ZebuClient:
             try:
                 resp = await client.post(f"{self.base}/{api_prefix}/{endpoint}", content=body, headers=headers)
                 if resp.status_code == 401:
-                    raise SessionExpired(f"{endpoint}: HTTP 401 Unauthorized (session expired or invalid)")
+                    body_snippet = (resp.text or "")[:160].strip()
+                    # Zebu's go.mynt.in gateway occasionally returns transient HTTP 401 under concurrent load
+                    # even when the token is still valid. Retry once after a short backoff before declaring SessionExpired.
+                    if attempt == 0 and retries > 0:
+                        await asyncio.sleep(0.6)
+                        continue
+                    raise SessionExpired(f"{endpoint}: HTTP 401 Unauthorized ({body_snippet or 'session expired or invalid'})")
                 if resp.status_code == 429:
                     raise RateLimitError("Zebu API Rate limit exceeded")
                 if resp.status_code >= 500:

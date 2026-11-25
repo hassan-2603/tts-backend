@@ -70,7 +70,7 @@ class Settings(BaseSettings):
 
     # Concurrency & Sync Timing
     MAX_CONCURRENT_ACCOUNTS: int = Field(default=50)
-    ACCOUNT_SYNC_WORKERS: int = Field(default=10)
+    ACCOUNT_SYNC_WORKERS: int = Field(default=3)
     POLL_SECONDS: int = Field(default=45)
     MARKET_OPEN: str = Field(default="09:15")
     MARKET_CLOSE: str = Field(default="15:30")

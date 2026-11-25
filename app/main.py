@@ -580,23 +580,16 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
     proxy_url = acc.get("proxy_url")
 
     try:
-        # Fetch TradeBook, PositionBook, and OrderBook concurrently from actual broker API
-        fills_res, positions_res, orders_res = await asyncio.gather(
-            ZEBU.trade_book_async(tok, uid, actid, proxy=proxy_url, auth_mode=auth_mode),
-            ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url, auth_mode=auth_mode),
-            ZEBU.order_book_async(tok, uid, proxy=proxy_url, auth_mode=auth_mode),
-            return_exceptions=True,
-        )
-        # Check ALL three endpoints (including OrderBook) for genuine SessionExpired
-        for r in (fills_res, positions_res, orders_res):
-            if isinstance(r, SessionExpired):
-                raise r
-
-        # If TradeBook or PositionBook failed with another error, raise it so we don't overwrite with partial data
-        if isinstance(fills_res, Exception):
-            raise fills_res
-        if isinstance(positions_res, Exception):
-            raise positions_res
+        # Fetch TradeBook, PositionBook, and OrderBook sequentially per account (with 3 accounts max in parallel)
+        # to avoid triggering Zebu go.mynt.in gateway transient HTTP 401 throttling under high concurrent bursts.
+        fills_res = await ZEBU.trade_book_async(tok, uid, actid, proxy=proxy_url, auth_mode=auth_mode)
+        positions_res = await ZEBU.position_book_async(tok, uid, actid, proxy=proxy_url, auth_mode=auth_mode)
+        try:
+            orders_res = await ZEBU.order_book_async(tok, uid, proxy=proxy_url, auth_mode=auth_mode)
+        except SessionExpired:
+            raise
+        except Exception as oe:
+            orders_res = oe
 
         fills = fills_res if isinstance(fills_res, list) else []
         positions = positions_res if isinstance(positions_res, list) else []

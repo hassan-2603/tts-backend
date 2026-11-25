@@ -100,10 +100,11 @@ class ConnectionManager:
         state = self.get_account_state(account_id)
         norm_mode = (auth_mode or "oauth").strip().lower()
 
-        # Avoid duplicate WebSocket connection if already running with same credentials
+        # Avoid duplicate WebSocket connection if already running & healthy (REAL-TIME) with same credentials
         if (
             state.ws_client
             and state.ws_client._running
+            and state.ws_client.status == "REAL-TIME"
             and state.ws_client.token == token
             and state.ws_client.uid == uid
             and state.ws_client.actid == (actid or uid)

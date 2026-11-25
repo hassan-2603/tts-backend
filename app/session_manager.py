@@ -382,8 +382,9 @@ class BrokerSessionManager:
                         "actid": existing.actid,
                         "reused": True,
                     }
-                # If not forced and no failed_token was reported, reuse valid session
-                if not force and not failed_token:
+                # If not manual and caller did not report a specific failed_token (e.g. poll_precheck / health_check),
+                # reuse the valid session that is now present in PostgreSQL!
+                if (not force and not failed_token) or (not is_manual and failed_token is None):
                     return {
                         "ok": True,
                         "access_token": existing.token,
@@ -655,6 +656,22 @@ class BrokerSessionManager:
                 ),
                 timeout=10.0,
             )
+            # Session is confirmed valid by broker: clear any stuck STALE flag and heal DEGRADED/DISCONNECTED WS
+            if sync_st.get("is_stale") or st_upper in ("STALE", "EXPIRED_RETRYING", "REAUTH_REQUIRED", "RECONNECT_REQUIRED"):
+                await self.db.put_sync_state_async(account_id, {
+                    "status": "LIVE",
+                    "is_stale": False,
+                    "last_error": None,
+                    "consecutive_failures": 0,
+                    "circuit_open": False,
+                })
+            if self.ws_sync_cb and self.conn_mgr:
+                ws_st = self.conn_mgr.get_account_state(account_id).status
+                if ws_st != "REAL-TIME":
+                    try:
+                        await self.ws_sync_cb(acc, sess.token, sess.auth_mode)
+                    except Exception as wse:
+                        log.debug("Health check WS heal notice for %s: %s", account_id, wse)
             return "valid"
         except SessionExpired:
             if recover_if_expired:

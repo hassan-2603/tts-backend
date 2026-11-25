@@ -148,6 +148,7 @@ class ZebuWebSocketClient:
     async def _run_loop(self):
         retry_delay = 1.0
         max_delay = 60.0
+        consecutive_not_ok = 0
 
         while self._running:
             try:
@@ -200,7 +201,22 @@ class ZebuWebSocketClient:
                             await self._set_status("REAUTH_REQUIRED", f"WS auth failed: {emsg}")
                             self._running = False
                             return
-                        # Transient / ambiguous handshake failure (including generic Not_Ok): back off & retry without false REAUTH_REQUIRED
+                        # Transient / ambiguous handshake failure (including generic Not_Ok):
+                        # Zebu Noren often sends {"t":"ck","s":"NOT_OK"} without emsg for expired tokens.
+                        # On 1st Not_Ok, treat as transient (DEGRADED); on 2nd consecutive Not_Ok, ask on_auth_failure
+                        # (which checks ClientDetails first before any QuickAuth).
+                        consecutive_not_ok += 1
+                        if consecutive_not_ok >= 2 and self.on_auth_failure:
+                            try:
+                                recovered = await self.on_auth_failure(self.account_id, self.token)
+                                if recovered and recovered[0] and recovered[0] != self.token:
+                                    self.token, self.auth_mode = recovered[0], (recovered[1] or self.auth_mode).strip().lower()
+                                    log.info(f"WebSocket recovered fresh token after repeated Not_Ok for {self.account_id}; reconnecting")
+                                    consecutive_not_ok = 0
+                                    retry_delay = 1.0
+                                    continue
+                            except Exception as re_err:
+                                log.warning(f"WebSocket recovery after repeated Not_Ok failed for {self.account_id}: {re_err}")
                         await self._set_status("DEGRADED", f"Transient handshake failure: {emsg}")
                         jitter = random.uniform(0.5, 1.5)
                         await asyncio.sleep(min(retry_delay * jitter, max_delay))
@@ -208,6 +224,7 @@ class ZebuWebSocketClient:
                         continue
 
                     # 3. Connection Established
+                    consecutive_not_ok = 0
                     await self._set_status("REAL-TIME")
                     retry_delay = 1.0  # Reset backoff on success
 

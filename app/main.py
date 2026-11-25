@@ -364,11 +364,13 @@ async def _ensure_account_ws_stream(acc: dict, token: str, auth_mode: Optional[s
         await FIN_SUMMARY.on_ws_status_change(account_id, new_status, acc=a)
 
     async def _on_ws_auth_failure(account_id: str, failed_tok: str):
-        rec = await SESSION_MGR.recover_expired_session(
-            account_id, failed_token=failed_tok, reason="ws_auth_failure"
-        )
-        if rec and rec.token:
-            return (rec.token, rec.auth_mode)
+        # Verify via lightweight read-only ClientDetails first (0 QuickAuth if token is still valid);
+        # only triggers 1 coordinated QuickAuth if broker confirms SessionExpired.
+        hc = await SESSION_MGR.health_check_session(account_id, recover_if_expired=True)
+        if hc in ("valid", "recovered"):
+            sess = await SESSION_MGR.get_valid_session(account_id)
+            if sess and sess.token:
+                return (sess.token, sess.auth_mode)
         return None
 
     await CONN_MGR.register_account_stream(
@@ -1762,34 +1764,45 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
 
         synced = 0
         processed_cnt = 0
-        reconn_sem = asyncio.Semaphore(6)
+        # Pace bulk reconnect/health checks (max 3 concurrent) to avoid Zebu IP burst rate limits
+        reconn_sem = asyncio.Semaphore(3)
 
         async def _reconnect_one(acc: dict):
             nonlocal connected, synced, skipped, failed, already_linked, processed_cnt
             aid = acc["id"]
             name = acc.get("name") or aid
 
-            # Skip accounts that are already linked, manually disconnected, or blocked/invalid-creds (when auto-reconnecting)
             td_cur = tok_by_acc.get(aid) or {}
+            cur_st_doc = (await DB.get_sync_state_async(aid)) or {}
+            cur_st_val = str(cur_st_doc.get("status") or "").upper()
+            cur_err_low = str(cur_st_doc.get("last_error") or "").lower()
+            cur_is_stale = bool(cur_st_doc.get("is_stale", False))
+
+            # Protect AUTH_BLOCKED accounts in bulk reconnect (both keepalive and manual) so blocked accounts are never re-hammered
+            if cur_st_val == "AUTH_BLOCKED" or td_cur.get("status") == "AUTH_BLOCKED":
+                skipped += 1
+                processed_cnt += 1
+                results.append({"account_id": aid, "name": name, "status": "skipped_auth_blocked"})
+                return
+
+            # In automatic keepalive / morning health check, never touch manually disconnected or bad-credential accounts
             if reason != "manual":
-                cur_st_doc = (await DB.get_sync_state_async(aid)) or {}
-                cur_st_val = str(cur_st_doc.get("status") or "").upper()
-                cur_err_low = str(cur_st_doc.get("last_error") or "").lower()
                 if (
                     td_cur.get("status") == "Disconnected"
                     or (not td_cur and cur_st_val == "DISCONNECTED")
-                    or cur_st_val == "AUTH_BLOCKED"
                     or any(w in cur_err_low for w in ("blocked", "invalid password", "invalid input", "invalid app key"))
                 ):
                     skipped += 1
                     processed_cnt += 1
                     results.append({"account_id": aid, "name": name, "status": "skipped_protected"})
                     return
+
             l_state = _link_state_from_doc(td_cur)
             ws_st = CONN_MGR.get_account_state(aid).status
-            # Never re-call QuickAuth on an already-linked account just because idle WS closed after market hours
-            is_already_linked = (l_state == "Linked" and ws_st != "REAUTH_REQUIRED")
-            if is_already_linked:
+
+            # In manual Reconnect All, skip ONLY truly healthy live accounts (Linked + REAL-TIME WS + not STALE)
+            # In automatic 08:45 / 5-min health check, ALWAYS verify via lightweight ClientDetails (never blindly skip overnight stale tokens!)
+            if reason == "manual" and l_state == "Linked" and ws_st == "REAL-TIME" and not cur_is_stale:
                 already_linked += 1
                 processed_cnt += 1
                 results.append({"account_id": aid, "name": name, "status": "already_linked"})
@@ -1806,7 +1819,9 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
             async with reconn_sem:
                 _RECONNECT_ALL_STATUS["current"] = aid
                 try:
-                    # Lightweight keepalive / morning health check: NEVER calls QuickAuth on valid sessions!
+                    # 1. Automatic 08:45 AM morning check & 5-min keepalive:
+                    # Always validate existing tokens with read-only ClientDetails first;
+                    # NEVER calls QuickAuth if valid; recovers expired overnight tokens cleanly!
                     if reason != "manual":
                         hc = await SESSION_MGR.health_check_session(aid, recover_if_expired=True)
                         if hc == "valid":
@@ -1815,12 +1830,38 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
                         elif hc == "recovered":
                             connected += 1
                             results.append({"account_id": aid, "name": name, "status": "connected", "sync": "recovered"})
+                            await asyncio.sleep(0.3)
                         else:
                             skipped += 1
                             results.append({"account_id": aid, "name": name, "status": "skipped", "reason": hc})
                         return
 
-                    auth_res = await SESSION_MGR.authenticate_once(aid, reason="manual", force=False)
+                    # 2. Manual "Reconnect all accounts":
+                    # If DB still says Linked (e.g. showing STALE or DEGRADED), validate with ClientDetails first!
+                    # - If token is valid -> clears STALE & restarts WS to REAL-TIME with 0 QuickAuth calls.
+                    # - If token expired -> recovers via QuickAuth (bypassing old cooldowns since user clicked Reconnect All).
+                    if l_state == "Linked":
+                        hc = await SESSION_MGR.health_check_session(aid, recover_if_expired=True)
+                        if hc == "valid":
+                            connected += 1
+                            results.append({"account_id": aid, "name": name, "status": "connected", "sync": "healed_valid_session"})
+                            return
+                        if hc == "recovered":
+                            connected += 1
+                            fresh_acc = await DB.get_account_async(aid) or acc
+                            sync_note = "recovered"
+                            try:
+                                sync_res = await asyncio.wait_for(poll_account_async(fresh_acc, now_ist(), force=True), timeout=15.0)
+                                synced += 1
+                                sync_note = str(sync_res)[:120]
+                            except Exception as se:
+                                log.warning(f"Post-reconnect sync notice for {aid}: {se}")
+                            results.append({"account_id": aid, "name": name, "status": "connected", "sync": sync_note})
+                            await asyncio.sleep(0.3)
+                            return
+
+                    # Force fresh QuickAuth for unlinked/expired accounts (or if health_check was blocked by prior cooldown)
+                    auth_res = await SESSION_MGR.authenticate_once(aid, reason="manual", force=True)
                     if not auth_res or not auth_res.get("ok"):
                         failed += 1
                         results.append({"account_id": aid, "name": name, "status": "skipped", "reason": "Auth returned not ok"})
@@ -1836,6 +1877,7 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
                     except Exception as se:
                         log.warning(f"Post-reconnect sync notice for {aid}: {se}")
                     results.append({"account_id": aid, "name": name, "status": "connected", "sync": sync_note})
+                    await asyncio.sleep(0.3)
                 except Exception as e:
                     failed += 1
                     err_msg = str(e)[:180]

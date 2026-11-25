@@ -1809,12 +1809,12 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
                 results.append({"account_id": aid, "name": name, "status": "skipped_auth_blocked"})
                 return
 
-            # In automatic keepalive / morning health check, never touch manually disconnected or bad-credential accounts
+            # In automatic keepalive / morning health check, never touch manually disconnected or locked/wrong-password accounts
             if reason != "manual":
                 if (
                     td_cur.get("status") == "Disconnected"
                     or (not td_cur and cur_st_val == "DISCONNECTED")
-                    or any(w in cur_err_low for w in ("blocked", "invalid password", "invalid input", "invalid app key"))
+                    or any(w in cur_err_low for w in ("blocked", "invalid password", "wrong password", "invalid app key"))
                 ):
                     skipped += 1
                     processed_cnt += 1

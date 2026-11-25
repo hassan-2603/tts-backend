@@ -526,3 +526,67 @@ async def test_18_put_token_expires_at_omitted_none_and_datetime_plus_relink():
     tok4 = await db.get_token_async("47000S99")
     assert tok4["expires_at"] == future_dt.timestamp()
 
+
+@pytest.mark.asyncio
+async def test_19_morning_auto_reconnect_recovers_all_expired_and_respects_guards():
+    """Verify 08:45 AM / 5-min health_check_session reconnects every overnight-expired account
+    (including those still marked Linked in DB or with transient sync_state=DISCONNECTED),
+    makes 0 QuickAuth calls for valid sessions, and never touches manually Disconnected or AUTH_BLOCKED accounts."""
+    db = await _setup_mem_db()
+    for aid in ("ACC_EXP_LINKED", "ACC_EXP_SYNC_DISC", "ACC_VALID", "ACC_MANUAL_DISC", "ACC_BLOCKED"):
+        await _seed_account(db, aid, aid)
+
+    qa_uids = []
+
+    async def _fake_qa(uid, password, factor2, vc, api_secret, **kwargs):
+        qa_uids.append(uid)
+        return {"stat": "Ok", "susertoken": f"NEW_TOK_{uid}", "uid": uid, "actid": uid}
+
+    async def _fake_cd(token, uid, actid, proxy=None, auth_mode=None):
+        if token.startswith("OLD_EXPIRED_"):
+            raise SessionExpired("Session Expired : Invalid Session Key")
+        return {"stat": "Ok", "uid": uid}
+
+    zebu = ZebuClient("https://go.mynt.in", "", "")
+    zebu.quick_auth_async = AsyncMock(side_effect=_fake_qa)
+    zebu.client_details_async = AsyncMock(side_effect=_fake_cd)
+    mgr = BrokerSessionManager(db=db, zebu=zebu)
+
+    # 1. Overnight-expired token still marked Linked in DB (typical morning state)
+    await mgr.register_session("ACC_EXP_LINKED", "OLD_EXPIRED_1", "quickauth", uid="ACC_EXP_LINKED", actid="ACC_EXP_LINKED", sync_ws=False)
+    mgr.reset_tracker("ACC_EXP_LINKED")
+
+    # 2. Expired token whose sync_state was transiently set to DISCONNECTED by a failed poll
+    await db.put_token_async("ACC_EXP_SYNC_DISC", {"access_token": "OLD_EXPIRED_2", "auth_mode": "quickauth", "status": "Login expired"})
+    await db.put_sync_state_async("ACC_EXP_SYNC_DISC", {"status": "DISCONNECTED", "is_stale": True})
+
+    # 3. Valid token that did not expire
+    await mgr.register_session("ACC_VALID", "STILL_VALID_3", "quickauth", uid="ACC_VALID", actid="ACC_VALID", sync_ws=False)
+
+    # 4. Manually disconnected by user -> must NOT auto-reconnect
+    await db.put_token_async("ACC_MANUAL_DISC", {"access_token": None, "status": "Disconnected"})
+    await db.put_sync_state_async("ACC_MANUAL_DISC", {"status": "DISCONNECTED"})
+
+    # 5. AUTH_BLOCKED by Zebu -> must NOT auto-reconnect
+    await db.put_token_async("ACC_BLOCKED", {"access_token": "OLD_EXPIRED_5", "status": "AUTH_BLOCKED"})
+    await db.put_sync_state_async("ACC_BLOCKED", {"status": "AUTH_BLOCKED", "last_error": "User Blocked"})
+
+    r1 = await mgr.health_check_session("ACC_EXP_LINKED", recover_if_expired=True)
+    r2 = await mgr.health_check_session("ACC_EXP_SYNC_DISC", recover_if_expired=True)
+    r3 = await mgr.health_check_session("ACC_VALID", recover_if_expired=True)
+    r4 = await mgr.health_check_session("ACC_MANUAL_DISC", recover_if_expired=True)
+    r5 = await mgr.health_check_session("ACC_BLOCKED", recover_if_expired=True)
+
+    assert r1 == "recovered"
+    assert r2 == "recovered"
+    assert r3 == "valid"
+    assert r4 == "skipped_disconnected"
+    assert r5 == "skipped_auth_blocked"
+    assert sorted(qa_uids) == ["ACC_EXP_LINKED", "ACC_EXP_SYNC_DISC"]
+
+    s1 = await mgr.get_valid_session("ACC_EXP_LINKED")
+    s2 = await mgr.get_valid_session("ACC_EXP_SYNC_DISC")
+    assert s1 and s1.token == "NEW_TOK_ACC_EXP_LINKED"
+    assert s2 and s2.token == "NEW_TOK_ACC_EXP_SYNC_DISC"
+
+

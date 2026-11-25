@@ -632,13 +632,17 @@ class BrokerSessionManager:
 
         sync_st = (await self.db.get_sync_state_async(account_id)) or {}
         st_upper = str(sync_st.get("status") or "").upper()
-        if st_upper in ("DISCONNECTED", "AUTH_BLOCKED"):
-            return f"skipped_{st_upper.lower()}"
+        tok_doc = (await self.db.get_token_async(account_id)) or {}
+        t_status = tok_doc.get("status") or "Not linked"
+        if st_upper == "AUTH_BLOCKED" or t_status == "AUTH_BLOCKED":
+            return "skipped_auth_blocked"
+        # Only skip as manually disconnected when broker_sessions explicitly records Disconnected
+        # (not merely when account_sync_states was transiently set to DISCONNECTED by a failed poll)
+        if t_status == "Disconnected" or (not tok_doc.get("access_token") and st_upper == "DISCONNECTED" and t_status == "Not linked"):
+            return "skipped_disconnected"
 
         sess = await self.get_valid_session(account_id)
         if not sess:
-            tok_doc = (await self.db.get_token_async(account_id)) or {}
-            t_status = tok_doc.get("status") or "Not linked"
             if t_status in ("Disconnected", "Not linked", "AUTH_BLOCKED"):
                 return "skipped_unlinked"
             if recover_if_expired and t_status in ("Login expired", "REAUTH_REQUIRED", "RECONNECT_REQUIRED"):

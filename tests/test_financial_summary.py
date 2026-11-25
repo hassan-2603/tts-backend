@@ -419,11 +419,17 @@ def test_31_websocket_account_isolation_and_auth_enforcement(env):
         mgr.disconnect(ws_a)
         mgr.disconnect(ws_b)
 
-    # Also verify authenticated WS endpoint accepts valid session tokens
+    # Also verify authenticated WS endpoint accepts valid session tokens and enforces RBAC on initial ws_snapshot
     with client.websocket_connect(f"/api/ws?token={trader_a_tok}") as ws1:
+        snap = ws1.receive_json()
+        assert snap["type"] == "ws_snapshot"
+        assert "ACC-B" not in snap["accounts"]
         ws1.send_text("ping")
         assert ws1.receive_text() == "pong"
     with client.websocket_connect(f"/api/ws?token={viewer_b_tok}") as ws2:
+        snap2 = ws2.receive_json()
+        assert snap2["type"] == "ws_snapshot"
+        assert "ACC-A" not in snap2["accounts"]
         ws2.send_text("ping")
         assert ws2.receive_text() == "pong"
 

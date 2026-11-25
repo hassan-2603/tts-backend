@@ -205,7 +205,8 @@ class ConnectionManager:
                 state.record_success()
                 return res
             except SessionExpired:
-                state.status = "REAUTH_REQUIRED"
+                if state.status != "REAL-TIME":
+                    state.status = "DEGRADED"
                 state.record_failure(SessionExpired("Session expired"))
                 return "expired"
             except Exception as e:

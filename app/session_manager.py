@@ -609,12 +609,21 @@ class BrokerSessionManager:
                 return None
             if "manually disconnected" in low:
                 return None
-            # Missing QuickAuth creds (e.g. OAuth-only account) or unrecoverable broker rejection
-            await self.invalidate_session_state(
-                account_id,
-                status="REAUTH_REQUIRED",
-                error_msg=f"Session expired; recovery unavailable: {err_s[:220]}",
-            )
+            # Only mark REAUTH_REQUIRED if the account truly has NO QuickAuth credentials (OAuth-only account).
+            # For QuickAuth accounts, NEVER auto-disconnect or flip to Login expired on a failed recovery —
+            # keep status=Linked and sync_state=STALE so the account stays linked until manually disconnected.
+            if "missing zebu quickauth credentials" in low:
+                await self.invalidate_session_state(
+                    account_id,
+                    status="REAUTH_REQUIRED",
+                    error_msg=f"Session expired; OAuth re-login required: {err_s[:220]}",
+                )
+            else:
+                await self.db.put_sync_state_async(account_id, {
+                    "status": "STALE",
+                    "is_stale": True,
+                    "last_error": f"Recovery pending: {err_s[:220]}",
+                })
             return None
 
         return None

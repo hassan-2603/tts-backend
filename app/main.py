@@ -607,10 +607,14 @@ async def poll_account_async(acc: dict, now: datetime, reconcile_today: bool = F
 
         log.warning(f"Zebu session expired for account {aid}: {se}")
         cur_sync_st = (await DB.get_sync_state_async(aid)) or {}
-        if str(cur_sync_st.get("status") or "").upper() not in ("AUTH_BLOCKED", "STALE"):
-            await SESSION_MGR.invalidate_session_state(
-                aid, status="REAUTH_REQUIRED", error_msg=f"Broker session expired: {se}"
-            )
+        # Never auto-disconnect QuickAuth accounts on transient/failed recovery; keep them Linked (STALE)
+        # until recovered or manually disconnected. Only OAuth-only accounts (already marked REAUTH_REQUIRED) stay REAUTH_REQUIRED.
+        if str(cur_sync_st.get("status") or "").upper() not in ("AUTH_BLOCKED", "STALE", "REAUTH_REQUIRED"):
+            await DB.put_sync_state_async(aid, {
+                "status": "STALE",
+                "is_stale": True,
+                "last_error": f"Session recovery pending: {str(se)[:240]}",
+            })
         raise SessionExpired(str(se))
 
     except Exception as e:

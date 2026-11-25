@@ -354,6 +354,23 @@ async def _ensure_account_ws_stream(acc: dict, token: str, auth_mode: Optional[s
     resolved_mode = ZEBU.get_token_mode(token, auth_mode)
 
     async def _on_fill(msg: dict, a=acc):
+        # Forward live Zebu order/fill event directly to connected frontend WebSockets
+        try:
+            asyncio.create_task(WS_HUB.broadcast({
+                "type": "zebu_order_update",
+                "account_id": a["id"],
+                "trader_id": a.get("trader"),
+                "tsym": msg.get("tsym"),
+                "exch": msg.get("exch"),
+                "status": msg.get("status"),
+                "reporttype": msg.get("reporttype") or msg.get("rpt"),
+                "trantype": msg.get("trantype"),
+                "flqty": msg.get("flqty") or msg.get("fillshares"),
+                "flprc": msg.get("flprc") or msg.get("avgprc"),
+                "ts": now_ist().isoformat(timespec="seconds"),
+            }))
+        except Exception:
+            pass
         FIN_SUMMARY.schedule_reconcile(a, reason="order_update")
         await poll_account_async(a, now_ist())
 
@@ -362,6 +379,18 @@ async def _ensure_account_ws_stream(acc: dict, token: str, auth_mode: Optional[s
 
     async def _on_status_change(new_status: str, _msg: str, account_id=aid, a=acc):
         await FIN_SUMMARY.on_ws_status_change(account_id, new_status, acc=a)
+        # Push real-time Zebu WebSocket status directly to connected frontend clients
+        try:
+            asyncio.create_task(WS_HUB.broadcast({
+                "type": "ws_status_updated",
+                "account_id": account_id,
+                "trader_id": a.get("trader"),
+                "ws_status": new_status,
+                "message": (_msg or "")[:180],
+                "ts": now_ist().isoformat(timespec="seconds"),
+            }))
+        except Exception:
+            pass
 
     async def _on_ws_auth_failure(account_id: str, failed_tok: str):
         # Verify via lightweight read-only ClientDetails first (0 QuickAuth if token is still valid);
@@ -1778,8 +1807,10 @@ async def reconnect_all_zebu_accounts_async(reason: str = "manual", now: Optiona
             cur_err_low = str(cur_st_doc.get("last_error") or "").lower()
             cur_is_stale = bool(cur_st_doc.get("is_stale", False))
 
-            # Protect AUTH_BLOCKED accounts in bulk reconnect (both keepalive and manual) so blocked accounts are never re-hammered
-            if cur_st_val == "AUTH_BLOCKED" or td_cur.get("status") == "AUTH_BLOCKED":
+            # In automatic keepalive, protect AUTH_BLOCKED accounts; in manual Reconnect All,
+            # only skip accounts whose actual broker error indicates a Zebu user lockout ("blocked").
+            is_zebu_locked = "blocked" in cur_err_low or "blocked" in str(td_cur.get("sync_message") or "").lower()
+            if (reason != "manual" and (cur_st_val == "AUTH_BLOCKED" or td_cur.get("status") == "AUTH_BLOCKED")) or (reason == "manual" and is_zebu_locked):
                 skipped += 1
                 processed_cnt += 1
                 results.append({"account_id": aid, "name": name, "status": "skipped_auth_blocked"})
@@ -2460,6 +2491,21 @@ async def websocket_endpoint(websocket: WebSocket):
         "assigned_accounts": (u_doc or {}).get("assigned_accounts") or [],
     }
     await WS_HUB.connect(websocket, user_scope)
+    # Immediately send live per-account Zebu WebSocket status snapshot to the newly connected frontend
+    try:
+        all_accs = await DB.get_all_accounts_async()
+        snap = {}
+        for a in all_accs:
+            aid = a.get("id")
+            if aid and WS_HUB._is_authorized_for_account(user_scope, str(aid), a.get("trader")):
+                snap[aid] = CONN_MGR.get_account_state(aid).status
+        await websocket.send_json({
+            "type": "ws_snapshot",
+            "accounts": snap,
+            "ts": now_ist().isoformat(timespec="seconds"),
+        })
+    except Exception:
+        pass
     try:
         while True:
             data = await websocket.receive_text()

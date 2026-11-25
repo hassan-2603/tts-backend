@@ -41,17 +41,17 @@ from app.zebu import RateLimitError, SessionExpired, ZebuClient, ZebuError
 log = logging.getLogger("tts.session_mgr")
 
 # Permanent/credential error markers that must immediately halt automatic retries
+# (Do NOT include generic "invalid input" so non-lockout errors like vendor code format never falsely block accounts)
 _CREDENTIAL_BLOCK_MARKERS = (
     "blocked",
     "invalid password",
-    "invalid input",
-    "invalid app key",
     "wrong password",
     "user is blocked",
     "password expired",
     "invalid pan",
     "invalid factor2",
     "invalid user",
+    "invalid app key",
 )
 
 

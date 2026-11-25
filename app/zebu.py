@@ -107,66 +107,86 @@ class ZebuClient:
         pwd_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
 
         # Primary official Noren formula: SHA256(uid + "|" + api_secret)
-        # Safe fallbacks only if Zebu explicitly replies "Invalid App Key" (checked before password validation):
-        #  - pre-hashed 64-char hex appkey if user pasted an already-hashed key
-        #  - SHA256(vc + "|" + api_secret) if vendor code differs from uid
-        candidate_appkeys: List[str] = [
-            hashlib.sha256(f"{clean_uid}|{clean_secret}".encode("utf-8")).hexdigest()
-        ]
-        if len(clean_secret) == 64 and all(c in "0123456789abcdefABCDEF" for c in clean_secret):
-            candidate_appkeys.append(clean_secret.lower())
-        if clean_vc and clean_vc != clean_uid:
-            vc_hash = hashlib.sha256(f"{clean_vc}|{clean_secret}".encode("utf-8")).hexdigest()
-            if vc_hash not in candidate_appkeys:
-                candidate_appkeys.append(vc_hash)
+        # Safe fallbacks only if Zebu explicitly replies "Invalid App Key" or "Invalid Vendor code"
+        # (both are validated before password checks, so they do not trigger password lockouts).
+        candidate_vcs: List[str] = [clean_vc]
+        if clean_vc.endswith("_U"):
+            alt_vc = clean_vc[:-2]
+            if alt_vc and alt_vc not in candidate_vcs:
+                candidate_vcs.append(alt_vc)
+        elif "_" not in clean_vc:
+            candidate_vcs.append(f"{clean_vc}_U")
+
+        def _appkeys_for_vc(vc_val: str) -> List[str]:
+            keys: List[str] = [
+                hashlib.sha256(f"{clean_uid}|{clean_secret}".encode("utf-8")).hexdigest()
+            ]
+            if len(clean_secret) == 64 and all(c in "0123456789abcdefABCDEF" for c in clean_secret):
+                keys.append(clean_secret.lower())
+            if vc_val and vc_val != clean_uid:
+                vc_hash = hashlib.sha256(f"{vc_val}|{clean_secret}".encode("utf-8")).hexdigest()
+                if vc_hash not in keys:
+                    keys.append(vc_hash)
+            return keys
 
         headers = {"Content-Type": "text/plain"}
         client = self._get_async_http(proxy=proxy)
         last_emsg = "Authentication failed"
 
-        for idx, appkey_val in enumerate(candidate_appkeys):
-            payload = {
-                "uid": clean_uid,
-                "pwd": pwd_hash,
-                "factor2": clean_factor2,
-                "vc": clean_vc,
-                "appkey": appkey_val,
-                "imei": (imei or "abc1234").strip(),
-                "source": (source or "API").strip(),
-                "apkversion": (apkversion or "1.0.0").strip(),
-            }
-            body = "jData=" + json.dumps(payload, separators=(",", ":"))
+        for vc_idx, vc_val in enumerate(candidate_vcs):
+            candidate_appkeys = _appkeys_for_vc(vc_val)
+            retry_next_vc = False
+            for idx, appkey_val in enumerate(candidate_appkeys):
+                payload = {
+                    "uid": clean_uid,
+                    "pwd": pwd_hash,
+                    "factor2": clean_factor2,
+                    "vc": vc_val,
+                    "appkey": appkey_val,
+                    "imei": (imei or "abc1234").strip(),
+                    "source": (source or "API").strip(),
+                    "apkversion": (apkversion or "1.0.0").strip(),
+                }
+                body = "jData=" + json.dumps(payload, separators=(",", ":"))
 
-            try:
-                resp = await client.post(
-                    f"{self.base}/NorenWClientTP/QuickAuth",
-                    content=body,
-                    headers=headers,
-                )
-            except (httpx.ProxyError, httpx.ConnectError, httpx.TimeoutException) as e:
-                raise ZebuError(f"QuickAuth network error: {e}") from e
+                try:
+                    resp = await client.post(
+                        f"{self.base}/NorenWClientTP/QuickAuth",
+                        content=body,
+                        headers=headers,
+                    )
+                except (httpx.ProxyError, httpx.ConnectError, httpx.TimeoutException) as e:
+                    raise ZebuError(f"QuickAuth network error: {e}") from e
 
-            if resp.status_code == 429:
-                raise RateLimitError("Zebu QuickAuth rate limit exceeded")
-            try:
-                data = resp.json()
-            except ValueError as ve:
-                raise ZebuError(f"QuickAuth: HTTP {resp.status_code} non-JSON response") from ve
+                if resp.status_code == 429:
+                    raise RateLimitError("Zebu QuickAuth rate limit exceeded")
+                try:
+                    data = resp.json()
+                except ValueError as ve:
+                    raise ZebuError(f"QuickAuth: HTTP {resp.status_code} non-JSON response") from ve
 
-            if not isinstance(data, dict):
-                raise ZebuError(f"QuickAuth: unexpected response type {type(data).__name__}")
+                if not isinstance(data, dict):
+                    raise ZebuError(f"QuickAuth: unexpected response type {type(data).__name__}")
 
-            if str(data.get("stat", "")).strip().lower() == "ok":
-                susertoken = str(data.get("susertoken") or "").strip()
-                if not susertoken:
-                    raise ZebuError("QuickAuth succeeded without returning a susertoken")
-                self.register_token_mode(susertoken, "quickauth")
-                return data
+                if str(data.get("stat", "")).strip().lower() == "ok":
+                    susertoken = str(data.get("susertoken") or "").strip()
+                    if not susertoken:
+                        raise ZebuError("QuickAuth succeeded without returning a susertoken")
+                    self.register_token_mode(susertoken, "quickauth")
+                    return data
 
-            emsg = str(data.get("emsg") or "Authentication failed").strip()
-            last_emsg = emsg
-            # Only retry alternate appkey formats when broker specifically rejects App Key
-            if "app key" in emsg.lower() and idx < len(candidate_appkeys) - 1:
+                emsg = str(data.get("emsg") or "Authentication failed").strip()
+                last_emsg = emsg
+                low_emsg = emsg.lower()
+                # Only retry alternate vc when broker specifically rejects Vendor code
+                if "vendor code" in low_emsg and vc_idx < len(candidate_vcs) - 1:
+                    retry_next_vc = True
+                    break
+                # Only retry alternate appkey formats when broker specifically rejects App Key
+                if "app key" in low_emsg and idx < len(candidate_appkeys) - 1:
+                    continue
+                break
+            if retry_next_vc:
                 continue
             break
 

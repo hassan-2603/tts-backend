@@ -10,6 +10,7 @@ Order-placing endpoints (PlaceOrder, ModifyOrder, CancelOrder, GTT, ProductConve
 are deliberately NOT in the allow-list below. This software only reads trades.
 """
 import hashlib
+import http.cookiejar
 import json
 import logging
 import asyncio
@@ -17,6 +18,18 @@ import random
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 import httpx
+
+
+class _NoCookieJar(http.cookiejar.CookieJar):
+    """Concurrency-safe no-op CookieJar so shared httpx clients NEVER leak Zebu session cookies across accounts."""
+    def extract_cookies(self, response, request):
+        return None
+
+    def set_cookie(self, cookie):
+        return None
+
+    def add_cookie_header(self, request):
+        return None
 
 log = logging.getLogger("tts.zebu")
 
@@ -216,10 +229,12 @@ class ZebuClient:
             cl = self._proxy_sync_clients.get(proxy_clean)
             if cl is None or cl.is_closed:
                 cl = httpx.Client(timeout=self.timeout, proxy=proxy_clean)
+                cl.cookies.jar = _NoCookieJar()
                 self._proxy_sync_clients[proxy_clean] = cl
             return cl
         if self._sync_http is None or self._sync_http.is_closed:
             self._sync_http = httpx.Client(timeout=self.timeout)
+            self._sync_http.cookies.jar = _NoCookieJar()
         return self._sync_http
 
     def _get_async_http(self, proxy: Optional[str] = None) -> httpx.AsyncClient:
@@ -230,11 +245,13 @@ class ZebuClient:
                 proxy_timeout = httpx.Timeout(connect=15.0, read=20.0, write=20.0, pool=15.0)
                 limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
                 cl = httpx.AsyncClient(timeout=proxy_timeout, limits=limits, proxy=proxy_clean)
+                cl.cookies.jar = _NoCookieJar()
                 self._proxy_async_clients[proxy_clean] = cl
             return cl
         if self._async_http is None or self._async_http.is_closed:
             limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
             self._async_http = httpx.AsyncClient(timeout=self.timeout, limits=limits)
+            self._async_http.cookies.jar = _NoCookieJar()
         return self._async_http
 
     async def aclose(self):
